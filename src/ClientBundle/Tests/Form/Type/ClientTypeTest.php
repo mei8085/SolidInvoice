@@ -13,9 +13,15 @@ declare(strict_types=1);
 
 namespace SolidInvoice\ClientBundle\Tests\Form\Type;
 
+use Doctrine\ORM\EntityManagerInterface;
+use Mockery as M;
 use SolidInvoice\ClientBundle\Entity\Client;
 use SolidInvoice\ClientBundle\Form\Type\ClientType;
-use SolidInvoice\ClientBundle\Form\Type\ContactDetailType;
+use SolidInvoice\CoreBundle\Enum\CustomFieldTarget;
+use SolidInvoice\CoreBundle\Form\Type\CustomFieldValueCollectionType;
+use SolidInvoice\CoreBundle\Repository\CustomFieldRepository;
+use SolidInvoice\CoreBundle\Repository\CustomFieldValueRepository;
+use SolidInvoice\CoreBundle\Service\CustomField\CustomFieldTypeResolver;
 use SolidInvoice\CoreBundle\Tests\FormTestCase;
 use SolidInvoice\MoneyBundle\Form\Type\CurrencyType;
 use Symfony\Component\Form\PreloadedExtension;
@@ -49,9 +55,19 @@ class ClientTypeTest extends FormTestCase
      */
     protected function getExtensions(): array
     {
+        $fieldRepo = M::mock(CustomFieldRepository::class);
+        $fieldRepo->shouldReceive('findByTargetOrdered')
+            ->with(M::type(CustomFieldTarget::class))
+            ->andReturn([]);
+
+        $valueRepo = M::mock(CustomFieldValueRepository::class);
+        $em = M::mock(EntityManagerInterface::class);
+
         return [
-            // register the type instances with the PreloadedExtension
-            new PreloadedExtension([new ContactDetailType(), new CurrencyType('en')], []),
+            new PreloadedExtension([
+                new CustomFieldValueCollectionType($fieldRepo, $valueRepo, new CustomFieldTypeResolver(), $em),
+                new CurrencyType('en'),
+            ], []),
         ];
     }
 }

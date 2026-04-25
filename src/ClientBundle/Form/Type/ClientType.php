@@ -15,6 +15,8 @@ namespace SolidInvoice\ClientBundle\Form\Type;
 
 use SolidInvoice\ClientBundle\Entity\Address;
 use SolidInvoice\ClientBundle\Entity\Client;
+use SolidInvoice\CoreBundle\Enum\CustomFieldTarget;
+use SolidInvoice\CoreBundle\Form\Type\CustomFieldValueCollectionType;
 use SolidInvoice\MoneyBundle\Form\Type\CurrencyType;
 use SolidInvoice\TaxBundle\Form\Type\TaxNumberType;
 use Symfony\Component\Form\AbstractType;
@@ -70,6 +72,11 @@ class ClientType extends AbstractType
                 'required' => false,
             ]
         );
+
+        $builder->add('customFields', CustomFieldValueCollectionType::class, [
+            'target' => CustomFieldTarget::CLIENT,
+            'parent_record' => $options['data'],
+        ]);
     }
 
     public function configureOptions(OptionsResolver $resolver): void
