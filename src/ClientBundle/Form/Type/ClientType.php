@@ -16,7 +16,6 @@ namespace SolidInvoice\ClientBundle\Form\Type;
 use SolidInvoice\ClientBundle\Entity\Address;
 use SolidInvoice\ClientBundle\Entity\Client;
 use SolidInvoice\MoneyBundle\Form\Type\CurrencyType;
-use SolidInvoice\TaxBundle\Form\Type\TaxNumberType;
 use Symfony\Component\Form\AbstractType;
 use Symfony\Component\Form\Extension\Core\Type\UrlType;
 use Symfony\Component\Form\FormBuilderInterface;
@@ -41,8 +40,6 @@ class ClientType extends AbstractType
                 'required' => false,
             ]
         );
-
-        $builder->add('vat_number', TaxNumberType::class, ['required' => false]);
 
         $builder->add(
             'contacts',
