@@ -22,12 +22,17 @@ use Doctrine\DBAL\Platforms\SqlitePlatform;
 use Doctrine\DBAL\Schema\Schema;
 use Doctrine\DBAL\Types\Types;
 use Doctrine\Migrations\AbstractMigration;
+use SolidInvoice\InvoiceBundle\Entity\Invoice;
 use SolidInvoice\InvoiceBundle\Entity\Line as InvoiceLine;
+use SolidInvoice\InvoiceBundle\Entity\RecurringInvoice;
 use SolidInvoice\QuoteBundle\Entity\Line as QuoteLine;
+use SolidInvoice\QuoteBundle\Entity\Quote;
+use SolidInvoice\TaxBundle\Entity\InvoiceTax;
 use SolidInvoice\TaxBundle\Entity\LineTax;
 use SolidInvoice\TaxBundle\Entity\Tax;
 use SolidInvoice\TaxBundle\Entity\TaxIdentifier;
 use SolidInvoice\TaxBundle\Enum\TaxCategory;
+use SolidInvoice\TaxBundle\Enum\TaxDirection;
 use SolidInvoice\TaxBundle\Enum\TaxType;
 use Symfony\Bridge\Doctrine\Types\UlidType;
 use Symfony\Component\Uid\Ulid;
@@ -38,7 +43,7 @@ final class Version30000_8 extends AbstractMigration
 
     public function getDescription(): string
     {
-        return 'Tax overhaul foundations: extend tax_rates (category/compound), introduce tax_identifier with VAT backfill, and introduce line_tax with per-line snapshots';
+        return 'Tax overhaul foundations: extend tax_rates (category/compound), introduce tax_identifier with VAT backfill, introduce line_tax with per-line snapshots, and introduce invoice_tax with document-level snapshots plus withholding/payable totals';
     }
 
     public function isTransactional(): bool
@@ -149,6 +154,47 @@ final class Version30000_8 extends AbstractMigration
             $lineTax->addForeignKeyConstraint(QuoteLine::TABLE_NAME, ['quote_line_id'], ['id'], ['onDelete' => 'CASCADE']);
         }
 
+        if (! $schema->hasTable(InvoiceTax::TABLE_NAME)) {
+            $invoiceTax = $schema->createTable(InvoiceTax::TABLE_NAME);
+
+            $invoiceTax->addColumn('id', UlidType::NAME);
+            $invoiceTax->addColumn('company_id', UlidType::NAME);
+            $invoiceTax->addColumn('tax_id', UlidType::NAME, ['notnull' => false]);
+            $invoiceTax->addColumn('invoice_id', UlidType::NAME, ['notnull' => false]);
+            $invoiceTax->addColumn('quote_id', UlidType::NAME, ['notnull' => false]);
+            $invoiceTax->addColumn('direction', Types::STRING, [
+                'length' => 32,
+                'default' => TaxDirection::Additive->value,
+            ]);
+            $invoiceTax->addColumn('name_snapshot', Types::STRING, ['length' => 32]);
+            $invoiceTax->addColumn('rate_snapshot', Types::DECIMAL, ['precision' => 10, 'scale' => 4]);
+            $invoiceTax->addColumn('category_snapshot', Types::STRING, [
+                'length' => 32,
+                'default' => TaxCategory::Standard->value,
+            ]);
+            $invoiceTax->addColumn('amount', Types::BIGINT, ['notnull' => true, 'default' => 0]);
+            $invoiceTax->addColumn('note', Types::TEXT, ['notnull' => false]);
+            $invoiceTax->addColumn('sequence', Types::SMALLINT, ['notnull' => true, 'default' => 0]);
+            $invoiceTax->addColumn('snapshotted_at', Types::DATETIME_IMMUTABLE, ['notnull' => false]);
+            $invoiceTax->addColumn('created', Types::DATETIME_MUTABLE);
+            $invoiceTax->addColumn('updated', Types::DATETIME_MUTABLE);
+
+            $invoiceTax->setPrimaryKey(['id']);
+            $invoiceTax->addIndex(['company_id']);
+            $invoiceTax->addIndex(['tax_id']);
+            $invoiceTax->addIndex(['invoice_id']);
+            $invoiceTax->addIndex(['quote_id']);
+
+            $invoiceTax->addForeignKeyConstraint('companies', ['company_id'], ['id'], ['onDelete' => 'CASCADE']);
+            $invoiceTax->addForeignKeyConstraint(Tax::TABLE_NAME, ['tax_id'], ['id'], ['onDelete' => 'SET NULL']);
+            $invoiceTax->addForeignKeyConstraint(Invoice::TABLE_NAME, ['invoice_id'], ['id'], ['onDelete' => 'CASCADE']);
+            $invoiceTax->addForeignKeyConstraint(Quote::TABLE_NAME, ['quote_id'], ['id'], ['onDelete' => 'CASCADE']);
+        }
+
+        $this->addDocumentTotalsColumns($schema, Invoice::TABLE_NAME);
+        $this->addDocumentTotalsColumns($schema, RecurringInvoice::TABLE_NAME);
+        $this->addDocumentTotalsColumns($schema, Quote::TABLE_NAME);
+
         $invoiceLines = $schema->getTable(InvoiceLine::TABLE_NAME);
         if ($invoiceLines->hasColumn('tax_id')) {
             // Drop FK before column so doctrine doesn't complain on platforms that require it.
@@ -212,6 +258,7 @@ final class Version30000_8 extends AbstractMigration
         $this->backfillLineTaxes($this->capturedQuoteLineTaxes, 'quote_line_id', $now);
 
         $this->addLineTaxCheckConstraint();
+        $this->addInvoiceTaxCheckConstraint();
     }
 
     public function down(Schema $schema): void
@@ -225,6 +272,14 @@ final class Version30000_8 extends AbstractMigration
         if ($taxTable->hasColumn('category')) {
             $taxTable->dropColumn('category');
         }
+
+        if ($schema->hasTable(InvoiceTax::TABLE_NAME)) {
+            $schema->dropTable(InvoiceTax::TABLE_NAME);
+        }
+
+        $this->dropDocumentTotalsColumns($schema, Invoice::TABLE_NAME);
+        $this->dropDocumentTotalsColumns($schema, RecurringInvoice::TABLE_NAME);
+        $this->dropDocumentTotalsColumns($schema, Quote::TABLE_NAME);
 
         if ($schema->hasTable(LineTax::TABLE_NAME)) {
             $schema->dropTable(LineTax::TABLE_NAME);
@@ -414,6 +469,67 @@ final class Version30000_8 extends AbstractMigration
     {
         // tax_rates.rate is float in the legacy schema; force 4-decimal text representation.
         return number_format((float) $rate, 4, '.', '');
+    }
+
+    private function addDocumentTotalsColumns(Schema $schema, string $tableName): void
+    {
+        if (! $schema->hasTable($tableName)) {
+            return;
+        }
+
+        $table = $schema->getTable($tableName);
+
+        if (! $table->hasColumn('withholding_amount')) {
+            $table->addColumn('withholding_amount', Types::BIGINT, [
+                'notnull' => true,
+                'default' => 0,
+            ]);
+        }
+
+        if (! $table->hasColumn('payable_amount')) {
+            $table->addColumn('payable_amount', Types::BIGINT, [
+                'notnull' => true,
+                'default' => 0,
+            ]);
+        }
+    }
+
+    private function dropDocumentTotalsColumns(Schema $schema, string $tableName): void
+    {
+        if (! $schema->hasTable($tableName)) {
+            return;
+        }
+
+        $table = $schema->getTable($tableName);
+
+        if ($table->hasColumn('payable_amount')) {
+            $table->dropColumn('payable_amount');
+        }
+
+        if ($table->hasColumn('withholding_amount')) {
+            $table->dropColumn('withholding_amount');
+        }
+    }
+
+    private function addInvoiceTaxCheckConstraint(): void
+    {
+        // MySQL 8+ and PostgreSQL support adding CHECK constraints via ALTER TABLE.
+        // SQLite cannot ALTER TABLE ADD CONSTRAINT; the ExactlyOneDocument validator covers it.
+        if ($this->platform instanceof SqlitePlatform) {
+            return;
+        }
+
+        if (! $this->platform instanceof MySQLPlatform && ! $this->platform instanceof PostgreSQLPlatform) {
+            return;
+        }
+
+        try {
+            $this->connection->executeStatement(
+                'ALTER TABLE invoice_tax ADD CONSTRAINT invoice_tax_exactly_one_document CHECK ((invoice_id IS NULL) <> (quote_id IS NULL))'
+            );
+        } catch (Exception) {
+            // Best-effort: older MySQL silently ignores CHECK constraints.
+        }
     }
 
     private function addLineTaxCheckConstraint(): void
