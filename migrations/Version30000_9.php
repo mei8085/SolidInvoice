@@ -37,7 +37,7 @@ use SolidInvoice\TaxBundle\Enum\TaxType;
 use Symfony\Bridge\Doctrine\Types\UlidType;
 use Symfony\Component\Uid\Ulid;
 
-final class Version30000_8 extends AbstractMigration
+final class Version30000_9 extends AbstractMigration
 {
     private const COMPANY_VAT_SETTING_KEY = 'system/company/vat_number';
 
