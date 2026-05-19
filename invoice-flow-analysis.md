@@ -258,113 +258,30 @@ private function saveInvoice(string $action): ?Response
 
 **风险提示**：Create/Edit Action 的 send 分支绕过了邮箱验证闸门，这可能是设计疏漏。
 
-### 2.3 邮件发送完整链路（发票发送）
-
-```
-用户点击发送
-    ↓
-[Action 层] Send/Create/Edit/CreateInvoice
-    │
-    ├─► 邮箱验证闸门 (仅 Send/LiveComponent 有)
-    │
-    ├─► 状态机检查 can('accept')
-    │
-    ├─► 应用 accept 转换（New/Draft → Pending）
-    │
-    ├─► 持久化发票
-    │
-    └─► 创建 InvoiceEmail 并发送
-            ↓
-[Mailer 事件] MessageEvent
-    ↓
-[Listener] InvoicePdfListener
-    ├─► 类型检查：$message instanceof InvoiceEmail ✅
-    ├─► 检查是否可以生成 PDF (mbstring + gd 扩展)
-    ├─► 渲染 PDF 模板 '@SolidInvoiceInvoice/Pdf/invoice.html.twig'
-    ├─► 使用 mPDF 生成 PDF 内容
-    └─► 附加 PDF 到邮件
-            ↓
-[邮件发送] Symfony Mailer
-```
-
-### 2.4 事件驱动的邮件发送（备用机制）
-
-**文件**：`src/InvoiceBundle/Listener/Mailer/InvoiceMailerListener.php`
-
-```php
-public static function getSubscribedEvents(): array
-{
-    return [
-        InvoiceEvents::INVOICE_POST_ACCEPT => 'onInvoiceAccepted',
-    ];
-}
-
-public function onInvoiceAccepted(InvoiceEvent $event): void
-{
-    $invoice = $event->getInvoice();
-
-    if (! $invoice instanceof Invoice) {
-        return;
-    }
-
-    try {
-        $this->mailer->send(new InvoiceEmail($invoice));
-    } catch (TransportExceptionInterface $e) {
-        $this->logger->error('Failed to send invoice email: ' . $e->getMessage(), [
-            'exception' => $e,
-        ]);
-        $this->addFlashError('invoice.email.send_failed');
-    }
-}
-```
-
-**注意**：这个监听器监听 `INVOICE_POST_ACCEPT` 事件，但目前 Send/Create/Edit 等入口都是**直接发送邮件**，而非通过事件触发。这是两套并行的机制。
-
 ---
 
 ## 3. 三类邮件的处理逻辑与 PDF 附件对比
 
 ### 3.1 三类邮件总览
 
-SolidInvoice 中有三类与发票相关的邮件，它们的处理逻辑和 PDF 附件行为完全不同：
+SolidInvoice 中有三类与发票相关的邮件，它们的处理逻辑、监听器触发和附件行为完全不同：
 
-| 邮件类型 | 邮件类 | 使用场景 | PDF 附件 |
-|---------|--------|----------|----------|
-| **发票发送** | `InvoiceEmail` | 首次发送发票给客户 | ✅ **有**（通过 InvoicePdfListener） |
-| **手动催款** | `ManualInvoiceReminderEmail` | 用户手动点击催款按钮 | ❌ **无** |
-| **自动提醒** | `InvoiceReminderEmail` | 系统自动发送到期/逾期提醒 | ❌ **无** |
+| 邮件类型 | 邮件类 | 使用场景 | PDF 附件 | 自动补主题 | 自动补收件人 | BCC 注入 |
+|---------|--------|----------|----------|----------|------------|----------|
+| **发票发送** | `InvoiceEmail` | 首次发送发票给客户 | ✅ **有**（InvoicePdfListener） | ✅ **有**（InvoiceSubjectListener） | ✅ **有**（InvoiceReceiverListener） | ✅ **有**（InvoiceReceiverListener） |
+| **手动催款** | `ManualInvoiceReminderEmail` | 用户手动点击催款按钮 | ❌ **无** | ✅ **构造函数硬编码** | ✅ **构造函数硬编码** | ❌ **无** |
+| **自动提醒** | `InvoiceReminderEmail` | 系统自动发送到期/逾期提醒 | ❌ **无** | ✅ **有**（ReminderSubjectListener） | ✅ **有**（ReminderReceiverListener） | ✅ **有**（ReminderReceiverListener） |
 
-### 3.2 PDF 附件的触发条件
+### 3.2 邮件监听器触发矩阵
 
-**关键代码**：`src/InvoiceBundle/Listener/Mailer/InvoicePdfListener.php:45`
-
-```php
-public function __invoke(MessageEvent $event): void
-{
-    $message = $event->getMessage();
-
-    // ⚠️  重要：只对 InvoiceEmail 实例附加 PDF
-    if ($message instanceof InvoiceEmail && $this->generator->canPrintPdf()) {
-        $content = $this->generator->generate(
-            $this->twig->render('@SolidInvoiceInvoice/Pdf/invoice.html.twig', 
-                ['invoice' => $message->getInvoice()]
-            )
-        );
-
-        $message->attach($content, 
-            "invoice_{$message->getInvoice()->getInvoiceId()}.pdf", 
-            'application/pdf'
-        );
-    }
-}
-```
-
-**触发条件解析**：
-1. **类型检查**：`$message instanceof InvoiceEmail` —— 只有 `InvoiceEmail` 会被处理
-2. **功能检查**：`$this->generator->canPrintPdf()` —— 检查 mbstring 和 gd 扩展是否可用
-3. **两者必须同时满足**才会附加 PDF
-
-> **关键修正**：之前的结论错误地认为手动催款也有 PDF 附件。实际上 `ManualInvoiceReminderEmail` 和 `InvoiceReminderEmail` 都不会触发 `InvoicePdfListener` 的 PDF 附加逻辑。
+| 监听器 | 监听类型 | InvoiceEmail | ManualInvoiceReminderEmail | InvoiceReminderEmail |
+|--------|---------|-------------|---------------------------|---------------------|
+| InvoicePdfListener (PDF 附件) | MessageEvent | ✅ 触发 | ❌ 跳过 | ❌ 跳过 |
+| InvoiceSubjectListener (补主题) | MessageEvent | ✅ 触发 | ❌ 跳过 | ❌ 跳过 |
+| InvoiceReceiverListener (补收件人+BCC) | MessageEvent | ✅ 触发 | ❌ 跳过 | ❌ 跳过 |
+| ReminderSubjectListener (补主题) | MessageEvent | ❌ 跳过 | ❌ 跳过 | ✅ 触发 |
+| ReminderReceiverListener (补收件人+BCC) | MessageEvent | ❌ 跳过 | ❌ 跳过 | ✅ 触发 |
+| InvoiceMailerListener (事件驱动发送) | InvoiceEvents | ✅ 发送 | ❌ 不适用 | ❌ 不适用 |
 
 ### 3.3 第一类：发票发送邮件（InvoiceEmail）
 
@@ -390,8 +307,64 @@ final class InvoiceEmail extends TemplatedEmail
 **特征**：
 - ✅ 会被 `InvoicePdfListener` 识别并附加 PDF
 - ✅ 支持所有四个发送入口（Send/Create/Edit/LiveComponent）
-- ❌ 不自动设置收件人（由调用方设置或通过其他监听器）
-- ❌ 不自动设置主题
+- ❌ 构造函数中**不设置**主题和收件人（通过监听器自动补全）
+
+#### 专用监听器 1：InvoiceSubjectListener
+
+**文件**：`src/InvoiceBundle/Listener/Mailer/InvoiceSubjectListener.php`
+
+```php
+public function __invoke(MessageEvent $event): void
+{
+    $message = $event->getMessage();
+
+    // 触发条件：是 InvoiceEmail 实例 AND 主题为空
+    if ($message instanceof InvoiceEmail && null === $message->getSubject()) {
+        $message->subject(str_replace(
+            '{id}', 
+            (string) $message->getInvoice()->getInvoiceId(), 
+            $this->config->get('invoice/email_subject')
+        ));
+    }
+}
+```
+
+**触发条件**：
+1. 类型检查：`$message instanceof InvoiceEmail`
+2. 状态检查：`null === $message->getSubject()`（主题未设置）
+3. 从系统配置 `invoice/email_subject` 读取模板，替换 `{id}` 占位符
+
+#### 专用监听器 2：InvoiceReceiverListener
+
+**文件**：`src/InvoiceBundle/Listener/Mailer/InvoiceReceiverListener.php`
+
+```php
+public function __invoke(MessageEvent $event): void
+{
+    $message = $event->getMessage();
+
+    // 触发条件：是 InvoiceEmail 实例 AND 收件人为空
+    if ($message instanceof InvoiceEmail && [] === $message->getTo()) {
+        $invoice = $message->getInvoice();
+
+        // 自动补全收件人：从发票关联的联系人
+        foreach ($invoice->getUsers() as $user) {
+            $message->addTo(new Address($user->getEmail(), 
+                trim(sprintf('%s %s', $user->getFirstName(), $user->getLastName()))));
+        }
+
+        // BCC 注入：从系统配置 invoice/bcc_address 读取
+        if ('' !== ($bcc = (string) $this->config->get('invoice/bcc_address'))) {
+            $message->addBcc($bcc);
+        }
+    }
+}
+```
+
+**触发条件**：
+1. 类型检查：`$message instanceof InvoiceEmail`
+2. 状态检查：`[] === $message->getTo()`（收件人为空数组）
+3. BCC 注入条件：配置 `invoice/bcc_address` 不为空
 
 **调用链路**：
 ```
@@ -399,8 +372,11 @@ final class InvoiceEmail extends TemplatedEmail
     ↓
 MessageEvent 触发
     ↓
-InvoicePdfListener 附加 PDF
-    ↓
+[监听器组]
+    ├─► InvoiceSubjectListener → 补主题（如果为空）
+    ├─► InvoiceReceiverListener → 补收件人+BCC（如果收件人为空）
+    └─► InvoicePdfListener → 附加 PDF
+            ↓
 发送
 ```
 
@@ -414,12 +390,13 @@ final class ManualInvoiceReminderEmail extends TemplatedEmail
     public function __construct(private readonly Invoice $invoice)
     {
         parent::__construct();
+        // 主题硬编码，不通过监听器
         $this->subject("Payment Reminder: Invoice {$invoice->getInvoiceId()}");
         $this->htmlTemplate('@SolidInvoiceInvoice/Email/manual_reminder.html.twig');
         $this->textTemplate('@SolidInvoiceInvoice/Email/manual_reminder.text.twig');
         $this->context(['invoice' => $this->invoice]);
         
-        // 自动设置收件人
+        // 收件人硬编码，不通过监听器
         $this->to(...$this->invoice->getUsers()->map(
             fn (Contact $user) => Address::create(
                 sprintf('%s %s <%s>', $user->getFirstName(), $user->getLastName(), $user->getEmail())
@@ -443,8 +420,8 @@ try {
 
 **特征**：
 - ❌ **不会**附加 PDF（不是 `InvoiceEmail` 实例）
-- ✅ 自动设置主题
-- ✅ 自动设置收件人（从发票关联的联系人）
+- ❌ **不会**触发任何监听器（主题和收件人在构造函数中硬编码）
+- ❌ **没有** BCC 注入（没有监听器处理）
 - ✅ 有 HTML 和纯文本双版本模板
 - ✅ 有完整的异常处理和日志记录
 
@@ -460,9 +437,9 @@ try {
             ↓
 MessageEvent 触发
     ↓
-InvoicePdfListener 检查类型：不是 InvoiceEmail，跳过 ❌
+所有监听器检查类型：不是 InvoiceEmail 也不是 InvoiceReminderEmail，全部跳过 ❌
     ↓
-发送（无 PDF 附件）
+发送（无 PDF 附件，无 BCC）
 ```
 
 ### 3.5 第三类：自动提醒邮件（InvoiceReminderEmail）
@@ -502,28 +479,69 @@ try {
 }
 ```
 
-**自动提醒的专用监听器**：
+#### 专用监听器 1：ReminderSubjectListener
 
-自动提醒有两个专用监听器处理主题和收件人：
+**文件**：`src/InvoiceBundle/Listener/Mailer/ReminderSubjectListener.php`
 
-1. **ReminderSubjectListener** (`src/InvoiceBundle/Listener/Mailer/ReminderSubjectListener.php`)
-   - 根据提醒类型自动设置邮件主题
-   - PreDue: "Upcoming Payment Due"
-   - Overdue1: "Payment Reminder"
-   - Overdue7: "Payment Overdue"
-   - Overdue14: "URGENT: ... Immediate Action Required"
+```php
+public function __invoke(MessageEvent $event): void
+{
+    $message = $event->getMessage();
 
-2. **ReminderReceiverListener** (`src/InvoiceBundle/Listener/Mailer/ReminderReceiverListener.php`)
-   - 自动设置收件人（从发票关联的联系人）
-   - 支持 BCC 密送配置
+    // 触发条件：是 InvoiceReminderEmail 实例 AND 主题为空
+    if ($message instanceof InvoiceReminderEmail && null === $message->getSubject()) {
+        $invoice = $message->getInvoice();
+        $invoiceId = $invoice->getInvoiceId();
+        $reminderType = $message->getReminderType();
 
-**特征**：
-- ❌ **不会**附加 PDF（不是 `InvoiceEmail` 实例）
-- ✅ 有 HTML 和纯文本双版本模板
-- ✅ 通过监听器自动设置主题
-- ✅ 通过监听器自动设置收件人
-- ✅ 有完整的异常处理、日志记录和状态追踪
-- ✅ 有幂等性保护（检查是否已发送过同类型提醒）
+        $subject = match ($reminderType) {
+            ReminderType::PreDue => "Upcoming Payment Due: Invoice {$invoiceId}",
+            ReminderType::Overdue1 => "Payment Reminder: Invoice {$invoiceId}",
+            ReminderType::Overdue7 => "Payment Overdue: Invoice {$invoiceId}",
+            ReminderType::Overdue14 => "URGENT: Invoice {$invoiceId} - Immediate Action Required",
+        };
+
+        $message->subject($subject);
+    }
+}
+```
+
+**触发条件**：
+1. 类型检查：`$message instanceof InvoiceReminderEmail`
+2. 状态检查：`null === $message->getSubject()`（主题未设置）
+3. 根据提醒类型生成不同主题
+
+#### 专用监听器 2：ReminderReceiverListener
+
+**文件**：`src/InvoiceBundle/Listener/Mailer/ReminderReceiverListener.php`
+
+```php
+public function __invoke(MessageEvent $event): void
+{
+    $message = $event->getMessage();
+
+    // 触发条件：是 InvoiceReminderEmail 实例 AND 收件人为空
+    if ($message instanceof InvoiceReminderEmail && [] === $message->getTo()) {
+        $invoice = $message->getInvoice();
+
+        // 自动补全收件人：从发票关联的联系人
+        foreach ($invoice->getUsers() as $user) {
+            $message->addTo(new Address($user->getEmail(), 
+                trim(sprintf('%s %s', $user->getFirstName(), $user->getLastName()))));
+        }
+
+        // BCC 注入：从系统配置 invoice/bcc_address 读取
+        if ('' !== ($bcc = (string) $this->config->get('invoice/bcc_address'))) {
+            $message->addBcc($bcc);
+        }
+    }
+}
+```
+
+**触发条件**：
+1. 类型检查：`$message instanceof InvoiceReminderEmail`
+2. 状态检查：`[] === $message->getTo()`（收件人为空数组）
+3. BCC 注入条件：配置 `invoice/bcc_address` 不为空
 
 **完整调用链路**：
 ```
@@ -542,22 +560,56 @@ try {
     │       ↓
     │   MessageEvent 触发
     │       ↓
-    │   ├─► ReminderSubjectListener → 设置主题
-    │   ├─► ReminderReceiverListener → 设置收件人
-    │   └─► InvoicePdfListener → 类型不匹配，跳过 ❌
+    │   [监听器组]
+    │       ├─► ReminderSubjectListener → 补主题（如果为空）
+    │       ├─► ReminderReceiverListener → 补收件人+BCC（如果收件人为空）
+    │       └─► InvoicePdfListener → 类型不匹配，跳过 ❌
     │
     ├─► 保存 InvoiceReminder 记录（Sent/Failed）
     └─► 发送内部通知（可选）
 ```
 
-### 3.6 三类邮件监听器触发矩阵
+### 3.6 PDF 附件的触发条件
 
-| 监听器 | InvoiceEmail | ManualInvoiceReminderEmail | InvoiceReminderEmail |
-|--------|-------------|---------------------------|---------------------|
-| InvoicePdfListener (PDF 附件) | ✅ 触发 | ❌ 跳过 | ❌ 跳过 |
-| ReminderSubjectListener (设置主题) | ❌ 跳过 | ❌ 跳过 | ✅ 触发 |
-| ReminderReceiverListener (设置收件人) | ❌ 跳过 | ❌ 跳过 | ✅ 触发 |
-| InvoiceMailerListener (事件驱动发送) | ✅ 发送 | ❌ 不适用 | ❌ 不适用 |
+**关键代码**：`src/InvoiceBundle/Listener/Mailer/InvoicePdfListener.php:45`
+
+```php
+public function __invoke(MessageEvent $event): void
+{
+    $message = $event->getMessage();
+
+    // ⚠️  重要：只对 InvoiceEmail 实例附加 PDF
+    if ($message instanceof InvoiceEmail && $this->generator->canPrintPdf()) {
+        $content = $this->generator->generate(
+            $this->twig->render('@SolidInvoiceInvoice/Pdf/invoice.html.twig', 
+                ['invoice' => $message->getInvoice()]
+            )
+        );
+
+        $message->attach($content, 
+            "invoice_{$message->getInvoice()->getInvoiceId()}.pdf", 
+            'application/pdf'
+        );
+    }
+}
+```
+
+**触发条件解析**：
+1. **类型检查**：`$message instanceof InvoiceEmail` —— 只有 `InvoiceEmail` 会被处理
+2. **功能检查**：`$this->generator->canPrintPdf()` —— 检查 mbstring 和 gd 扩展是否可用
+3. **两者必须同时满足**才会附加 PDF
+
+> **关键修正**：`ManualInvoiceReminderEmail` 和 `InvoiceReminderEmail` 都不会触发 `InvoicePdfListener` 的 PDF 附加逻辑，因为类型检查不通过。
+
+### 3.7 BCC 注入路径对比
+
+| 邮件类 | BCC 注入方式 | 注入位置 | 配置项 |
+|--------|-------------|----------|--------|
+| InvoiceEmail | ✅ 通过监听器注入 | InvoiceReceiverListener | `invoice/bcc_address` |
+| ManualInvoiceReminderEmail | ❌ 无任何 BCC 注入 | N/A | N/A |
+| InvoiceReminderEmail | ✅ 通过监听器注入 | ReminderReceiverListener | `invoice/bcc_address` |
+
+> **关键修正**：手动催款（`ManualInvoiceReminderEmail`）是唯一不会注入 BCC 的邮件类型，因为它没有对应的监听器处理，且构造函数中也没有硬编码 BCC。
 
 ---
 
@@ -671,11 +723,11 @@ if (InvoiceStatus::Pending !== $invoice->getStatus()
 
 | 场景 | 当前状态 | 状态转换 | 邮件发送 | 结果 |
 |------|----------|----------|----------|------|
-| 正常首次发送 | Draft | ✅ 执行 accept → Pending | ✅ 发送（带 PDF） | 正常流程 |
-| 重复点击发送 | Pending | ❌ 跳过（已在 Pending） | ✅ 仍发送（带 PDF） | 状态不变，邮件重复发送 ⚠️ |
-| 已取消发票重发 | Cancelled | ❌ 跳过（can() 返回 false） | ✅ 仍发送（带 PDF） | 邮件发送，但状态不变 ⚠️ |
-| 已支付发票 | Paid | ❌ 跳过（can() 返回 false） | ✅ 仍发送（带 PDF） | 邮件发送，但状态不变 ⚠️ |
-| 已逾期发票 | Overdue | ❌ 跳过（can() 返回 false） | ✅ 仍发送（带 PDF） | 邮件发送，但状态不变 ⚠️ |
+| 正常首次发送 | Draft | ✅ 执行 accept → Pending | ✅ 发送（带 PDF，带 BCC） | 正常流程 |
+| 重复点击发送 | Pending | ❌ 跳过（已在 Pending） | ✅ 仍发送（带 PDF，带 BCC） | 状态不变，邮件重复发送 ⚠️ |
+| 已取消发票重发 | Cancelled | ❌ 跳过（can() 返回 false） | ✅ 仍发送（带 PDF，带 BCC） | 邮件发送，但状态不变 ⚠️ |
+| 已支付发票 | Paid | ❌ 跳过（can() 返回 false） | ✅ 仍发送（带 PDF，带 BCC） | 邮件发送，但状态不变 ⚠️ |
+| 已逾期发票 | Overdue | ❌ 跳过（can() 返回 false） | ✅ 仍发送（带 PDF，带 BCC） | 邮件发送，但状态不变 ⚠️ |
 
 **风险点**：
 - 状态检查只保护了状态转换，未阻止邮件发送
@@ -748,12 +800,13 @@ if ($form->isSubmitted() && $form->isValid()) {
 | 邮件类型 | `InvoiceEmail` | `ManualInvoiceReminderEmail` |
 | 模板 | `@SolidInvoiceInvoice/Email/invoice.html.twig` | `@SolidInvoiceInvoice/Email/manual_reminder.html.twig` |
 | PDF 附件 | ✅ **有**（通过 InvoicePdfListener） | ❌ **无**（重要修正！） |
-| 自动设置收件人 | ❌ 无 | ✅ 有（在邮件类构造函数中） |
-| 自动设置主题 | ❌ 无 | ✅ 有（在邮件类构造函数中） |
+| 主题设置 | ✅ 通过 InvoiceSubjectListener 自动补全 | ✅ 构造函数硬编码 |
+| 收件人设置 | ✅ 通过 InvoiceReceiverListener 自动补全 | ✅ 构造函数硬编码 |
+| BCC 注入 | ✅ 通过 InvoiceReceiverListener 注入 | ❌ **无**（重要修正！） |
 
 **设计意图差异**：
-- **直接发送**：用于首次发送发票，会改变状态，操作相对"重"，包含 PDF 附件
-- **手动催款**：用于后续提醒，不改变状态，操作相对"轻"，有更完善的防护和日志，但**不包含 PDF 附件**
+- **直接发送**：用于首次发送发票，会改变状态，操作相对"重"，包含 PDF 附件和 BCC 抄送
+- **手动催款**：用于后续提醒，不改变状态，操作相对"轻"，有更完善的防护和日志，但**不包含 PDF 附件，也没有 BCC 抄送**
 
 ### 5.4 自动提醒的异常路径
 
@@ -783,6 +836,7 @@ if ($this->reminderRepository->hasReminderBeenSent($invoice, $message->reminderT
 - ✅ 幂等性保护（同类型提醒只发一次）
 - ✅ 发送状态追踪（InvoiceReminder 实体记录 Sent/Failed）
 - ✅ 完整的异常处理和日志记录
+- ✅ 有 BCC 抄送（通过 ReminderReceiverListener）
 - ❌ 不包含 PDF 附件
 
 ### 5.5 API 层面异常处理
@@ -877,11 +931,12 @@ public function testTransitionOnForeignCompanyInvoice(): void
 
 1. **清晰的边界划分**：状态机负责状态合法性，Action 负责业务流程，Listener 负责副作用
 2. **统一的转换入口**：`InvoiceStatusTransitionService` 提供了可复用的状态转换服务
-3. **事件驱动设计**：PDF 附件生成通过事件监听解耦
+3. **事件驱动设计**：PDF 附件生成、主题/收件人补全通过事件监听解耦
 4. **多租户安全**：通过 Doctrine Filter 自动实现公司级数据隔离
 5. **幂等性设计**：状态转换前检查当前状态，避免重复转换
 6. **多层验证**：CSRF 保护（表单/LiveComponent）、邮箱验证闸门、状态机验证形成多重防护
 7. **自动提醒完善**：自动提醒有完整的幂等性保护、状态追踪和异常处理
+8. **监听器解耦**：每类邮件有专用监听器，职责单一，易于扩展
 
 ### 6.2 关键设计决策
 
@@ -893,6 +948,8 @@ public function testTransitionOnForeignCompanyInvoice(): void
 | Paid 状态为终态 | 已支付发票不允许编辑 | 保护财务数据一致性 |
 | edit 转换配置但不调用 | 状态机定义了 edit 转换，但业务代码未使用 | 配置与实现脱节，可能造成困惑 |
 | 仅 InvoiceEmail 附加 PDF | 只有首次发送邮件带 PDF，催款/提醒不带 | 减少不必要的 PDF 生成，但可能不符合用户预期 |
+| 手动催款无监听器 | 主题和收件人在构造函数中硬编码 | 简单直接，但失去了监听器的灵活性，也没有 BCC |
+| 三类邮件独立监听器 | 每类邮件有专用监听器处理主题和收件人 | 职责清晰，但代码有重复（InvoiceReceiverListener 和 ReminderReceiverListener 逻辑几乎相同） |
 
 ### 6.3 潜在风险与改进建议
 
@@ -903,12 +960,14 @@ public function testTransitionOnForeignCompanyInvoice(): void
 | Pending 状态可编辑 | 中 | 考虑将 Pending 状态设为只读，或要求明确的"重新编辑"操作并记录 |
 | 编辑保存状态不回退 | 中 | 明确设计意图：要么调用 edit 转换回退到 Draft，要么禁止编辑非 Draft 状态 |
 | 手动催款无 PDF 附件 | 中 | 根据业务需求决定是否为手动催款也添加 PDF 附件 |
+| 手动催款无 BCC 注入 | 中 | 为 ManualInvoiceReminderEmail 添加专用监听器，或在构造函数中支持 BCC |
 | 自动提醒无 PDF 附件 | 低 | 可配置是否为自动提醒添加 PDF 附件 |
 | 缺乏修改历史 | 低 | 考虑添加实体版本追踪或审计日志 |
 | 邮件发送失败状态不回滚 | 中 | 可考虑使用事务或补偿机制，或添加"发送失败"状态 |
 | 两套邮件发送机制并行 | 低 | 统一使用事件驱动或统一直接调用，避免混淆 |
 | 直接发送无 CSRF 保护 | 中 | 将 Send Action 改为 POST 方法并添加 CSRF 保护 |
 | edit 转换配置与实现脱节 | 低 | 要么在编辑时调用 edit 转换，要么从配置中移除避免混淆 |
+| 收件人监听器代码重复 | 低 | 提取公共逻辑到抽象基类或 Trait |
 
 ### 6.4 关键文件索引
 
@@ -927,6 +986,8 @@ public function testTransitionOnForeignCompanyInvoice(): void
 | 邮件类 - 手动催款 | `src/InvoiceBundle/Email/ManualInvoiceReminderEmail.php` |
 | 邮件类 - 自动提醒 | `src/InvoiceBundle/Email/InvoiceReminderEmail.php` |
 | PDF 生成监听器 | `src/InvoiceBundle/Listener/Mailer/InvoicePdfListener.php` |
+| 发票主题监听器 | `src/InvoiceBundle/Listener/Mailer/InvoiceSubjectListener.php` |
+| 发票收件人监听器 | `src/InvoiceBundle/Listener/Mailer/InvoiceReceiverListener.php` |
 | 提醒主题监听器 | `src/InvoiceBundle/Listener/Mailer/ReminderSubjectListener.php` |
 | 提醒收件人监听器 | `src/InvoiceBundle/Listener/Mailer/ReminderReceiverListener.php` |
 | 邮件发送监听器 | `src/InvoiceBundle/Listener/Mailer/InvoiceMailerListener.php` |
@@ -946,7 +1007,7 @@ public function testTransitionOnForeignCompanyInvoice(): void
 
 ## 7. 修正说明
 
-本报告针对以下关键问题进行了修正：
+本报告针对以下关键问题进行了多轮修正：
 
 ### 修正1：编辑保存路径的状态转换
 - ❌ 错误结论：编辑保存会触发 `edit` 转换回退到 Draft
@@ -967,3 +1028,11 @@ public function testTransitionOnForeignCompanyInvoice(): void
 ### 修正5：补充自动提醒的完整链路
 - ❌ 缺失：自动提醒的发送链路、专用监听器、幂等性保护等
 - ✅ 补充：完整描述了自动提醒的消息队列处理流程、专用监听器（ReminderSubjectListener、ReminderReceiverListener）、以及完善的幂等性保护和状态追踪机制
+
+### 修正6：直接发送邮件的监听器触发
+- ❌ 错误结论：`InvoiceEmail` 不自动设置收件人和主题
+- ✅ 正确结论：`InvoiceEmail` 有两个专用监听器：`InvoiceSubjectListener`（主题为空时自动补全）和 `InvoiceReceiverListener`（收件人为空时自动补全并注入 BCC）
+
+### 修正7：三类邮件的 BCC 注入路径差异
+- ❌ 错误结论：手动催款有 BCC 注入
+- ✅ 正确结论：只有 `InvoiceEmail` 和 `InvoiceReminderEmail` 通过各自的监听器注入 BCC，`ManualInvoiceReminderEmail` **没有** BCC 注入
