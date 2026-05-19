@@ -258,7 +258,7 @@ private function saveInvoice(string $action): ?Response
 
 **风险提示**：Create/Edit Action 的 send 分支绕过了邮箱验证闸门，这可能是设计疏漏。
 
-### 2.3 邮件发送完整链路
+### 2.3 邮件发送完整链路（发票发送）
 
 ```
 用户点击发送
@@ -278,6 +278,7 @@ private function saveInvoice(string $action): ?Response
 [Mailer 事件] MessageEvent
     ↓
 [Listener] InvoicePdfListener
+    ├─► 类型检查：$message instanceof InvoiceEmail ✅
     ├─► 检查是否可以生成 PDF (mbstring + gd 扩展)
     ├─► 渲染 PDF 模板 '@SolidInvoiceInvoice/Pdf/invoice.html.twig'
     ├─► 使用 mPDF 生成 PDF 内容
@@ -321,9 +322,51 @@ public function onInvoiceAccepted(InvoiceEvent $event): void
 
 ---
 
-## 3. 模板渲染上下文数据来源
+## 3. 三类邮件的处理逻辑与 PDF 附件对比
 
-### 3.1 邮件模板上下文
+### 3.1 三类邮件总览
+
+SolidInvoice 中有三类与发票相关的邮件，它们的处理逻辑和 PDF 附件行为完全不同：
+
+| 邮件类型 | 邮件类 | 使用场景 | PDF 附件 |
+|---------|--------|----------|----------|
+| **发票发送** | `InvoiceEmail` | 首次发送发票给客户 | ✅ **有**（通过 InvoicePdfListener） |
+| **手动催款** | `ManualInvoiceReminderEmail` | 用户手动点击催款按钮 | ❌ **无** |
+| **自动提醒** | `InvoiceReminderEmail` | 系统自动发送到期/逾期提醒 | ❌ **无** |
+
+### 3.2 PDF 附件的触发条件
+
+**关键代码**：`src/InvoiceBundle/Listener/Mailer/InvoicePdfListener.php:45`
+
+```php
+public function __invoke(MessageEvent $event): void
+{
+    $message = $event->getMessage();
+
+    // ⚠️  重要：只对 InvoiceEmail 实例附加 PDF
+    if ($message instanceof InvoiceEmail && $this->generator->canPrintPdf()) {
+        $content = $this->generator->generate(
+            $this->twig->render('@SolidInvoiceInvoice/Pdf/invoice.html.twig', 
+                ['invoice' => $message->getInvoice()]
+            )
+        );
+
+        $message->attach($content, 
+            "invoice_{$message->getInvoice()->getInvoiceId()}.pdf", 
+            'application/pdf'
+        );
+    }
+}
+```
+
+**触发条件解析**：
+1. **类型检查**：`$message instanceof InvoiceEmail` —— 只有 `InvoiceEmail` 会被处理
+2. **功能检查**：`$this->generator->canPrintPdf()` —— 检查 mbstring 和 gd 扩展是否可用
+3. **两者必须同时满足**才会附加 PDF
+
+> **关键修正**：之前的结论错误地认为手动催款也有 PDF 附件。实际上 `ManualInvoiceReminderEmail` 和 `InvoiceReminderEmail` 都不会触发 `InvoicePdfListener` 的 PDF 附加逻辑。
+
+### 3.3 第一类：发票发送邮件（InvoiceEmail）
 
 **文件**：`src/InvoiceBundle/Email/InvoiceEmail.php`
 
@@ -336,15 +379,201 @@ final class InvoiceEmail extends TemplatedEmail
         $this->htmlTemplate('@SolidInvoiceInvoice/Email/invoice.html.twig');
         $this->context(['invoice' => $this->invoice]);
     }
+
+    public function getInvoice(): Invoice
+    {
+        return $this->invoice;
+    }
 }
 ```
 
-**上下文传递机制**：
-- 直接将 `Invoice` 实体对象传递给模板
-- 模板通过对象属性访问器获取数据
-- 不使用 DTO，直接依赖实体
+**特征**：
+- ✅ 会被 `InvoicePdfListener` 识别并附加 PDF
+- ✅ 支持所有四个发送入口（Send/Create/Edit/LiveComponent）
+- ❌ 不自动设置收件人（由调用方设置或通过其他监听器）
+- ❌ 不自动设置主题
 
-### 3.2 邮件模板数据来源详解
+**调用链路**：
+```
+[Action 层] → new InvoiceEmail($invoice) → $mailer->send()
+    ↓
+MessageEvent 触发
+    ↓
+InvoicePdfListener 附加 PDF
+    ↓
+发送
+```
+
+### 3.4 第二类：手动催款邮件（ManualInvoiceReminderEmail）
+
+**文件**：`src/InvoiceBundle/Email/ManualInvoiceReminderEmail.php`
+
+```php
+final class ManualInvoiceReminderEmail extends TemplatedEmail
+{
+    public function __construct(private readonly Invoice $invoice)
+    {
+        parent::__construct();
+        $this->subject("Payment Reminder: Invoice {$invoice->getInvoiceId()}");
+        $this->htmlTemplate('@SolidInvoiceInvoice/Email/manual_reminder.html.twig');
+        $this->textTemplate('@SolidInvoiceInvoice/Email/manual_reminder.text.twig');
+        $this->context(['invoice' => $this->invoice]);
+        
+        // 自动设置收件人
+        $this->to(...$this->invoice->getUsers()->map(
+            fn (Contact $user) => Address::create(
+                sprintf('%s %s <%s>', $user->getFirstName(), $user->getLastName(), $user->getEmail())
+            )
+        )->toArray());
+    }
+}
+```
+
+**调用入口**：`src/InvoiceBundle/Action/SendManualReminder.php:63`
+
+```php
+// 发送手动催款邮件
+try {
+    $this->mailer->send(new ManualInvoiceReminderEmail($invoice));
+    // ...
+} catch (TransportExceptionInterface $e) {
+    // 异常处理
+}
+```
+
+**特征**：
+- ❌ **不会**附加 PDF（不是 `InvoiceEmail` 实例）
+- ✅ 自动设置主题
+- ✅ 自动设置收件人（从发票关联的联系人）
+- ✅ 有 HTML 和纯文本双版本模板
+- ✅ 有完整的异常处理和日志记录
+
+**调用链路**：
+```
+用户点击"发送催款"
+    ↓
+[Action 层] SendManualReminder
+    ├─► CSRF 验证 ✅
+    ├─► 邮箱验证闸门 ✅
+    ├─► 联系人存在性检查 ✅
+    └─► new ManualInvoiceReminderEmail($invoice) → $mailer->send()
+            ↓
+MessageEvent 触发
+    ↓
+InvoicePdfListener 检查类型：不是 InvoiceEmail，跳过 ❌
+    ↓
+发送（无 PDF 附件）
+```
+
+### 3.5 第三类：自动提醒邮件（InvoiceReminderEmail）
+
+**文件**：`src/InvoiceBundle/Email/InvoiceReminderEmail.php`
+
+```php
+final class InvoiceReminderEmail extends TemplatedEmail
+{
+    public function __construct(
+        private readonly Invoice $invoice,
+        private readonly ReminderType $reminderType,
+        private readonly ?int $daysUntilDue = null,
+    ) {
+        parent::__construct();
+        $this->htmlTemplate('@SolidInvoiceInvoice/Email/reminder.html.twig');
+        $this->textTemplate('@SolidInvoiceInvoice/Email/reminder.text.twig');
+        $this->context([
+            'invoice' => $this->invoice,
+            'reminder_type' => $this->reminderType->value,
+            'days_until_due' => $this->daysUntilDue,
+        ]);
+    }
+}
+```
+
+**调用入口**：`src/InvoiceBundle/MessageHandler/SendInvoiceReminderHandler.php:127-133`
+
+```php
+// 发送邮件给客户联系人
+$email = new InvoiceReminderEmail($invoice, $message->reminderType, $message->daysUntilDue);
+try {
+    $this->mailer->send($email);
+    $emailSent = true;
+} catch (TransportExceptionInterface $e) {
+    // 异常处理
+}
+```
+
+**自动提醒的专用监听器**：
+
+自动提醒有两个专用监听器处理主题和收件人：
+
+1. **ReminderSubjectListener** (`src/InvoiceBundle/Listener/Mailer/ReminderSubjectListener.php`)
+   - 根据提醒类型自动设置邮件主题
+   - PreDue: "Upcoming Payment Due"
+   - Overdue1: "Payment Reminder"
+   - Overdue7: "Payment Overdue"
+   - Overdue14: "URGENT: ... Immediate Action Required"
+
+2. **ReminderReceiverListener** (`src/InvoiceBundle/Listener/Mailer/ReminderReceiverListener.php`)
+   - 自动设置收件人（从发票关联的联系人）
+   - 支持 BCC 密送配置
+
+**特征**：
+- ❌ **不会**附加 PDF（不是 `InvoiceEmail` 实例）
+- ✅ 有 HTML 和纯文本双版本模板
+- ✅ 通过监听器自动设置主题
+- ✅ 通过监听器自动设置收件人
+- ✅ 有完整的异常处理、日志记录和状态追踪
+- ✅ 有幂等性保护（检查是否已发送过同类型提醒）
+
+**完整调用链路**：
+```
+[定时任务] SendInvoiceRemindersCommand
+    ↓
+[消息队列] SendInvoiceReminderMessage
+    ↓
+[消息处理器] SendInvoiceReminderHandler
+    ├─► 公司上下文切换
+    ├─► SaaS 功能闸门检查
+    ├─► 公司级提醒开关检查
+    ├─► 幂等性检查（该类型提醒是否已发送）
+    ├─► 联系人存在性检查
+    ├─► new InvoiceReminderEmail(...)
+    ├─► $mailer->send()
+    │       ↓
+    │   MessageEvent 触发
+    │       ↓
+    │   ├─► ReminderSubjectListener → 设置主题
+    │   ├─► ReminderReceiverListener → 设置收件人
+    │   └─► InvoicePdfListener → 类型不匹配，跳过 ❌
+    │
+    ├─► 保存 InvoiceReminder 记录（Sent/Failed）
+    └─► 发送内部通知（可选）
+```
+
+### 3.6 三类邮件监听器触发矩阵
+
+| 监听器 | InvoiceEmail | ManualInvoiceReminderEmail | InvoiceReminderEmail |
+|--------|-------------|---------------------------|---------------------|
+| InvoicePdfListener (PDF 附件) | ✅ 触发 | ❌ 跳过 | ❌ 跳过 |
+| ReminderSubjectListener (设置主题) | ❌ 跳过 | ❌ 跳过 | ✅ 触发 |
+| ReminderReceiverListener (设置收件人) | ❌ 跳过 | ❌ 跳过 | ✅ 触发 |
+| InvoiceMailerListener (事件驱动发送) | ✅ 发送 | ❌ 不适用 | ❌ 不适用 |
+
+---
+
+## 4. 模板渲染上下文数据来源
+
+### 4.1 邮件模板上下文
+
+三类邮件都直接传递 `Invoice` 实体对象给模板：
+
+| 邮件类 | 模板路径 | 上下文数据 |
+|--------|----------|-----------|
+| InvoiceEmail | `@SolidInvoiceInvoice/Email/invoice.html.twig` | `['invoice' => $invoice]` |
+| ManualInvoiceReminderEmail | `@SolidInvoiceInvoice/Email/manual_reminder.html.twig` | `['invoice' => $invoice]` |
+| InvoiceReminderEmail | `@SolidInvoiceInvoice/Email/reminder.html.twig` | `['invoice' => $invoice, 'reminder_type' => ..., 'days_until_due' => ...]` |
+
+### 4.2 邮件模板数据来源详解
 
 **模板**：`src/InvoiceBundle/Resources/views/Email/invoice.html.twig`
 
@@ -376,7 +605,7 @@ final class InvoiceEmail extends TemplatedEmail
 | 公司名称 | `setting('system/company/company_name')` | Twig 全局函数，读取系统设置 |
 | 支付配置 | `payments_configured(false)` | Twig 全局函数 |
 
-### 3.3 PDF 模板上下文
+### 4.3 PDF 模板上下文
 
 **模板**：`src/InvoiceBundle/Resources/views/Pdf/invoice.html.twig`
 
@@ -399,7 +628,7 @@ PDF 模板使用与邮件模板相同的上下文数据 (`invoice` 实体)，但
 | 逾期状态 | `isOverdue = daysDiff < 0` | 模板内计算 |
 | 逾期天数 | `daysOverdue = daysDiff * -1` | 模板内计算 |
 
-### 3.4 上下文数据组装流程图
+### 4.4 上下文数据组装流程图
 
 ```
 Invoice 实体
@@ -425,9 +654,9 @@ Invoice 实体
 
 ---
 
-## 4. 异常路径分析
+## 5. 异常路径分析
 
-### 4.1 重复发送场景
+### 5.1 重复发送场景
 
 **核心代码**：`Send.php:55-57`
 
@@ -442,11 +671,11 @@ if (InvoiceStatus::Pending !== $invoice->getStatus()
 
 | 场景 | 当前状态 | 状态转换 | 邮件发送 | 结果 |
 |------|----------|----------|----------|------|
-| 正常首次发送 | Draft | ✅ 执行 accept → Pending | ✅ 发送 | 正常流程 |
-| 重复点击发送 | Pending | ❌ 跳过（已在 Pending） | ✅ 仍发送 | 状态不变，邮件重复发送 ⚠️ |
-| 已取消发票重发 | Cancelled | ❌ 跳过（can() 返回 false） | ✅ 仍发送 | 邮件发送，但状态不变 ⚠️ |
-| 已支付发票 | Paid | ❌ 跳过（can() 返回 false） | ✅ 仍发送 | 邮件发送，但状态不变 ⚠️ |
-| 已逾期发票 | Overdue | ❌ 跳过（can() 返回 false） | ✅ 仍发送 | 邮件发送，但状态不变 ⚠️ |
+| 正常首次发送 | Draft | ✅ 执行 accept → Pending | ✅ 发送（带 PDF） | 正常流程 |
+| 重复点击发送 | Pending | ❌ 跳过（已在 Pending） | ✅ 仍发送（带 PDF） | 状态不变，邮件重复发送 ⚠️ |
+| 已取消发票重发 | Cancelled | ❌ 跳过（can() 返回 false） | ✅ 仍发送（带 PDF） | 邮件发送，但状态不变 ⚠️ |
+| 已支付发票 | Paid | ❌ 跳过（can() 返回 false） | ✅ 仍发送（带 PDF） | 邮件发送，但状态不变 ⚠️ |
+| 已逾期发票 | Overdue | ❌ 跳过（can() 返回 false） | ✅ 仍发送（带 PDF） | 邮件发送，但状态不变 ⚠️ |
 
 **风险点**：
 - 状态检查只保护了状态转换，未阻止邮件发送
@@ -454,7 +683,7 @@ if (InvoiceStatus::Pending !== $invoice->getStatus()
 - 缺乏发送次数限制或发送日志记录
 - 没有"已发送"标记来防止重复发送
 
-### 4.2 草稿修改场景
+### 5.2 草稿修改场景
 
 **核心代码**：`Edit.php:58-64, 83-99`
 
@@ -498,7 +727,7 @@ if ($form->isSubmitted() && $form->isValid()) {
 - 缺乏修改历史记录或版本追踪
 - 没有"锁定"机制防止已发送发票被修改
 
-### 4.3 直接发送 vs 手动催款对比
+### 5.3 直接发送 vs 手动催款对比
 
 **直接发送**：`src/InvoiceBundle/Action/Transition/Send.php`
 **手动催款**：`src/InvoiceBundle/Action/SendManualReminder.php`
@@ -518,13 +747,45 @@ if ($form->isSubmitted() && $form->isValid()) {
 | **邮件特征** | | |
 | 邮件类型 | `InvoiceEmail` | `ManualInvoiceReminderEmail` |
 | 模板 | `@SolidInvoiceInvoice/Email/invoice.html.twig` | `@SolidInvoiceInvoice/Email/manual_reminder.html.twig` |
-| PDF 附件 | ✅ 有（通过 InvoicePdfListener） | ✅ 有（同上） |
+| PDF 附件 | ✅ **有**（通过 InvoicePdfListener） | ❌ **无**（重要修正！） |
+| 自动设置收件人 | ❌ 无 | ✅ 有（在邮件类构造函数中） |
+| 自动设置主题 | ❌ 无 | ✅ 有（在邮件类构造函数中） |
 
 **设计意图差异**：
-- **直接发送**：用于首次发送发票，会改变状态，操作相对"重"
-- **手动催款**：用于后续提醒，不改变状态，操作相对"轻"，有更完善的防护和日志
+- **直接发送**：用于首次发送发票，会改变状态，操作相对"重"，包含 PDF 附件
+- **手动催款**：用于后续提醒，不改变状态，操作相对"轻"，有更完善的防护和日志，但**不包含 PDF 附件**
 
-### 4.4 API 层面异常处理
+### 5.4 自动提醒的异常路径
+
+**核心代码**：`SendInvoiceReminderHandler.php:107-114`
+
+```php
+// 幂等性保护：检查该类型提醒是否已发送
+if ($this->reminderRepository->hasReminderBeenSent($invoice, $message->reminderType)) {
+    $this->logger->info('Reminder already sent, skipping duplicate creation', [...]);
+    return;
+}
+```
+
+**异常路径矩阵**：
+
+| 场景 | 处理结果 |
+|------|----------|
+| SaaS 自动化提醒功能禁用 | 跳过，记录日志，不重试 |
+| 公司级提醒开关关闭 | 跳过，记录日志，不重试 |
+| 发票不存在 | 跳过，记录警告日志 |
+| 发票无联系人 | 跳过，记录警告日志 |
+| 该类型提醒已发送过 | 跳过，幂等性保护生效 ✅ |
+| 邮件发送失败 | 标记为 Failed，记录失败原因，不重试 |
+
+**自动提醒的保护机制**：
+- ✅ 多层功能闸门（SaaS + 公司级）
+- ✅ 幂等性保护（同类型提醒只发一次）
+- ✅ 发送状态追踪（InvoiceReminder 实体记录 Sent/Failed）
+- ✅ 完整的异常处理和日志记录
+- ❌ 不包含 PDF 附件
+
+### 5.5 API 层面异常处理
 
 **文件**：`src/ApiBundle/State/Processor/InvoiceTransitionProcessor.php`
 
@@ -556,7 +817,7 @@ public function process(mixed $data, Operation $operation, array $uriVariables =
 - 包含明确的错误信息，说明哪个状态不允许哪个转换
 - 与 Web 界面的异常处理一致（都依赖状态机的 can() 检查）
 
-### 4.5 邮件发送失败处理
+### 5.6 邮件发送失败处理
 
 **文件**：`src/InvoiceBundle/Listener/Mailer/InvoiceMailerListener.php`
 
@@ -577,7 +838,7 @@ try {
 - 添加 Flash 错误消息提示用户
 - **注意**：状态转换已经完成（Pending），但邮件发送失败，状态不会回滚
 
-### 4.6 多租户安全边界
+### 5.7 多租户安全边界
 
 **测试验证**：`src/InvoiceBundle/Tests/Functional/Api/InvoiceTransitionTest.php`
 
@@ -610,9 +871,9 @@ public function testTransitionOnForeignCompanyInvoice(): void
 
 ---
 
-## 5. 架构总结
+## 6. 架构总结
 
-### 5.1 架构优点
+### 6.1 架构优点
 
 1. **清晰的边界划分**：状态机负责状态合法性，Action 负责业务流程，Listener 负责副作用
 2. **统一的转换入口**：`InvoiceStatusTransitionService` 提供了可复用的状态转换服务
@@ -620,8 +881,9 @@ public function testTransitionOnForeignCompanyInvoice(): void
 4. **多租户安全**：通过 Doctrine Filter 自动实现公司级数据隔离
 5. **幂等性设计**：状态转换前检查当前状态，避免重复转换
 6. **多层验证**：CSRF 保护（表单/LiveComponent）、邮箱验证闸门、状态机验证形成多重防护
+7. **自动提醒完善**：自动提醒有完整的幂等性保护、状态追踪和异常处理
 
-### 5.2 关键设计决策
+### 6.2 关键设计决策
 
 | 决策 | 说明 | 影响 |
 |------|------|------|
@@ -630,8 +892,9 @@ public function testTransitionOnForeignCompanyInvoice(): void
 | 多入口发送 | Send/Create/Edit/LiveComponent 都可以触发发送 | 代码有重复，且邮箱验证闸门不一致 |
 | Paid 状态为终态 | 已支付发票不允许编辑 | 保护财务数据一致性 |
 | edit 转换配置但不调用 | 状态机定义了 edit 转换，但业务代码未使用 | 配置与实现脱节，可能造成困惑 |
+| 仅 InvoiceEmail 附加 PDF | 只有首次发送邮件带 PDF，催款/提醒不带 | 减少不必要的 PDF 生成，但可能不符合用户预期 |
 
-### 5.3 潜在风险与改进建议
+### 6.3 潜在风险与改进建议
 
 | 风险点 | 严重程度 | 改进建议 |
 |--------|----------|----------|
@@ -639,13 +902,15 @@ public function testTransitionOnForeignCompanyInvoice(): void
 | 重复发送邮件无限制 | 中 | 添加发送日志，限制发送频率或次数；增加"已发送"标记 |
 | Pending 状态可编辑 | 中 | 考虑将 Pending 状态设为只读，或要求明确的"重新编辑"操作并记录 |
 | 编辑保存状态不回退 | 中 | 明确设计意图：要么调用 edit 转换回退到 Draft，要么禁止编辑非 Draft 状态 |
+| 手动催款无 PDF 附件 | 中 | 根据业务需求决定是否为手动催款也添加 PDF 附件 |
+| 自动提醒无 PDF 附件 | 低 | 可配置是否为自动提醒添加 PDF 附件 |
 | 缺乏修改历史 | 低 | 考虑添加实体版本追踪或审计日志 |
 | 邮件发送失败状态不回滚 | 中 | 可考虑使用事务或补偿机制，或添加"发送失败"状态 |
 | 两套邮件发送机制并行 | 低 | 统一使用事件驱动或统一直接调用，避免混淆 |
 | 直接发送无 CSRF 保护 | 中 | 将 Send Action 改为 POST 方法并添加 CSRF 保护 |
 | edit 转换配置与实现脱节 | 低 | 要么在编辑时调用 edit 转换，要么从配置中移除避免混淆 |
 
-### 5.4 关键文件索引
+### 6.4 关键文件索引
 
 | 功能模块 | 文件路径 |
 |----------|----------|
@@ -657,13 +922,20 @@ public function testTransitionOnForeignCompanyInvoice(): void
 | 编辑动作 | `src/InvoiceBundle/Action/Edit.php` |
 | LiveComponent 创建 | `src/InvoiceBundle/Twig/Components/CreateInvoice.php` |
 | 手动催款 | `src/InvoiceBundle/Action/SendManualReminder.php` |
-| 邮件类 | `src/InvoiceBundle/Email/InvoiceEmail.php` |
+| 自动提醒处理器 | `src/InvoiceBundle/MessageHandler/SendInvoiceReminderHandler.php` |
+| 邮件类 - 发票发送 | `src/InvoiceBundle/Email/InvoiceEmail.php` |
+| 邮件类 - 手动催款 | `src/InvoiceBundle/Email/ManualInvoiceReminderEmail.php` |
+| 邮件类 - 自动提醒 | `src/InvoiceBundle/Email/InvoiceReminderEmail.php` |
 | PDF 生成监听器 | `src/InvoiceBundle/Listener/Mailer/InvoicePdfListener.php` |
+| 提醒主题监听器 | `src/InvoiceBundle/Listener/Mailer/ReminderSubjectListener.php` |
+| 提醒收件人监听器 | `src/InvoiceBundle/Listener/Mailer/ReminderReceiverListener.php` |
 | 邮件发送监听器 | `src/InvoiceBundle/Listener/Mailer/InvoiceMailerListener.php` |
 | 工作流订阅器 | `src/InvoiceBundle/Listener/WorkFlowSubscriber.php` |
 | 事件定义 | `src/InvoiceBundle/Event/InvoiceEvents.php` |
 | API 转换处理器 | `src/ApiBundle/State/Processor/InvoiceTransitionProcessor.php` |
-| 邮件模板 | `src/InvoiceBundle/Resources/views/Email/invoice.html.twig` |
+| 邮件模板 - 发票发送 | `src/InvoiceBundle/Resources/views/Email/invoice.html.twig` |
+| 邮件模板 - 手动催款 | `src/InvoiceBundle/Resources/views/Email/manual_reminder.html.twig` |
+| 邮件模板 - 自动提醒 | `src/InvoiceBundle/Resources/views/Email/reminder.html.twig` |
 | PDF 模板 | `src/InvoiceBundle/Resources/views/Pdf/invoice.html.twig` |
 | 路由配置 | `src/InvoiceBundle/Resources/config/routing.php` |
 | 发票实体 | `src/InvoiceBundle/Entity/Invoice.php` |
@@ -672,18 +944,26 @@ public function testTransitionOnForeignCompanyInvoice(): void
 
 ---
 
-## 6. 修正说明
+## 7. 修正说明
 
-本报告针对以下三处关键问题进行了修正：
+本报告针对以下关键问题进行了修正：
 
-1. **编辑保存路径的状态转换**：
-   - ❌ 错误结论：编辑保存会触发 `edit` 转换回退到 Draft
-   - ✅ 正确结论：编辑保存**不会**自动触发状态转换，普通保存时状态保持原样，只有明确选择 send/publish 时才会应用 `accept` 转换
+### 修正1：编辑保存路径的状态转换
+- ❌ 错误结论：编辑保存会触发 `edit` 转换回退到 Draft
+- ✅ 正确结论：编辑保存**不会**自动触发状态转换，普通保存时状态保持原样，只有明确选择 send/publish 时才会应用 `accept` 转换
 
-2. **邮箱验证闸门差异**：
-   - ❌ 错误结论：所有发送入口都有邮箱验证闸门
-   - ✅ 正确结论：Create/Edit Action 的 send 分支**没有**邮箱验证闸门，只有 Send Action、LiveComponent 和手动催款有
+### 修正2：邮箱验证闸门差异
+- ❌ 错误结论：所有发送入口都有邮箱验证闸门
+- ✅ 正确结论：Create/Edit Action 的 send 分支**没有**邮箱验证闸门，只有 Send Action、LiveComponent 和手动催款有
 
-3. **直接发送与手动催款的差异**：
-   - ❌ 错误结论：两者差异不明确
-   - ✅ 正确结论：两者在 HTTP 方法、CSRF 保护、状态转换、日志记录、异常处理等多个维度有明确差异
+### 修正3：直接发送与手动催款的差异
+- ❌ 错误结论：两者差异不明确，且手动催款有 PDF 附件
+- ✅ 正确结论：两者在 HTTP 方法、CSRF 保护、状态转换、日志记录、异常处理等多个维度有明确差异，且**手动催款没有 PDF 附件**
+
+### 修正4：三类邮件的 PDF 附件行为
+- ❌ 错误结论：手动催款和自动提醒都有 PDF 附件
+- ✅ 正确结论：只有 `InvoiceEmail`（发票发送）会通过 `InvoicePdfListener` 附加 PDF，`ManualInvoiceReminderEmail`（手动催款）和 `InvoiceReminderEmail`（自动提醒）都**不会**附加 PDF
+
+### 修正5：补充自动提醒的完整链路
+- ❌ 缺失：自动提醒的发送链路、专用监听器、幂等性保护等
+- ✅ 补充：完整描述了自动提醒的消息队列处理流程、专用监听器（ReminderSubjectListener、ReminderReceiverListener）、以及完善的幂等性保护和状态追踪机制
