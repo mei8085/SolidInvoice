@@ -35,13 +35,13 @@ enum InvoiceStatus: string implements HasStatusLabel
 | `pay` | Pending, Overdue | Paid | 付款完成 |
 | `reopen` | Cancelled | Draft | 重新打开 |
 | `archive` | New, Draft, Cancelled, Paid | Archived | 归档 |
-| `edit` | Cancelled, Draft, Pending, Overdue | Draft | 编辑发票 |
+| `edit` | Cancelled, Draft, Pending, Overdue | Draft | 编辑发票（配置定义，但代码中未主动调用） |
 
 **关键边界规则**：
 - `accept` 是发送动作的核心边界：只有 New/Draft 状态可以转换到 Pending
-- `edit` 转换支持从多个状态回到 Draft，允许修改后重新发送
 - `Paid` 状态没有出站转换，是最终状态之一
 - `Archived` 是终态，不可逆转
+- `edit` 转换在配置中定义，但在 Edit/Create 等业务入口中**未被主动调用**
 
 ### 1.3 状态转换服务层
 
@@ -83,9 +83,16 @@ public function applyTransition(BaseInvoice $invoice, string $transition): void
 ```php
 public function __invoke(Request $request, Invoice $invoice): RedirectResponse
 {
-    // 边界1：邮箱验证闸门
+    $route = $this->router->generate('_invoices_view', ['id' => $invoice->getId()]);
+
+    // 边界1：邮箱验证闸门 ✅
     if ($this->emailVerificationGate->isGated()) {
-        return new RedirectResponse(..., FlashResponse::FLASH_ERROR);
+        return new class($route) extends RedirectResponse implements FlashResponse {
+            public function getFlash(): Generator
+            {
+                yield FlashResponse::FLASH_ERROR => 'email_verification.flash.send_invoice';
+            }
+        };
     }
 
     // 边界2：状态转换（核心边界）
@@ -100,43 +107,92 @@ public function __invoke(Request $request, Invoice $invoice): RedirectResponse
     // 发送邮件
     $this->mailer->send(new InvoiceEmail($invoice));
 
-    return new RedirectResponse(..., FlashResponse::FLASH_SUCCESS);
+    return new class($route) extends RedirectResponse implements FlashResponse {
+        public function getFlash(): Generator
+        {
+            yield FlashResponse::FLASH_SUCCESS => 'invoice.transition.action.sent';
+        }
+    };
 }
 ```
+
+**关键特征**：
+- ✅ 有邮箱验证闸门
+- ✅ 有状态转换（幂等性保护）
+- ❌ 无 CSRF 保护（GET 请求即可触发）
+- ❌ 无异常处理（邮件发送失败直接抛出）
+- ❌ 无日志记录
 
 #### 入口2：创建时发送 (Create Action)
 
 **文件**：`src/InvoiceBundle/Action/Create.php`
 
 ```php
-if ('send' === $action || 'publish' === $action) {
-    $this->invoiceStateMachine->apply($invoice, Graph::TRANSITION_ACCEPT);
-}
+if ($form->isSubmitted() && $form->isValid()) {
+    $action = $request->request->get('save');
 
-$entityManager->persist($invoice);
-$entityManager->flush();
+    // 转换为实体
+    $invoice = $this->formManager->createInvoiceFromDTO($dto);
 
-// 仅在 'send' 动作时发送邮件
-if ('send' === $action) {
-    $this->mailer->send(new InvoiceEmail($invoice));
+    // 初始化转换 New → Draft
+    if (! $invoice->getId() instanceof Ulid) {
+        $this->invoiceStateMachine->apply($invoice, Graph::TRANSITION_NEW);
+    }
+
+    // 发布发票
+    if ('send' === $action || 'publish' === $action) {
+        $this->invoiceStateMachine->apply($invoice, Graph::TRANSITION_ACCEPT);
+    }
+
+    $entityManager->persist($invoice);
+    $entityManager->flush();
+
+    // 仅在 'send' 动作时发送邮件
+    if ('send' === $action) {
+        $this->mailer->send(new InvoiceEmail($invoice));
+    }
 }
 ```
+
+**关键特征**：
+- ❌ **无邮箱验证闸门**（重要差异！）
+- ✅ 有状态转换
+- ✅ 有表单 CSRF 保护（通过 Symfony Form）
+- ❌ 无异常处理
 
 #### 入口3：编辑时发送 (Edit Action)
 
 **文件**：`src/InvoiceBundle/Action/Edit.php`
 
 ```php
-if ('send' === $action || 'publish' === $action) {
-    $this->invoiceStateMachine->apply($invoice, Graph::TRANSITION_ACCEPT);
-}
+if ($form->isSubmitted() && $form->isValid()) {
+    $action = $request->request->get('save');
 
-$this->doctrine->getManager()->flush();
+    // 从 DTO 更新实体
+    $this->formManager->updateInvoiceFromDTO($invoice, $dto);
 
-if ('send' === $action) {
-    $this->mailer->send(new InvoiceEmail($invoice));
+    // 发布发票
+    if ('send' === $action || 'publish' === $action) {
+        $this->invoiceStateMachine->apply($invoice, Graph::TRANSITION_ACCEPT);
+    }
+
+    $this->doctrine->getManager()->flush();
+
+    // 仅在 'send' 动作时发送邮件
+    if ('send' === $action) {
+        $this->mailer->send(new InvoiceEmail($invoice));
+    }
 }
 ```
+
+**关键特征**：
+- ❌ **无邮箱验证闸门**（重要差异！）
+- ⚠️ **编辑保存不会自动回退状态**（重要修正！）
+- ✅ 有状态转换（仅当 action=send/publish 时）
+- ✅ 有表单 CSRF 保护
+- ❌ 无异常处理
+
+> **重要修正**：编辑保存路径**不会**自动触发 `edit` 转换回退到 Draft。只有当用户明确选择 'send' 或 'publish' 动作时，才会应用 `accept` 转换。普通保存（action=save）不会改变发票状态。
 
 #### 入口4：LiveComponent 发送
 
@@ -146,6 +202,7 @@ if ('send' === $action) {
 #[LiveAction]
 public function saveSend(): ?Response
 {
+    // 边界1：邮箱验证闸门 ✅
     if ($this->emailVerificationGate->isGated()) {
         $this->addFlash('error', 'email_verification.flash.send_invoice');
         return null;
@@ -156,28 +213,59 @@ public function saveSend(): ?Response
 
 private function saveInvoice(string $action): ?Response
 {
-    // ... 表单验证和实体转换 ...
-    
-    if ('send' === $action || 'publish' === $action) {
-        $this->invoiceStateMachine->apply($invoice, Graph::TRANSITION_ACCEPT);
+    $this->submitForm();
+
+    if (! $this->getForm()->isValid()) {
+        return null;
     }
 
-    $this->entityManager->flush();
+    $dto = $this->getForm()->getData();
 
-    if ('send' === $action) {
-        $this->mailer->send(new InvoiceEmail($invoice));
+    if ($this->isEdit) {
+        assert($this->invoice instanceof Invoice);
+        $this->formManager->updateInvoiceFromDTO($this->invoice, $dto);
+
+        if ('send' === $action || 'publish' === $action) {
+            $this->invoiceStateMachine->apply($this->invoice, Graph::TRANSITION_ACCEPT);
+        }
+
+        $this->entityManager->flush();
+
+        if ('send' === $action) {
+            $this->mailer->send(new InvoiceEmail($this->invoice));
+        }
+    } else {
+        // 创建逻辑...
     }
 }
 ```
 
-### 2.2 邮件发送完整链路
+**关键特征**：
+- ✅ 有邮箱验证闸门
+- ✅ 有状态转换
+- ✅ 有 CSRF 保护（LiveComponent 自动处理）
+- ❌ 无异常处理
+
+### 2.2 邮箱验证闸门差异对比表
+
+| 发送入口 | 邮箱验证闸门 | 代码位置 |
+|---------|------------|----------|
+| Send Action (独立路由 `/action/send/{id}`) | ✅ 有 | `Send.php:46-53` |
+| Create Action (创建时发送) | ❌ **无** | `Create.php:100-124` |
+| Edit Action (编辑时发送) | ❌ **无** | `Edit.php:83-99` |
+| CreateInvoice LiveComponent | ✅ 有 | `CreateInvoice.php:180-188` |
+| SendManualReminder (手动催款) | ✅ 有 | `SendManualReminder.php:45-54` |
+
+**风险提示**：Create/Edit Action 的 send 分支绕过了邮箱验证闸门，这可能是设计疏漏。
+
+### 2.3 邮件发送完整链路
 
 ```
 用户点击发送
     ↓
 [Action 层] Send/Create/Edit/CreateInvoice
     │
-    ├─► 邮箱验证闸门 (EmailVerificationGateInterface)
+    ├─► 邮箱验证闸门 (仅 Send/LiveComponent 有)
     │
     ├─► 状态机检查 can('accept')
     │
@@ -198,7 +286,7 @@ private function saveInvoice(string $action): ?Response
 [邮件发送] Symfony Mailer
 ```
 
-### 2.3 事件驱动的邮件发送
+### 2.4 事件驱动的邮件发送（备用机制）
 
 **文件**：`src/InvoiceBundle/Listener/Mailer/InvoiceMailerListener.php`
 
@@ -229,7 +317,7 @@ public function onInvoiceAccepted(InvoiceEvent $event): void
 }
 ```
 
-**注意**：这个监听器监听 `INVOICE_POST_ACCEPT` 事件，但目前 Send/Create/Edit 等入口都是直接发送邮件，而非通过事件触发。这是两套并行的机制。
+**注意**：这个监听器监听 `INVOICE_POST_ACCEPT` 事件，但目前 Send/Create/Edit 等入口都是**直接发送邮件**，而非通过事件触发。这是两套并行的机制。
 
 ---
 
@@ -368,76 +456,73 @@ if (InvoiceStatus::Pending !== $invoice->getStatus()
 
 ### 4.2 草稿修改场景
 
-**核心代码**：`Edit.php:58-64`
+**核心代码**：`Edit.php:58-64, 83-99`
 
 ```php
+// 仅禁止已支付发票的编辑
 if (InvoiceStatus::Paid === $invoice->getStatus()) {
     $session->getFlashBag()->add('warning', 'invoice.edit.paid');
     return new RedirectResponse($this->router->generate('_invoices_index'));
 }
-```
 
-**异常路径矩阵**：
+// 编辑保存逻辑（注意：没有 edit 转换调用）
+if ($form->isSubmitted() && $form->isValid()) {
+    $action = $request->request->get('save');
+    $this->formManager->updateInvoiceFromDTO($invoice, $dto);
 
-| 场景 | 当前状态 | 编辑权限 | edit 转换 | 结果 |
-|------|----------|----------|----------|------|
-| 正常修改草稿 | Draft | ✅ 允许 | ✅ Draft → Draft | 正常修改 |
-| 修改待付款发票 | Pending | ✅ 允许 | ✅ Pending → Draft | 发票可被修改后重新发送 ⚠️ |
-| 修改已逾期发票 | Overdue | ✅ 允许 | ✅ Overdue → Draft | 逾期状态被清除 ⚠️ |
-| 修改已取消发票 | Cancelled | ✅ 允许 | ✅ Cancelled → Draft | 取消状态被撤销 |
-| 修改已支付发票 | Paid | ❌ 拒绝 | ❌ 不适用 | 重定向到列表页，保护机制生效 |
-
-**风险点**：
-- Pending 状态发票可被编辑，可能导致已发送内容与实际不符
-- Overdue 状态通过 edit 转换后丢失逾期标记
-- 缺乏修改历史记录或版本追踪
-- 没有"锁定"机制防止已发送发票被修改
-
-### 4.3 手动催款场景
-
-**文件**：`src/InvoiceBundle/Action/SendManualReminder.php`
-
-```php
-public function __invoke(Request $request, Invoice $invoice): RedirectResponse
-{
-    // 边界1：CSRF 令牌验证
-    if (! $this->isCsrfTokenValid('send_manual_reminder', $request->request->get('_token'))) {
-        return $this->createErrorResponse($invoice, 'invoice.manual_reminder.error.invalid_csrf');
+    // 只有 send/publish 才触发状态转换
+    if ('send' === $action || 'publish' === $action) {
+        $this->invoiceStateMachine->apply($invoice, Graph::TRANSITION_ACCEPT);
     }
 
-    // 边界2：邮箱验证闸门
-    if ($this->emailVerificationGate->isGated()) {
-        return new class(...) extends RedirectResponse implements FlashResponse {
-            public function getFlash(): Generator
-            {
-                yield FlashResponse::FLASH_ERROR => 'email_verification.flash.send_reminder';
-            }
-        };
-    }
-
-    // 边界3：联系人检查
-    if ($invoice->getUsers()->isEmpty()) {
-        return $this->createErrorResponse($invoice, 'invoice.manual_reminder.error.no_contacts');
-    }
-
-    // 发送催款邮件
-    try {
-        $this->mailer->send(new ManualInvoiceReminderEmail($invoice));
-        $this->logger->info('Manual reminder sent for invoice', [...]);
-        return $this->createSuccessResponse($invoice);
-    } catch (TransportExceptionInterface $e) {
-        $this->logger->error('Failed to send manual reminder', [...]);
-        return $this->createErrorResponse($invoice, 'invoice.manual_reminder.error.send_failed');
-    }
+    $this->doctrine->getManager()->flush();
 }
 ```
 
-**异常处理特点**：
-- 有完整的 CSRF 保护
-- 有邮箱验证闸门检查
-- 有联系人存在性检查
-- 有邮件发送异常捕获和日志记录
-- **注意**：没有状态检查，任何状态的发票都可以发送催款邮件
+**异常路径矩阵**（**修正版**）：
+
+| 场景 | 当前状态 | 编辑权限 | 状态变化 | 结果 |
+|------|----------|----------|----------|------|
+| 正常修改草稿 | Draft | ✅ 允许 | → Draft（不变） | 正常修改 |
+| 修改待付款发票（普通保存） | Pending | ✅ 允许 | → Pending（**保持不变**） | 内容已修改，状态未变 ⚠️ |
+| 修改待付款发票（选择发送） | Pending | ✅ 允许 | → Pending（accept 转换无变化） | 内容已修改，重新发送邮件 |
+| 修改已逾期发票（普通保存） | Overdue | ✅ 允许 | → Overdue（**保持不变**） | 内容已修改，逾期状态保留 ✅ |
+| 修改已逾期发票（选择发送） | Overdue | ✅ 允许 | → Overdue（can() 返回 false） | 内容已修改，邮件发送，但状态仍为 Overdue |
+| 修改已取消发票 | Cancelled | ✅ 允许 | → Cancelled（**保持不变**） | 内容已修改，取消状态保留 |
+| 修改已支付发票 | Paid | ❌ 拒绝 | ❌ 不适用 | 重定向到列表页，保护机制生效 |
+
+> **重要修正**：编辑保存**不会**自动触发 `edit` 转换回退到 Draft。状态机配置中的 `edit` 转换定义了 `Cancelled/Draft/Pending/Overdue → Draft` 的路径，但在 Edit/CreateInvoice 等业务入口中并未调用此转换。普通保存时状态保持原样，只有明确选择 send/publish 时才会尝试应用 `accept` 转换。
+
+**风险点**：
+- Pending 状态发票可被编辑，可能导致已发送内容与实际不符
+- 缺乏修改历史记录或版本追踪
+- 没有"锁定"机制防止已发送发票被修改
+
+### 4.3 直接发送 vs 手动催款对比
+
+**直接发送**：`src/InvoiceBundle/Action/Transition/Send.php`
+**手动催款**：`src/InvoiceBundle/Action/SendManualReminder.php`
+
+| 维度 | 直接发送 (Send Action) | 手动催款 (SendManualReminder) |
+|------|----------------------|--------------------------|
+| **请求防护** | | |
+| HTTP 方法 | 无限制（GET 即可触发） | 限制为 POST 方法 |
+| CSRF 保护 | ❌ 无 | ✅ 有 (`isCsrfTokenValid`) |
+| 邮箱验证闸门 | ✅ 有 | ✅ 有 |
+| 联系人检查 | ❌ 无 | ✅ 有 (`getUsers()->isEmpty()`) |
+| **副作用边界** | | |
+| 状态转换 | ✅ 触发 accept 转换 | ❌ 无状态变更 |
+| 持久化 | ✅ 保存发票实体 | ❌ 不修改不保存 |
+| 日志记录 | ❌ 无 | ✅ 有 (info/error) |
+| 异常处理 | ❌ 无（直接抛出） | ✅ 有 try-catch TransportException |
+| **邮件特征** | | |
+| 邮件类型 | `InvoiceEmail` | `ManualInvoiceReminderEmail` |
+| 模板 | `@SolidInvoiceInvoice/Email/invoice.html.twig` | `@SolidInvoiceInvoice/Email/manual_reminder.html.twig` |
+| PDF 附件 | ✅ 有（通过 InvoicePdfListener） | ✅ 有（同上） |
+
+**设计意图差异**：
+- **直接发送**：用于首次发送发票，会改变状态，操作相对"重"
+- **手动催款**：用于后续提醒，不改变状态，操作相对"轻"，有更完善的防护和日志
 
 ### 4.4 API 层面异常处理
 
@@ -534,7 +619,7 @@ public function testTransitionOnForeignCompanyInvoice(): void
 3. **事件驱动设计**：PDF 附件生成通过事件监听解耦
 4. **多租户安全**：通过 Doctrine Filter 自动实现公司级数据隔离
 5. **幂等性设计**：状态转换前检查当前状态，避免重复转换
-6. **多层验证**：CSRF 保护、邮箱验证闸门、状态机验证形成多重防护
+6. **多层验证**：CSRF 保护（表单/LiveComponent）、邮箱验证闸门、状态机验证形成多重防护
 
 ### 5.2 关键设计决策
 
@@ -542,20 +627,23 @@ public function testTransitionOnForeignCompanyInvoice(): void
 |------|------|------|
 | 直接传递实体到模板 | 不使用 DTO，模板直接访问 Invoice 实体 | 简单但耦合度高，模板可访问所有实体属性 |
 | 状态转换与邮件发送解耦 | 状态转换成功后才发送邮件 | 邮件发送失败不影响状态，但可能导致状态与实际不一致 |
-| 多入口发送 | Send/Create/Edit/LiveComponent 都可以触发发送 | 代码有重复，但各自场景有特殊处理 |
+| 多入口发送 | Send/Create/Edit/LiveComponent 都可以触发发送 | 代码有重复，且邮箱验证闸门不一致 |
 | Paid 状态为终态 | 已支付发票不允许编辑 | 保护财务数据一致性 |
+| edit 转换配置但不调用 | 状态机定义了 edit 转换，但业务代码未使用 | 配置与实现脱节，可能造成困惑 |
 
 ### 5.3 潜在风险与改进建议
 
 | 风险点 | 严重程度 | 改进建议 |
 |--------|----------|----------|
+| Create/Edit 发送无邮箱验证闸门 | 高 | 在 Create/Edit 的 send 分支添加邮箱验证检查，保持与其他入口一致 |
 | 重复发送邮件无限制 | 中 | 添加发送日志，限制发送频率或次数；增加"已发送"标记 |
 | Pending 状态可编辑 | 中 | 考虑将 Pending 状态设为只读，或要求明确的"重新编辑"操作并记录 |
-| Overdue 编辑后状态丢失 | 中 | edit 转换应保留逾期标记，或单独处理逾期状态 |
+| 编辑保存状态不回退 | 中 | 明确设计意图：要么调用 edit 转换回退到 Draft，要么禁止编辑非 Draft 状态 |
 | 缺乏修改历史 | 低 | 考虑添加实体版本追踪或审计日志 |
 | 邮件发送失败状态不回滚 | 中 | 可考虑使用事务或补偿机制，或添加"发送失败"状态 |
 | 两套邮件发送机制并行 | 低 | 统一使用事件驱动或统一直接调用，避免混淆 |
-| 催款邮件无状态检查 | 低 | 可考虑限制只有 Pending/Overdue 状态可以发送催款 |
+| 直接发送无 CSRF 保护 | 中 | 将 Send Action 改为 POST 方法并添加 CSRF 保护 |
+| edit 转换配置与实现脱节 | 低 | 要么在编辑时调用 edit 转换，要么从配置中移除避免混淆 |
 
 ### 5.4 关键文件索引
 
@@ -581,3 +669,21 @@ public function testTransitionOnForeignCompanyInvoice(): void
 | 发票实体 | `src/InvoiceBundle/Entity/Invoice.php` |
 | 发票基类 | `src/InvoiceBundle/Entity/BaseInvoice.php` |
 | 发票管理器 | `src/InvoiceBundle/Manager/InvoiceManager.php` |
+
+---
+
+## 6. 修正说明
+
+本报告针对以下三处关键问题进行了修正：
+
+1. **编辑保存路径的状态转换**：
+   - ❌ 错误结论：编辑保存会触发 `edit` 转换回退到 Draft
+   - ✅ 正确结论：编辑保存**不会**自动触发状态转换，普通保存时状态保持原样，只有明确选择 send/publish 时才会应用 `accept` 转换
+
+2. **邮箱验证闸门差异**：
+   - ❌ 错误结论：所有发送入口都有邮箱验证闸门
+   - ✅ 正确结论：Create/Edit Action 的 send 分支**没有**邮箱验证闸门，只有 Send Action、LiveComponent 和手动催款有
+
+3. **直接发送与手动催款的差异**：
+   - ❌ 错误结论：两者差异不明确
+   - ✅ 正确结论：两者在 HTTP 方法、CSRF 保护、状态转换、日志记录、异常处理等多个维度有明确差异
