@@ -14,9 +14,10 @@
 3. [序列化器声明体系](#序列化器声明体系)
 4. [OpenAPI 文档生成](#openapi-文档生成)
 5. [三者协作的完整流程](#三者协作的完整流程)
-6. [对齐验证：如何确保一致性](#对齐验证如何确保一致性)
-7. [关键文件索引](#关键文件索引)
-8. [复核记录](#复核记录)
+6. [API 安全及文档访问边界](#api-安全及文档访问边界)
+7. [对齐验证：如何确保一致性](#对齐验证如何确保一致性)
+8. [关键文件索引](#关键文件索引)
+9. [复核记录](#复核记录)
 
 ---
 
@@ -1189,9 +1190,11 @@ public function authenticate(Request $request): Passport
 }
 ```
 
-> 💡 **行为细节**：`$request->headers->get('X-API-TOKEN', $request->query->get('token'))`
-> 这是一个很巧妙的写法：如果 header 存在，返回 header 的值；如果 header 不存在，才会计算第二个参数（调用 query get）。
-> 也就是说：**header 和 query 同时存在时，只使用 header 的值，忽略 query 的值。**
+> ⚠️ **重要修正**：PHP 是**传值调用（call by value）**语言，函数参数在调用前就会被求值。
+> 因此 `$request->query->get('token')` 这部分代码**总是会执行**，无论 header 是否存在，不存在"惰性求值"。
+>
+> Header 优先的真正原因是 `HeaderBag::get()` 方法内部的逻辑：如果 key 存在，直接返回对应值，default 参数虽然已经被求值了但不会被使用。
+> 最终效果：**header 和 query 同时存在时，只使用 header 的值，忽略 query 的值。**（但 query 的 get 方法已经被调用过了）
 
 ### 6. 与 OpenAPI/Swagger 描述的一致性核对
 
