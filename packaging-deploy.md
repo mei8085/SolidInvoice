@@ -217,7 +217,7 @@ SolidInvoice 的环境变量体系是**五层叠加**的结构，从外到内逐
 │  .env.dist → .env.local 等                         │
 ├─────────────────────────────────────────────────────┤
 │  第 4 层：Symfony Secrets Vault (加密存储)           │
-│  config/secrets/ 目录下的加密密钥                   │
+│  $SOLIDINVOICE_CONFIG_DIR/ 下的加密密钥             │
 ├─────────────────────────────────────────────────────┤
 │  第 5 层：EnvVarLoader 动态加载                     │
 │  EnvLoader、BuildIdLoader 等运行时生成              │
@@ -269,12 +269,13 @@ $_SERVER['APP_RUNTIME_OPTIONS'] = [
 
 这意味着所有环境变量都使用 `SOLIDINVOICE_` 前缀，与 Symfony 框架的默认命名空间解耦。
 
-**.env 文件加载顺序（Symfony 标准行为）：**
-1. `.env` — 公共默认值
-2. `.env.local` — 本地覆盖（不提交到 Git）
-3. `.env.{SOLIDINVOICE_ENV}` — 环境特定（如 `.env.prod`）
-4. `.env.{SOLIDINVOICE_ENV}.local` — 环境特定本地覆盖
+**.env 文件加载顺序（Symfony Dotenv 标准行为，优先级从低到高）：**
+1. .env  公共默认值
+2. .env.local  本地覆盖（不提交到 Git）
+3. .env.{SOLIDINVOICE_ENV}  环境特定（如 .env.prod）
+4. .env.{SOLIDINVOICE_ENV}.local  环境特定本地覆盖（最高优先级）
 
+> .env.dist 是**模板文件**，不会被自动加载，仅作为 .env 的参考模板。
 ### 4. 第 4 层：Secrets Vault
 
 [config/packages/framework.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/config/packages/framework.php#L41-L44) 配置了 Secrets Vault：
@@ -286,53 +287,62 @@ $config->secrets()
 ;
 ```
 
-[ConfigWriter](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/src/CoreBundle/ConfigWriter.php) 是操作 Vault 的封装类：
+[src/CoreBundle/ConfigWriter.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/src/CoreBundle/ConfigWriter.php) 是操作 Vault 的封装类：
 
 - 所有配置键自动添加 `SOLIDINVOICE_` 前缀
 - 配置存储路径由 `SOLIDINVOICE_CONFIG_DIR` 决定
 - 写入时自动处理 OPCache 失效（避免缓存旧配置）
 
-**Vault 文件位置：**
-- Docker 容器：`/etc/solidinvoice/`（VOLUME 挂载点）
-- systemd 安装：`/etc/solidinvoice/`
-- 手动运行：`~/.config/SolidInvoice/`（Go 的 `os.UserConfigDir()`）
+**Vault 文件位置（`SOLIDINVOICE_CONFIG_DIR` 的实际落点）：**
 
+| 运行方式 | 配置目录 | 来源 |
+|----------|----------|------|
+| Docker 容器 | `/etc/solidinvoice/` | Dockerfile `ENV` 设置 |
+| systemd / deb/rpm 包 | `/etc/solidinvoice/` | `solidinvoice.env` 环境文件 |
+| FrankenPHP 二进制（solidinvoice run） | `~/.config/SolidInvoice/` | Go `os.UserConfigDir()` |
+| 直接运行 PHP（源码方式，非 test） | `{项目根}/config/env/` | `config/services.php` 默认值 |
+| 直接运行 PHP（test 环境） | `{项目根}/var/cache/test/config/` | `config/services.php` test 专用 |
+| Snap 安装 | `$SNAP_COMMON/config` | `snapcraft.yaml` |
+
+> 默认数据库（SQLite）也位于配置目录下：`$SOLIDINVOICE_CONFIG_DIR/db/solidinvoice.db`
 ### 5. 第 5 层：EnvVarLoader 动态加载
 
-Symfony 的 `EnvVarLoaderInterface` 允许在容器编译时动态注入环境变量。
+Symfony 的 `EnvVarLoaderInterface` 允许在容器编译时动态注入环境变量作为默认值。
+Secrets Vault 本身也是通过这个机制加载的（`AbstractVault` 实现了该接口）。
 
-**(1) EnvLoader — 旧配置迁移**
+**(1) EnvLoader — 旧配置迁移（一次性）**
 
-[EnvLoader.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/src/CoreBundle/Config/Loader/EnvLoader.php) 处理从旧版 `env.php` 到 Secrets Vault 的迁移：
+[src/CoreBundle/Config/Loader/EnvLoader.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/src/CoreBundle/Config/Loader/EnvLoader.php) 是一个**迁移工具**，而非日常配置加载器：
 
 - 检查 `config/env/env.php` 和 `config/env.php`（新旧两个位置）
 - 将旧的数据库参数（`database_host` 等）转换为 `DATABASE_URL`
 - 将 `secret` 键重命名为 `APP_SECRET`
-- 所有键转为大写并保存到 Vault
+- 所有键转为大写并加上 `SOLIDINVOICE_` 前缀后保存到 Vault
+- 仅在旧文件存在时触发，全新安装不会运行
 - 迁移完成后删除旧文件
 
 **(2) BuildIdLoader — 构建 ID 生成**
 
-[BuildIdLoader.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/src/CoreBundle/Config/Loader/BuildIdLoader.php) 生成唯一构建 ID：
+[src/CoreBundle/Config/Loader/BuildIdLoader.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/src/CoreBundle/Config/Loader/BuildIdLoader.php) 生成唯一构建 ID：
 
-- 若 `SOLIDINVOICE_BUILD_ID` 环境变量已设置，跳过
+- 若 `SOLIDINVOICE_BUILD_ID` 环境变量已设置（即 Vault 中已有），跳过
 - 否则生成 UUID v7 作为构建 ID 并保存到 Vault
-- 用于资产缓存清除、版本追踪等
+- 用于资产缓存清除、版本追踪、部署标识等
 
 ### 6. 配置读取链路
 
-以数据库配置为例，完整的读取链路：
+以数据库配置为例，完整的读取链路（优先级从高到低，共 8 级）：
 
-```
-DATABASE_URL 查找顺序：
-  1. 操作系统环境变量 (最高优先级)
-  2. .env.local 文件
-  3. .env.{env} 文件
-  4. .env 文件
-  5. Secrets Vault 中的 SOLIDINVOICE_DATABASE_URL
-  6. EnvVarLoader 动态注入的值
-  7. 容器参数中的默认值 (最低优先级)
-```
+| 优先级 | 来源 | 说明 | 示例 |
+|--------|------|------|------|
+| 1（最高） | 操作系统环境变量 | 用户在运行前设置的环境变量 | `export SOLIDINVOICE_DATABASE_URL=...` |
+| 2 | Go 二进制默认值 | FrankenPHP 在 PHP 启动前通过 `os.Setenv` 设置的默认值 | `SOLIDINVOICE_ENV=prod` |
+| 3 | `.env.{env}.local` | 环境特定的本地覆盖文件（不提交 Git） | `.env.prod.local` |
+| 4 | `.env.{env}` | 环境特定的配置文件 | `.env.prod` |
+| 5 | `.env.local` | 本地通用覆盖文件（不提交 Git） | `.env.local` |
+| 6 | `.env` | 公共默认值文件 | `.env` |
+| 7 | Secrets Vault / EnvVarLoader | 加密的 Vault 配置和动态加载器 | `env.php` 加密文件 |
+| 8（最低） | 容器参数默认值 | 在服务定义中的默认值 | `%env(SOLIDINVOICE_DATABASE_URL)%` 默认值 |
 
 **实际应用：**
 ```php
@@ -342,6 +352,7 @@ $dbalConfig->connection('default')
 ```
 
 这里 `env()` 是 Symfony DI 的环境变量处理器，会按照上述优先级查找。
+找到即止，后面的层级作为 fallback。
 
 ---
 
@@ -351,7 +362,7 @@ $dbalConfig->connection('default')
 
 ### 1. 版本号的"家"：源代码常量
 
-[SolidInvoiceCoreBundle.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/src/CoreBundle/SolidInvoiceCoreBundle.php#L24) 是版本号的唯一真相源：
+[src/CoreBundle/SolidInvoiceCoreBundle.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/src/CoreBundle/SolidInvoiceCoreBundle.php#L24) 是版本号的唯一真相源：
 
 ```php
 final public const VERSION = '3.0.0-alpha2';
@@ -512,7 +523,7 @@ GitHub Actions CI 触发
 
 ### 3. 安装向导的协作
 
-当应用首次运行且未安装时，[RequestListener](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/src/InstallBundle/Listener\RequestListener.php) 拦截所有请求：
+当应用首次运行且未安装时，[src/InstallBundle/Listener/RequestListener.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/src/InstallBundle/Listener/RequestListener.php) 拦截所有请求：
 
 1. **检测**：检查 `installed` 标记是否存在于 Vault
 2. **重定向**：未安装则跳转到 `_system_install` 路由
@@ -555,15 +566,16 @@ GitHub Actions CI 触发
 
 `SOLIDINVOICE_CONFIG_DIR` 的值取决于运行方式：
 
-| 运行方式 | 配置目录 |
-|----------|----------|
-| Docker 容器 | `/etc/solidinvoice`（Dockerfile 设置） |
-| systemd 服务 | `/etc/solidinvoice`（env 文件设置） |
-| 手动执行二进制 | `~/.config/SolidInvoice`（Go UserConfigDir） |
-| 直接运行 PHP | `config/secrets/`（项目内默认） |
+| 运行方式 | 配置目录 | 来源 |
+|----------|----------|------|
+| Docker 容器 | `/etc/solidinvoice/` | `linux-static-build.Dockerfile` |
+| systemd / deb/rpm 包 | `/etc/solidinvoice/` | `solidinvoice.env` 环境文件 |
+| FrankenPHP 二进制（solidinvoice run） | `~/.config/SolidInvoice/` | Go `os.UserConfigDir()` |
+| 直接运行 PHP（源码方式，非 test） | `{项目根}/config/env/` | `config/services.php` 默认值 |
+| 直接运行 PHP（test 环境） | `{项目根}/var/cache/test/config/` | `config/services.php` test 专用 |
+| Snap 安装 | `$SNAP_COMMON/config` | `snapcraft.yaml` |
 
-这也是为什么有 `SOLIDINVOICE_CONFIG_DIR` 环境变量的原因——解耦配置位置与应用代码。
-
+这也是为什么有 `SOLIDINVOICE_CONFIG_DIR` 环境变量的原因解耦配置位置与应用代码。
 ### 4. 安装前与安装后的 APP_SECRET
 
 **安装前**：`RequestListener` 用 Session ID 作为临时 `APP_SECRET`
@@ -577,7 +589,7 @@ GitHub Actions CI 触发
 
 ### 5. 嵌入式应用的解压与缓存
 
-[app.go](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/frankenphp/app.go#L686-L703) 中的 `extractEmbeddedApp` 函数有一个巧妙的缓存机制：
+[frankenphp/app.go](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/frankenphp/app.go#L686-L703) 中的 `extractEmbeddedApp` 函数有一个巧妙的缓存机制：
 
 ```go
 appPath := filepath.Join(appDir, "."+appName, "app_"+string(embeddedAppChecksum))
@@ -591,7 +603,7 @@ appPath := filepath.Join(appDir, "."+appName, "app_"+string(embeddedAppChecksum)
 
 ### 6. 构建脚本的 --local 模式
 
-[build_dist.sh](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/scripts/build_dist.sh) 和 [build_binary.sh](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/scripts/build_binary.sh) 都支持 `--local` 模式：
+[scripts/build_dist.sh](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/scripts/build_dist.sh) 和 [scripts/build_binary.sh](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/scripts/build_binary.sh) 都支持 `--local` 模式：
 
 | 模式 | 行为 | 适用场景 |
 |------|------|----------|
