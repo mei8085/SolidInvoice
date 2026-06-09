@@ -199,6 +199,381 @@ go build \
 
 ---
 
+## Kubernetes / Helm 部署架构
+
+SolidInvoice 提供了完整的 Helm Chart 用于 Kubernetes 部署，位于 helm/solidinvoice/ 目录。Chart 遵循 Kubernetes 最佳实践，通过 ConfigMap、Secret、PVC、Job、Deployment 等多种资源协同工作，实现了配置管理、数据持久化、自动安装、数据库迁移和异步任务处理。
+
+### 1. Helm Chart 总览
+
+[helm/solidinvoice/Chart.yaml](helm/solidinvoice/Chart.yaml) 定义了 Chart 的基本信息和依赖：
+
+| 依赖子 Chart | 用途 | 条件 |
+|-------------|------|------|
+| mysql (Bitnami) | MySQL 数据库 | mysql.enabled=true |
+| postgresql (Bitnami) | PostgreSQL 数据库 | postgresql.enabled=true |
+| redis (Bitnami) | Redis 消息队列/缓存 | edis.enabled=true |
+| meilisearch | Meilisearch 搜索引擎 | meilisearch.enabled=true |
+
+**核心资源清单：**
+
+`
+configmap.yaml        # 非敏感环境变量
+secret.yaml           # 敏感配置（密钥、数据库密码等）
+pvc.yaml              # 配置目录持久化
+deployment.yaml       # Web 主应用 Deployment
+service.yaml          # Service
+ingress.yaml          # Ingress（可选）
+hpa.yaml              # 水平自动扩缩（可选）
+pdb.yaml              # Pod Disruption Budget
+networkpolicy.yaml    # 网络策略
+serviceaccount.yaml   # 服务账号
+jobs/
+  install.yaml        # 首次安装 Job（pre-install hook）
+  install-secret.yaml # 安装用 admin 凭证 Secret
+  migrate.yaml        # 数据库迁移 Job（pre-upgrade hook）
+worker/
+  deployment.yaml     # Messenger Worker Deployment
+  hpa.yaml            # Worker HPA
+`
+
+---
+
+### 2. ConfigMap  非敏感配置中心
+
+[helm/solidinvoice/templates/configmap.yaml](helm/solidinvoice/templates/configmap.yaml) 存储所有非敏感的环境变量，作为应用配置的第一层。
+
+**包含的配置项：**
+
+| 变量 | 作用 | 来源 |
+|------|------|------|
+| SOLIDINVOICE_ENV | 运行环境（prod） | 硬编码 |
+| SOLIDINVOICE_DEBUG | 调试模式开关（0） | 硬编码 |
+| SOLIDINVOICE_DOCKER | Docker 环境标记 | 硬编码 |
+| SOLIDINVOICE_CONFIG_DIR | Vault 配置目录（/etc/solidinvoice） | 硬编码 |
+| SOLIDINVOICE_LOCALE | 应用语言 | alues.yaml  pp.locale |
+| SOLIDINVOICE_ALLOW_REGISTRATION | 是否允许公开注册 | alues.yaml  pp.allowRegistration |
+| SOLIDINVOICE_MAILER_SENDER | 邮件发件人地址 | alues.yaml  mailer.sender |
+| SOLIDINVOICE_SENTRY_RELEASE | Sentry 版本号 | 可选，sentry.enabled=true 时 |
+| FRANKENPHP_WORKER_MODE | FrankenPHP Worker 模式 | 可选，pp.workerMode=true 时 |
+
+**设计要点：**
+- ConfigMap 只存**非敏感**配置，敏感信息全部走 Secret
+- 所有 Pod（主应用、Worker、Job）都通过 envFrom.configMapRef 统一加载
+
+---
+
+### 3. Secret  敏感配置管理
+
+[helm/solidinvoice/templates/secret.yaml](helm/solidinvoice/templates/secret.yaml) 管理所有敏感配置，包括密钥、数据库连接、消息队列 DSN 等。
+
+#### 3.1 APP_SECRET 的保留机制
+
+Secret 中有一个关键设计：**SOLIDINVOICE_APP_SECRET 跨升级保留**。
+
+`yaml
+{{- if .Values.app.secret }}
+  SOLIDINVOICE_APP_SECRET: {{ .Values.app.secret | quote }}
+{{- else if and $existingSecret (index $existingSecret.data "SOLIDINVOICE_APP_SECRET") }}
+  SOLIDINVOICE_APP_SECRET: {{ index $existingSecret.data "SOLIDINVOICE_APP_SECRET" | b64dec | quote }}
+{{- else }}
+  SOLIDINVOICE_APP_SECRET: {{ randAlphaNum 64 | quote }}
+{{- end }}
+`
+
+**三级回退逻辑：**
+1. **显式设置**：如果 alues.yaml 中指定了 pp.secret，使用它
+2. **保留现有值**：通过 Helm lookup 函数查询集群中已存在的 Secret，复用旧值
+3. **随机生成**：首次安装时，用 andAlphaNum 64 生成 64 位随机字符串
+
+>  **为什么要保留？**
+> APP_SECRET 用于 Symfony 的 CSRF 保护、Cookie 加密、Sessions 等。如果升级时重新生成，会导致所有用户会话失效、已签名的 URL 失效等问题。
+
+#### 3.2 其他敏感配置
+
+| 配置项 | 优先级逻辑 |
+|--------|-----------|
+| SOLIDINVOICE_DATABASE_URL | externalDatabase.url > mysql subchart > postgresql subchart |
+| SOLIDINVOICE_MAILER_DSN | 存在 mailer.existingSecret 时走外部 Secret，否则存本 Secret |
+| SOLIDINVOICE_MESSENGER_DSN | messenger.dsn > redis subchart > doctrine://default |
+| SOLIDINVOICE_SENTRY_DSN | sentry.dsn（可选） |
+| OAuth 凭证 | Google OAuth 等（可选） |
+
+#### 3.3 外部 Secret 支持
+
+对于数据库密码、邮件 DSN 等敏感信息，Chart 支持引用集群中已有的 Secret（通过 existingSecret 配置），无需将明文写入 values.yaml。
+
+---
+
+### 4. PVC  Secrets Vault 持久化
+
+[helm/solidinvoice/templates/pvc.yaml](helm/solidinvoice/templates/pvc.yaml) 为 /etc/solidinvoice 目录提供持久化存储。
+
+**关键设计：**
+
+`yaml
+metadata:
+  annotations:
+    helm.sh/resource-policy: keep   # Helm 卸载时保留 PVC
+spec:
+  accessModes:
+    - ReadWriteOnce                  # 默认单节点读写
+  resources:
+    requests:
+      storage: 1Gi                   # 1GB 存储空间
+`
+
+**为什么需要持久化？**
+
+/etc/solidinvoice 目录存放的是 Symfony Secrets Vault 的加密文件：
+- defuse.encrypt.key  加密密钥（首次运行自动生成）
+- pp.base64 等加密配置文件
+
+这些文件一旦丢失，所有已加密的配置就无法解密。所以 PVC 设置了 helm.sh/resource-policy: keep，即使执行 helm uninstall 也不会删除 PVC。
+
+**多副本注意事项：**
+- 默认 ReadWriteOnce 只允许单节点挂载
+- 如果 eplicaCount > 1，需要使用 ReadWriteMany 的 StorageClass 或外部共享存储
+
+---
+
+### 5. 安装 Job  首次部署初始化
+
+[helm/solidinvoice/templates/jobs/install.yaml](helm/solidinvoice/templates/jobs/install.yaml) 是 pre-install Hook，在首次安装时自动运行 CLI 安装向导。
+
+#### 5.1 触发条件与时机
+
+| 属性 | 值 | 含义 |
+|------|---|------|
+| helm.sh/hook | pre-install | 在 Helm 安装主资源之前执行 |
+| helm.sh/hook-weight |  | 执行权重 |
+| helm.sh/hook-delete-policy | efore-hook-creation,hook-succeeded | 成功后删除，下次创建前先删旧的 |
+| ackoffLimit | 可配置（默认 1） | 失败重试次数 |
+
+#### 5.2 安装流程
+
+`
+检查是否已安装  已安装  退出（幂等）
+      未安装
+ 运行 app:install 命令
+     
+ 配置数据库连接
+     
+ 创建管理员账号
+     
+ 写入安装标记到 Vault
+`
+
+**核心命令：**
+`ash
+/usr/local/bin/solidinvoice console app:install \
+  --database-driver=pdo_mysql \
+  --database-host=... \
+  --admin-email="" \
+  --admin-password="" \
+  --no-interaction
+`
+
+#### 5.3 admin 凭证 Secret
+
+[helm/solidinvoice/templates/jobs/install-secret.yaml](helm/solidinvoice/templates/jobs/install-secret.yaml) 存储安装用的管理员凭证，Hook 权重为 -5（比安装 Job 更早执行）。
+
+安装凭证有两种来源：
+- 直接在 alues.yaml 中设置 install.adminEmail 和 install.adminPassword（不推荐生产环境）
+- 通过 install.existingSecret 引用已有的 Secret
+
+安装成功后，这个 Secret 会被自动删除（hook-succeeded 策略）。
+
+#### 5.4 数据库等待 InitContainer
+
+如果启用了 MySQL 或 PostgreSQL 子 Chart，安装 Job 会有一个 wait-for-mysql / wait-for-postgresql InitContainer，用 
+c -z 轮询数据库端口，确保数据库就绪后再开始安装。
+
+---
+
+### 6. 迁移 Job  升级时数据库迁移
+
+[helm/solidinvoice/templates/jobs/migrate.yaml](helm/solidinvoice/templates/jobs/migrate.yaml) 是 pre-upgrade Hook，在每次 Helm 升级时先执行数据库迁移。
+
+| 属性 | 值 | 含义 |
+|------|---|------|
+| helm.sh/hook | pre-upgrade | 在 Helm 升级主资源之前执行 |
+| ctiveDeadlineSeconds | 可配置 | 最长执行时间，防止卡死 |
+| estartPolicy | OnFailure | 失败时重启 Pod 重试 |
+
+**执行命令：**
+`ash
+/usr/local/bin/solidinvoice console doctrine:migrations:migrate \
+  --no-interaction --no-ansi
+`
+
+**协作关系：**
+- 迁移 Job 运行时，旧版本的 Deployment 还在运行
+- 迁移完成后，Helm 才开始滚动更新 Deployment
+- 保证数据库 schema 先升级，应用代码后升级
+
+---
+
+### 7. Worker Deployment  异步任务处理
+
+[helm/solidinvoice/templates/worker/deployment.yaml](helm/solidinvoice/templates/worker/deployment.yaml) 运行独立的 Messenger Consumer Worker。
+
+#### 7.1 为什么要独立 Deployment？
+
+SolidInvoice 使用 Symfony Messenger 处理异步任务（发送邮件、生成 PDF、通知等）。Chart 选择了**独立 Deployment** 的架构，而不是在主应用里跑 worker：
+
+**主应用 Deployment 启动参数：**
+`ash
+solidinvoice run --disable-https --messenger-workers=0
+`
+
+**Worker Deployment 启动参数：**
+`ash
+solidinvoice worker --workers=N
+`
+
+**架构优势：**
+- **独立扩缩容**：Web 流量和任务量的峰值不一定同步，可以分别调整副本数
+- **独立资源配置**：Worker 通常更吃 CPU 和内存，可以单独设置 requests/limits
+- **故障隔离**：Worker 崩溃不影响 Web 服务，反之亦然
+- **独立 HPA**：Worker 可以基于队列长度或 CPU 利用率自动扩缩
+
+#### 7.2 Worker 健康检查
+
+Worker 使用 exec 类型的 liveness probe，检查 messenger:consume 进程是否存在：
+
+`ash
+ps aux | grep '[m]essenger:consume' | grep -v grep
+`
+
+初始延迟 60 秒，每 60 秒检查一次，给 Worker 启动和任务处理留出充足时间。
+
+---
+
+### 8. 主 Deployment  Web 服务
+
+[helm/solidinvoice/templates/deployment.yaml](helm/solidinvoice/templates/deployment.yaml) 是主要的 Web 应用 Deployment。
+
+#### 8.1 滚动更新策略
+
+`yaml
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1        # 升级时最多新增 1 个 Pod
+    maxUnavailable: 0  # 升级过程中不可用 Pod 数为 0
+`
+
+确保升级过程零停机。
+
+#### 8.2 配置变更触发滚动更新
+
+Pod template 的 annotations 中包含 ConfigMap 和 Secret 的 checksum：
+
+`yaml
+annotations:
+  checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+  checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+`
+
+当 ConfigMap 或 Secret 内容变化时，checksum 会变化，触发 Deployment 滚动更新，确保 Pod 使用最新配置。
+
+#### 8.3 健康检查
+
+使用 /health 端点进行三类探针：
+- **startupProbe**：启动探针，最多等待 300 秒（30 次  10 秒）
+- **livenessProbe**：存活探针，每 15 秒检查一次
+- **readinessProbe**：就绪探针，每 10 秒检查一次
+
+#### 8.4 统一的环境变量注入
+
+通过 solidinvoice.commonEnv 模板（定义在 _env.tpl）实现统一的环境变量注入：
+
+`yaml
+envFrom:
+  - configMapRef:
+      name: {{ include "solidinvoice.fullname" . }}
+  - secretRef:
+      name: {{ include "solidinvoice.fullname" . }}
+`
+
+ConfigMap + Secret 通过 envFrom 批量注入，再加上按需添加的特殊 env 条目（如外部数据库 Secret 引用、Meilisearch 配置等）。
+
+---
+
+### 9. 资源协作全景
+
+#### 9.1 首次安装时序
+
+`
+helm install
+    
+     0. 先创建 PVC（同步等待绑定）
+    
+     pre-install hook 阶段
+         Hook Weight -5: install-secret（admin 凭证）
+         Hook Weight  0: install Job
+                Init: wait-for-mysql（等待数据库就绪）
+                运行 app:install 命令
+                     配置数据库
+                     创建管理员
+                     写入安装标记到 Vault
+    
+     主资源创建
+          ConfigMap
+          Secret
+          Service
+          主 Deployment
+          Worker Deployment
+`
+
+#### 9.2 升级部署时序
+
+`
+helm upgrade
+    
+     pre-upgrade hook 阶段
+         Hook Weight 0: migrate Job
+              运行 doctrine:migrations:migrate
+    
+     主资源滚动更新
+          ConfigMap 变更  checksum 变化  Deployment 滚动
+          Secret 变更   checksum 变化  Deployment 滚动
+          主 Deployment 滚动更新
+          Worker Deployment 滚动更新
+`
+
+#### 9.3 配置数据流
+
+`
+values.yaml
+    
+     configmap.yaml  ConfigMap 资源 
+                                           envFrom  所有 Pod
+     secret.yaml  Secret 资源 
+    
+     外部 Secret 引用（existingSecret）
+          数据库密码（subchart secret）
+          邮件 DSN
+          Sentry DSN
+          OAuth 凭证
+`
+
+#### 9.4 Secrets Vault 数据流向
+
+`
+PVC (/etc/solidinvoice)
+    
+     所有 Pod 挂载（主应用、Worker、Job）
+         读取加密的 Vault 文件
+         使用 defuse 密钥解密
+    
+     写入操作
+          安装 Job 写入安装标记、数据库配置等
+          应用运行时通过 ConfigWriter 动态写入
+`
+
+---
+
 ## 环境变量加载机制
 
 SolidInvoice 的环境变量体系是**五层叠加**的结构，从外到内逐层覆盖。
@@ -636,6 +1011,20 @@ appPath := filepath.Join(appDir, "."+appName, "app_"+string(embeddedAppChecksum)
 - [packaging/nfpm.yaml](packaging/nfpm.yaml) — 系统包配置
 - [packaging/systemd/solidinvoice.service](packaging/systemd/solidinvoice.service) — systemd 服务单元
 - [packaging/systemd/solidinvoice.env](packaging/systemd/solidinvoice.env) — 环境配置模板
+
+### Kubernetes / Helm
+- [helm/solidinvoice/Chart.yaml](helm/solidinvoice/Chart.yaml)  Helm Chart 定义与依赖
+- [helm/solidinvoice/values.yaml](helm/solidinvoice/values.yaml)  默认配置值
+- [helm/solidinvoice/templates/configmap.yaml](helm/solidinvoice/templates/configmap.yaml)  ConfigMap 模板
+- [helm/solidinvoice/templates/secret.yaml](helm/solidinvoice/templates/secret.yaml)  Secret 模板
+- [helm/solidinvoice/templates/pvc.yaml](helm/solidinvoice/templates/pvc.yaml)  PVC 模板
+- [helm/solidinvoice/templates/deployment.yaml](helm/solidinvoice/templates/deployment.yaml)  主应用 Deployment
+- [helm/solidinvoice/templates/jobs/install.yaml](helm/solidinvoice/templates/jobs/install.yaml)  安装 Job
+- [helm/solidinvoice/templates/jobs/install-secret.yaml](helm/solidinvoice/templates/jobs/install-secret.yaml)  安装凭证 Secret
+- [helm/solidinvoice/templates/jobs/migrate.yaml](helm/solidinvoice/templates/jobs/migrate.yaml)  迁移 Job
+- [helm/solidinvoice/templates/worker/deployment.yaml](helm/solidinvoice/templates/worker/deployment.yaml)  Worker Deployment
+- [helm/solidinvoice/templates/_env.tpl](helm/solidinvoice/templates/_env.tpl)  环境变量模板
+- [helm/solidinvoice/templates/_helpers.tpl](helm/solidinvoice/templates/_helpers.tpl)  通用模板助手
 
 ### 环境变量与配置
 - [src/CoreBundle/ConfigWriter.php](src/CoreBundle/ConfigWriter.php) — 配置写入器
