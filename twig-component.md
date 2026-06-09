@@ -270,18 +270,68 @@ BundleNameBundle/
 {# 无参数调用 #}
 <twig:ClientForm />
 
-{# 传递属性（字面量） #}
+{# 传递属性：使用 PHP 属性名 #}
 <twig:ClientForm :client="client" />
 
 {# 传递多个属性 #}
-<twig:CreateInvoice :form="form" :dto="dto" :isEdit="isEdit" />
+<twig:CreateInvoice :form="form" :dto="dto" :isEdit="isEdit" :invoice="invoice|default(null)" />
 ```
 
 **属性传递规则**：
 - 使用 `:name="value"` 语法传递属性
-- 属性名对应组件类中的公共属性或 `#[LiveProp]` 属性
-- 对于 `#[LiveProp(fieldName: 'xxx')]`，模板中使用 `:xxx="value"` 传递
+- **模板中的属性名对应组件类中的 PHP 属性名**（如 `:client="client"` 对应 `public ?Client $client`）
+- `fieldName` 是 Live Component 内部数据存储的字段名，**不**影响模板调用时的属性名
 - 非 `LiveProp` 的公共属性也可以直接传递（仅首次挂载时有效）
+- 对于 `#[LiveProp(fieldName: 'xxx')]`，模板中仍然使用**PHP 属性名**传递，不是 `fieldName` 的值
+
+### `fieldName` 的作用与表单水合
+
+`fieldName` 是 `#[LiveProp]` 的一个选项，用于指定该属性在 Live Component 内部数据结构中的存储字段名。它主要影响表单数据的序列化和水合（hydration）。
+
+#### 两种典型的 fieldName 模式
+
+| fieldName 值 | 含义 | 适用场景 | 组件示例 |
+|-------------|------|---------|---------|
+| `'formData'` | 表单底层数据对象 | 属性本身就是表单绑定的数据实体/DTO | ClientForm、ContactInfo、AddressInfo、CreateRecurringInvoice |
+| `'xxxEntity'` | 引用实体（非表单数据） | 用于标识或上下文，不是表单直接绑定的数据 | CreateInvoice (`invoiceEntity`)、CreateQuote (`quoteEntity`) |
+
+#### fieldName: 'formData' 的特殊意义
+
+当 `#[LiveProp(fieldName: 'formData')]` 时，Live Component 知道这个属性是表单的底层数据对象。在表单提交和重渲染时：
+
+1. **序列化（输出到前端）**：将实体/DTO 序列化为表单数据，存储在 `formData` 字段中
+2. **水合（从前端接收）**：将前端传回的 `formData` 数据反序列化回实体/DTO 对象
+3. **表单提交**：`submitForm()` 时使用 `formData` 中的数据重建表单并提交
+
+**示例：ClientForm 中的 formData**
+
+```php
+// 组件类
+#[LiveProp(fieldName: 'formData')]
+public ?Client $client = null;
+
+// 模板调用——注意：用的是属性名 client，不是 formData
+// <twig:ClientForm :client="client" />
+```
+
+> `fieldName: 'formData'` 是与 `ComponentWithFormTrait` / `LiveCollectionTrait` 配合使用的约定。当属性是表单直接绑定的数据对象时，应该使用 `fieldName: 'formData'` 以确保表单数据的正确序列化和水合。
+
+#### fieldName: 'xxxEntity' 的意义
+
+当属性只是用于标识或上下文（不是表单直接绑定的数据）时，使用自定义的 fieldName。
+
+**示例：CreateInvoice 中的 invoiceEntity**
+
+```php
+// 组件类
+#[LiveProp(writable: false, fieldName: 'invoiceEntity')]
+public ?Invoice $invoice = null;
+
+// 模板调用——注意：用的是属性名 invoice，不是 invoiceEntity
+// <twig:CreateInvoice :invoice="invoice|default(null)" />
+```
+
+这种情况下，`$invoice` 只是用来标识"编辑模式下的发票实体"，不是表单直接绑定的数据（表单绑定的是 `$dto`）。`fieldName: 'invoiceEntity'` 只是在内部数据中给它一个明确的存储名。
 
 ---
 
