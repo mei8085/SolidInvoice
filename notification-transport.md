@@ -192,7 +192,64 @@ public function onWorkflowTransitionApplied(Event $event): void
 - **参数：** 只有 invoice 对象
 - **覆盖的 transitions：** accept, pay, cancel, overdue, reopen, archive, activate 等
 
-#### 2.4.2 发送发票动作：间接触发
+#### 2.4.2 ⚠️ 创建发票时的重复通知（确定结论：两次重复）
+
+**关键发现：发票创建时（new 转换）会触发两次 invoice_status_update 通知！**
+
+**调用链路（基于 InvoiceManager::create()）：**
+
+```
+InvoiceManager::create()
+    │
+    ├─ $invoice->setStatus(InvoiceStatus::New)  // 先设为 New
+    ├─ entityManager->persist + flush
+    │
+    └─ applyTransition($invoice)
+          │
+          ├─ $invoiceStateMachine->apply('new')  // New → Draft
+          │     │
+          │     └─ 触发 workflow.invoice.entered 事件
+          │           │
+          │           ▼
+          │     WorkFlowSubscriber::onWorkflowTransitionApplied()
+          │           │
+          │           └─ 状态不是 New/Draft → sendNotification()  ← 第 1 次通知
+          │
+          └─ sendNotification(InvoiceStatusNotification)  ← 第 2 次通知
+```
+
+**为什么会重复：**
+
+1. `new` 转换的目标状态是 `Draft`（不是 New），所以 WorkFlowSubscriber 的判断 `!$isNew` 为 true
+2. InvoiceManager::applyTransition() 在 stateMachine->apply() 返回后，自己又调用了一次 sendNotification
+3. 两次都是针对同一个状态变更（New → Draft）
+
+**工作流配置验证：** [workflow.php](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/config/packages/workflow.php#L54-L57)
+
+```php
+$invoiceWorkflow
+    ->transition()
+    ->name(InvoiceGraph::TRANSITION_NEW)
+    ->from(InvoiceStatus::New->value)
+    ->to(InvoiceStatus::Draft->value);  // New → Draft，不是保持 New
+```
+
+**状态判断验证：** [WorkFlowSubscriber 第 70-77 行](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/Listener/WorkFlowSubscriber.php#L70-L77)
+
+```php
+$isNew = match (true) {
+    $invoice instanceof Invoice => InvoiceStatus::New === $invoice->getStatus(),
+    $invoice instanceof RecurringInvoice => RecurringInvoiceStatus::New === $invoice->getStatus(),
+};
+
+if (! $isNew) {
+    $this->notification->sendNotification(new InvoiceStatusNotification(['invoice' => $invoice]));
+}
+```
+
+> 注意：代码中只判断 `New` 状态，不判断 `Draft`。只要状态不是 New，就发通知。
+
+#### 2.4.3 发送发票动作：间接触发（不重复）
 
 **文件：** [Invoice Send Action](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/Action/Transition/Send.php)
 
@@ -217,19 +274,19 @@ public function __invoke(Request $request, Invoice $invoice): RedirectResponse
 - **触发方式：** 间接（通过 `accept` 转换 → 触发 `entered` 事件 → WorkFlowSubscriber）
 - **业务动作：** 给客户发发票邮件（业务邮件，不是通知系统）
 - **通知触发链路：** `SendAction` → `apply('accept')` → `workflow.invoice.entered` → `WorkFlowSubscriber` → `sendNotification()`
+- **是否重复：** 不重复，只有 WorkFlowSubscriber 发一次
 
-#### 2.4.3 触发汇总
+#### 2.4.4 触发汇总
 
-| 位置 | 触发方式 | Transition | 参数 | 场景 |
-|------|---------|-----------|------|------|
-| InvoiceManager::applyTransition | 直接调用 | `new` | 完整 | 创建发票 |
-| WorkFlowSubscriber | 监听 entered 事件 | 所有状态变更 | 只有 invoice | 状态变化（accept/pay/cancel 等）|
-| SendAction | 间接触发（通过 WorkFlowSubscriber） | `accept` | 只有 invoice | 发送发票 |
+| 场景 | 触发方式 | Transition | 通知次数 | 是否重复 |
+|------|---------|-----------|---------|---------|
+| 创建发票 | InvoiceManager 直接调用 + WorkFlowSubscriber 监听 | `new` (New→Draft) | **2 次** | **重复 ⚠️** |
+| 发送发票 | WorkFlowSubscriber 监听（SendAction 间接触发） | `accept` (Draft→Pending) | 1 次 | 不重复 |
+| 支付发票 | WorkFlowSubscriber 监听 | `pay` | 1 次 | 不重复 |
+| 取消/逾期/归档等 | WorkFlowSubscriber 监听 | cancel/overdue/archive 等 | 1 次 | 不重复 |
+| 从报价转发票 | WorkFlowSubscriber 监听 | `new` (New→Draft) | 1 次 | 不重复* |
 
-> **是否重复？** 
-> - 创建发票时：InvoiceManager 发一次，WorkflowSubscriber 也发一次 → **可能重复**
-> - 发送发票时：只有 WorkFlowSubscriber 发一次 → 不重复
-> - 其他状态变更：只有 WorkFlowSubscriber 发一次 → 不重复
+> *从报价转发票时，直接调用 `invoiceStateMachine->apply('new')`，不走 InvoiceManager::create()，所以只有 WorkFlowSubscriber 发一次。
 
 ---
 
@@ -545,7 +602,7 @@ public function postPersist(LifecycleEventArgs $event): void
 
 **触发时机：** Doctrine `postPersist` 生命周期事件（新客户保存到数据库后）
 
-#### 2.7.3 发票逾期通知
+#### 2.9.3 发票逾期通知
 
 **监听器：** [InvoiceOverdueListener](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/Listener/InvoiceOverdueListener.php#L38-L59)
 
@@ -560,13 +617,9 @@ public static function getSubscribedEvents(): array
 
 **触发时机：** 发票进入 `overdue`（逾期）状态时
 
-#### 2.7.4 发票催缴通知
+#### 2.9.4 发票催缴通知
 
-**处理器：** [SendInvoiceReminderHandler](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/MessageHandler/SendInvoiceReminderHandler.php)
-
-两种通知：
-- `invoice_reminder` - 催缴提醒（Overdue7、Overdue30 等）
-- `invoice_reminder_stopped` - 催缴停止（Overdue14）
+详见 [链路二：发票提醒通知](#25-链路二发票提醒通知invoice_reminder--invoice_reminder_stopped)。
 
 **触发方式：** Messenger 消息处理器，由定时任务或手动触发
 
