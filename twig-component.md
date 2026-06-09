@@ -339,14 +339,14 @@ public ?Invoice $invoice = null;
 
 SolidInvoice 中 Live Component 与表单结合有 **两种不同的使用模式**，适用于不同场景。
 
-### 模式 A：组件完全自建表单
+### 模式 A：组件自建表单
 
-**特点**：表单完全由 Live Component 内部创建和管理，页面模板不传递 form 变量。
+**特点**：`form` 对象由 Live Component 内部通过 `instantiateForm()` 创建，页面模板**不传递 `form` 变量**。页面模板可以传递数据实体（如 `:client="client"`）作为表单的初始数据，但 form 对象本身由组件创建。
 
 **适用场景**：
-- 简单的独立表单
-- 表单数据完全由组件内部逻辑决定
-- 不需要 Action 层干预表单初始化
+- 独立的表单组件
+- 表单数据结构固定
+- 组件自包含程度高
 
 **数据流**：
 
@@ -548,21 +548,34 @@ final class CreateInvoice extends AbstractController
 
 | 特性 | 模式 A：组件自建 | 模式 B：页面传参 |
 |------|---------------|----------------|
-| 表单创建位置 | 组件 `instantiateForm()` | Action 中创建，再传入组件 |
-| DTO 初始化位置 | 组件构造函数或 `#[PostMount]` | Action 中 |
-| 传统表单提交支持 | 不支持（仅 AJAX） | 支持（降级方案） |
-| 代码复杂度 | 较低（组件自包含） | 较高（两层都有表单逻辑） |
-| 适用场景 | 简单独立表单 | 复杂表单、需要初始化 |
-| 首次渲染性能 | 稍慢（组件内建表单） | 稍快（Action 已建好） |
-| URL 参数依赖处理 | 在组件内处理 | 在 Action 中处理 |
+| **form 对象创建位置** | 完全由组件的 `instantiateForm()` 创建 | 首次渲染用传入的 form，AJAX 时用 `instantiateForm()` 重建 |
+| **页面向组件传什么** | 不传 form，可传数据实体/DTO | 传 form + 数据实体/DTO |
+| 数据初始化位置 | 组件构造函数、`#[PostMount]` 或组件内部逻辑 | Action 中 |
+| **无 JS 降级支持** | 不一定——取决于 Action 层是否处理传统提交 | 通常支持（Action 层有 form 用于降级） |
+| 代码复杂度 | 较低（组件自包含） | 较高（两层都有表单相关逻辑） |
+| 适用场景 | 独立表单组件、简单表单 | 复杂表单、需要 Action 层初始化 |
+| AJAX 提交方式 | `submitForm()` + `#[LiveAction]` | `submitForm()` + `#[LiveAction]` |
+| 表单水合机制 | 基于 `formData`（fieldName: 'formData' 的属性） | 基于 `formData`（数据属性作为 formData） |
+
+> **重要澄清**：无 JS 降级支持与模式 A/B **没有必然联系**。是否支持降级，取决于 Action 层是否 `handleRequest` 并处理 `isSubmitted() && isValid()`。ClientForm 属于模式 A（自建 form），但它的 Action 层也处理了传统提交，所以也支持降级。
 
 ### 重要说明：关于 `instantiateForm()`
 
-无论使用哪种模式，**Live Component 始终需要 `instantiateForm()` 方法**。原因：
+无论使用哪种模式，**带表单的 Live Component 始终需要 `instantiateForm()` 方法**。原因：
 
-1. **首次渲染（模式 A）**：组件完全自己创建表单
-2. **首次渲染（模式 B）**：虽然从模板传入了初始 form，但组件会用传入的 form 初始化内部状态
-3. **AJAX 重渲染**：每次 AJAX 请求后，组件都需要通过 `instantiateForm()` 重建表单，然后提交数据
+1. **模式 A（首次渲染 + AJAX）**：所有表单都通过此方法创建
+2. **模式 B（首次渲染）**：传入的 form 作为初始状态，但组件需要知道如何建 form
+3. **模式 B（AJAX 重渲染）**：每次 AJAX 请求后，组件都需要通过 `instantiateForm()` 重建表单，然后用前端传回的数据填充
+
+### 表单水合（hydration）机制
+
+表单数据在前端和后端之间的传递依赖 Live Component 的水合机制：
+
+1. **序列化（后端 → 前端）**：组件渲染时，将 `#[LiveProp]` 属性序列化为 JSON，存在前端 `data-live-props-value` 属性中
+2. **水合（前端 → 后端）**：AJAX 请求时，前端将 props 数据传回，后端反序列化重建对象
+3. **`fieldName: 'formData'` 的特殊作用**：标记某个属性是表单的底层数据对象，`ComponentWithFormTrait` / `LiveCollectionTrait` 会用它来关联表单数据
+
+> 对于使用 `LiveCollectionTrait` 的组件，通常有一个属性使用 `fieldName: 'formData'`，这个属性就是表单 `getData()` 返回的数据对象。表单提交时，数据会同步回这个属性。
 
 ---
 
