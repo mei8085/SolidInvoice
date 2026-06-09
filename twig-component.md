@@ -288,50 +288,68 @@ BundleNameBundle/
 
 `fieldName` 是 `#[LiveProp]` 的一个选项，用于指定该属性在 Live Component 内部数据结构中的存储字段名。它主要影响表单数据的序列化和水合（hydration）。
 
-#### 两种典型的 fieldName 模式
+> **重要说明**：`fieldName` 是**内部存储字段名**，**不影响**模板调用时的属性名。模板中始终使用 **PHP 属性名** 传递属性。
 
-| fieldName 值 | 含义 | 适用场景 | 组件示例 |
-|-------------|------|---------|---------|
-| `'formData'` | 表单底层数据对象 | 属性本身就是表单绑定的数据实体/DTO | ClientForm、ContactInfo、AddressInfo、CreateRecurringInvoice |
+#### fieldName 的三种典型用法
+
+| fieldName 值 | 含义 | 作用 | 组件示例 |
+|-------------|------|------|---------|
+| `'formData'` | 表单数据对象 | 将属性标记为表单直接绑定的数据对象，参与表单水合 | ClientForm、ContactInfo、AddressInfo、CreateRecurringInvoice |
 | `'xxxEntity'` | 引用实体（非表单数据） | 用于标识或上下文，不是表单直接绑定的数据 | CreateInvoice (`invoiceEntity`)、CreateQuote (`quoteEntity`) |
+| 不设置 | 默认存储名 | 属性名即为内部存储字段名 | Settings (`section`)、DataGrid (`page`、`sort`) |
 
-#### fieldName: 'formData' 的特殊意义
+#### 类型一：fieldName: 'formData'（表单数据对象）
 
-当 `#[LiveProp(fieldName: 'formData')]` 时，Live Component 知道这个属性是表单的底层数据对象。在表单提交和重渲染时：
+当 `#[LiveProp(fieldName: 'formData')]` 时，这个属性就是表单**直接绑定**的数据对象。表单提交后，数据会同步回这个属性。
 
-1. **序列化（输出到前端）**：将实体/DTO 序列化为表单数据，存储在 `formData` 字段中
-2. **水合（从前端接收）**：将前端传回的 `formData` 数据反序列化回实体/DTO 对象
-3. **表单提交**：`submitForm()` 时使用 `formData` 中的数据重建表单并提交
-
-**示例：ClientForm 中的 formData**
+**示例：ClientForm**
 
 ```php
 // 组件类
 #[LiveProp(fieldName: 'formData')]
 public ?Client $client = null;
 
-// 模板调用——注意：用的是属性名 client，不是 formData
+// 模板调用——用 PHP 属性名 client，不是 formData
 // <twig:ClientForm :client="client" />
 ```
 
-> `fieldName: 'formData'` 是与 `ComponentWithFormTrait` / `LiveCollectionTrait` 配合使用的约定。当属性是表单直接绑定的数据对象时，应该使用 `fieldName: 'formData'` 以确保表单数据的正确序列化和水合。
+工作机制：
+1. **序列化**：渲染时将 `$client` 序列化为表单数据，存入内部 `formData` 字段
+2. **水合**：AJAX 请求时，从 `formData` 反序列化重建 `$client` 对象
+3. **表单提交**：`submitForm()` 后，表单数据更新到 `$client`
 
-#### fieldName: 'xxxEntity' 的意义
+> `fieldName: 'formData'` 是 `ComponentWithFormTrait` / `LiveCollectionTrait` 的约定方式。当属性本身就是表单绑定的数据实体时，使用此约定。
 
-当属性只是用于标识或上下文（不是表单直接绑定的数据）时，使用自定义的 fieldName。
+#### 类型二：fieldName: 'xxxEntity'（引用实体）
 
-**示例：CreateInvoice 中的 invoiceEntity**
+当属性只是用于标识或上下文（不是表单直接绑定的数据）时，用自定义的 fieldName 区分内部存储名。
+
+**示例：CreateInvoice 的 invoiceEntity**
 
 ```php
 // 组件类
 #[LiveProp(writable: false, fieldName: 'invoiceEntity')]
 public ?Invoice $invoice = null;
 
-// 模板调用——注意：用的是属性名 invoice，不是 invoiceEntity
+// 模板调用——用 PHP 属性名 invoice，不是 invoiceEntity
 // <twig:CreateInvoice :invoice="invoice|default(null)" />
 ```
 
-这种情况下，`$invoice` 只是用来标识"编辑模式下的发票实体"，不是表单直接绑定的数据（表单绑定的是 `$dto`）。`fieldName: 'invoiceEntity'` 只是在内部数据中给它一个明确的存储名。
+这种情况下，`$invoice` 只是"编辑模式下的发票实体"，用于标识和上下文，**不是**表单直接绑定的数据（表单绑定的是 `$dto`）。`fieldName: 'invoiceEntity'` 只是给它一个明确的内部存储名，避免与表单数据混淆。
+
+#### 类型三：不设置 fieldName（普通属性）
+
+不设置 `fieldName` 时，属性名直接作为内部存储名。通常用于简单的状态属性。
+
+**示例：Settings 的 section**
+
+```php
+// 组件类
+#[LiveProp(writable: true, onUpdated: 'onSectionChange', url: true)]
+public string $section = '';
+
+// 内部存储名就是 "section"
+```
 
 ---
 
@@ -1277,10 +1295,15 @@ Symfony Form 组件统一处理表单
 
 ### 6. 渐进增强模式
 
-表单支持降级到传统提交方式
-- 首选：AJAX 实时交互（Live Component）
-- 降级：整页刷新提交（Action 中处理）
-- 确保无 JS 环境下仍可正常使用
+有降级支持的表单采用渐进增强设计：
+
+- **基础层**：传统 HTML 表单提交（Action 层 `handleRequest` + `isSubmitted() && isValid()`）—— 无 JS 环境也能用
+- **增强层**：AJAX 实时交互（Live Component + `#[LiveAction]`）—— 有 JS 时体验更好
+
+> 是否支持降级取决于 Action 层是否处理了传统表单提交，与组件自建表单还是页面传参无关。
+>
+> - ✅ 支持降级：ClientForm、CreateInvoice、CreateQuote 等
+> - ❌ 不支持降级：Settings 等（Action 层极简，不处理提交）
 
 ---
 
