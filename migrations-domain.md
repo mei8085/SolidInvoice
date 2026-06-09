@@ -80,21 +80,22 @@
 
 **这是一次重大架构变更**，引入多租户（Company）隔离：
 
-1. 新建 `companies` 表和 `user_company` 关联表
-2. 为**所有业务表**增加 `company_id` 列（此时仍为 integer 类型）
-3. 主键从单 `id` 改为复合主键 `(id, company_id)`
-4. 调整唯一约束以包含 `company_id`（如 `clients.name` → `(name, company_id)`）
-5. 新增 `user_invitations` 表
-6. `payment.details` 列类型从 `object` 改为 `json`
+1. 新建 `companies` 表和 `user_company` 关联表 — **`companies` 表主键直接使用 ULID**（Symfony `UlidType`）
+2. 新增 `user_invitations` 表 — 主键同样直接使用 ULID
+3. 为**所有业务表**增加 `company_id` 列（**ULID 类型**，因为引用 `companies` 表主键）
+4. 业务表主键从单 `id`（integer 自增）改为复合主键 `(id, company_id)`，`id` 仍为 integer
+5. **删除所有引用单 `id` 列的外键约束**（因为主键变成复合的了，单例外键不再匹配）
+6. 调整唯一约束以包含 `company_id`（如 `clients.name` → `(name, company_id)`）
+7. `payment.details` 列类型从 `object` 改为 `json`
 
 **数据迁移策略**：
 - `preUp()` 关闭外键检查
 - `up()` 修改 Schema 结构
-- `postUp()` 将现有数据关联到默认公司（从 `app_config` 读取公司名）
+- `postUp()` 创建默认公司，将所有现有数据关联到该公司
 
 > 💡 **关键洞察**：这是一次破坏性变更。迁移后所有查询都必须带上 `company_id` 过滤条件，由运行时的 `CompanyFilter` 自动处理。
 >
-> **注意**：此时主键仍是 `integer` 类型，只是增加了 `company_id` 形成复合主键。真正的 ID 类型转换发生在 Version20201。
+> **重要时间点**：Version20200 是 ULID 首次出现在数据库中。`companies.id`、`user_invitations.id`、所有表的 `company_id` 都是 ULID 类型，但业务表自身的主键 `id` 仍然是 integer。
 
 #### 🔹 Version20201 — 主键从 Integer 迁移到 ULID（核心转换）
 [Version20201.php](migrations/Version20201.php)
@@ -148,7 +149,7 @@
 
 补充 `contact_types` 表的 `(name, company_id)` 唯一索引。
 
-#### 🔹 Version20300 — 金额大升级 + ULID 类型统一 + 结构调整
+#### 🔹 Version20300 — 金额大升级 + 遗留修复 + 结构调整
 [Version20300.php](migrations/Version20300.php)
 
 **注意**：这个版本的 ID 已经是 ULID 了。它主要做三件事：
@@ -159,15 +160,13 @@
 - 删除所有 `*_currency` 列（如 `total_currency`、`price_currency` 等）
 - 货币信息统一由 Client 实体的 `currency` 字段决定
 
-**二、ULID 类型统一**：
-- 从 `Ramsey\Uuid\Doctrine\UuidBinaryOrderedTimeType` 迁移到 `Symfony\Bridge\Doctrine\Types\UlidType`
-- 遍历所有表，检查列类型，如果是 `UuidBinaryOrderedTimeType` 则统一转换为 `UlidType`
-- 这解释了为什么 Version20201 已经转了 ULID，Version20300 还要再转一次 —— 库换了
-
-**三、关联表遗留问题修复**：
-- 显式设置 `invoice_contact`、`quote_contact`、`recurringinvoice_contact` 等关联表的外键列类型为 `UlidType`
-- 为这些关联表的 `company_id` 添加指向 `companies` 表的外键约束
-- （Version20201 中这些关联表的外键转换因为缺少 company_id 被跳过了，见 TODO 注释）
+**二、ULID 遗留问题修复**：
+- **关联表外键修复**：显式设置 `invoice_contact`、`quote_contact`、`recurringinvoice_contact` 等关联表的外键列类型为 `UlidType`
+- **关联表 company_id 外键**：为这些关联表的 `company_id` 添加指向 `companies` 表的外键约束
+- **Ramsey UUID 兜底转换**：遍历所有表，如果发现列类型是 Ramsey 的 `UuidBinaryOrderedTimeType`，则转换为 Symfony `UlidType`
+  - 这是**兜底/防御性**代码，标准迁移路径（20000→20200→20201）不会触发
+  - Version20201 用的就是 Symfony UlidType，不存在 Ramsey → Symfony 的转换
+  - 可能是为了兼容某些特殊升级路径或第三方 bundle
 
 **四、其他结构调整**：
 - 新增 `invoice_date` 列（独立的发票日期字段）
@@ -195,12 +194,6 @@
 [Version20306.php](migrations/Version20306.php)
 
 - 新增 `reset_password_request` 表（Symfony 标准重置密码表结构）
-- 从 `users` 表移除 `confirmation_token` 和 `password_requested_at`
-
-#### 🔹 Version20306 — 密码重置重构
-[Version20306.php](migrations/Version20306.php)
-
-- 新增 `reset_password_request` 表（Symfony C 标准重置密码表结构）
 - 从 `users` 表移除 `confirmation_token` 和 `password_requested_at`
 
 #### 🔹 Version20400_1 ~ 20400_5 — 2.4 系列增量变更
@@ -421,7 +414,8 @@ Doctrine 自动扫描 `src/` 目录下带有 `#[ORM\Entity]` 注解的类，无�
 | **迁移 (Version20000)** | integer 主键、deleted 软删除、amount+currency 双列 | `invoices` 表定义 |
 | **迁移 (Version20100)** | 移除 deleted、移除 is_recurring | 删除列操作 |
 | **迁移 (Version20200)** | 增加 company_id、复合主键 | `addCompanyToTable()` |
-| **迁移 (Version20300)** | ULID 主键、BigInteger 金额、移除 currency、增加 invoice_date | 类型转换 + 列增删 |
+| **迁移 (Version20201)** | 主键和外键从 integer 转 ULID（核心转换） | `migrate()` 七步算法 |
+| **迁移 (Version20300)** | BigInteger 金额、移除 currency、修复关联表外键遗留 | 金额升级 + 遗留修复 |
 | **实体定义** | PHP 属性 + ORM Attributes + Traits + Embeddable | [Invoice.php](src/InvoiceBundle/Entity/Invoice.php) |
 | **运行时映射** | CompanyFilter 自动加 company_id 条件、ArchivableFilter 过滤归档 | [CompanyFilter.php](src/CoreBundle/Doctrine/Filter/CompanyFilter.php) |
 
@@ -452,9 +446,10 @@ Doctrine 自动扫描 `src/` 目录下带有 `#[ORM\Entity]` 注解的类，无�
 
 5. **ID 类型和生成策略的变化**
    - 迁移 20000：自增整数 ID
-   - 迁移 20200：复合主键 (id, company_id)
-   - 迁移 20300：ULID 单主键
-   - 当前实体：ULID + 自定义生成器
+   - 迁移 20200：复合主键 (id integer + company_id ULID)
+   - 迁移 20201：ULID 单主键（核心转换，外键同步转换）
+   - 迁移 20300：修复关联表外键遗留（兜底）
+   - 当前实体：ULID + UlidGenerator 自定义生成器
 
 ### 5.3 关键架构决策的迁移轨迹
 
@@ -500,21 +495,215 @@ Version20300: 删除 *_currency 列，amount 升级为 BigInteger
 
 #### 决策 4：主键从 Integer 到 ULID
 ```
-Version20000-20200: 自增 integer 主键 (+ company_id 复合)
+Version20000: 自增 integer 单主键
         ↓
-Version20300: ULID 单主键 (二进制有序 UUID)
+Version20200: 复合主键 (id integer + company_id ULID)
+        ↓
+Version20201: 业务表主键转为 ULID (Symfony UlidType) + 外键自动转换
+        ↓  关联表外键有遗留
+Version20300: 修复关联表外键遗留 + Ramsey UUID 兜底转换
+        ↓
+Version20305: 关联表删除冗余 company_id
 ```
+
+**关键节点说明**：
+
+| 版本 | 变更内容 | 类型 |
+|------|---------|------|
+| 20200 | `companies.id` 首次用 ULID；所有表的 `company_id` 是 ULID | 部分 ULID 化 |
+| 20201 | 业务表主键和大部分外键从 integer → ULID（核心转换） | 基本完成 ULID 化 |
+| 20300 | 修复关联表外键遗留；Ramsey UUID → Symfony ULID 兜底 | 完全 ULID 化 |
+| 20305 | 清理关联表冗余 company_id | 优化清理 |
 
 **原因**：
 - ULID 可在客户端生成，无需数据库 round-trip
 - 按时间有序，索引性能好
 - 分布式系统友好
+- 与多租户架构配合，避免跨租户 ID 碰撞
 
 ---
 
-## 六、开发时的心智模型
+## 六、ID &amp; 外键迁移链路深度解析
 
-### 6.1 修改实体时的检查清单
+本章以「主键和外键从 integer 到 ULID 的迁移」为深度案例，拆解三个版本的职责边界、外键演化过程，以及与实体定义、运行时过滤的叠加关系。
+
+### 6.1 三个时间点的三层状态对比
+
+以发票（Invoice）相关的表为例，对比三个关键时间点的状态：
+
+| 维度 | Version20000 (2.0) | Version20201 (2.2.1) | Version20300 (2.3) |
+|------|-------------------|---------------------|-------------------|
+| **invoices.id** | integer 自增，主键 | ULID (Symfony)，主键 | ULID (Symfony)，主键 |
+| **invoices.company_id** | 不存在 | ULID 类型，从主键之一改为单列索引 | ULID 类型，普通列（有索引） |
+| **invoice_lines.invoice_id** | integer，外键约束 | ULID，已转换（自动发现） | ULID，约束已重建 |
+| **invoice_contact.invoice_id** | integer，外键约束 | 遗留（自动发现失效） | ULID（手动修复） |
+| **invoice_contact.company_id** | 不存在 | ULID 类型，新增 | ULID 类型，有外键约束（后被删除） |
+| **外键约束状态** | 完整 | 大部分已重建，关联表缺失 | 全部修复完成 |
+| **实体 ID 定义** | — (早期可能是 XML/Annotation) | 逐步迁移中 | UlidType + UlidGenerator |
+| **CompanyFilter** | 不存在 | 已启用，过滤主实体 | 已启用，过滤主实体 |
+
+### 6.2 当前实体的 ID 定义模式
+
+当前所有实体的 ID 都遵循统一的四注解模式，以 Invoice.php 为例：
+
+```php
+#[ORM\Column(name: 'id', type: UlidType::NAME)]
+#[ORM\Id]
+#[ORM\GeneratedValue(strategy: 'CUSTOM')]
+#[ORM\CustomIdGenerator(class: UlidGenerator::class)]
+private ?Ulid $id = null;
+```
+
+**四层含义**：
+1. `#[ORM\Column(type: UlidType::NAME)]` — 数据库列类型为 ULID（二进制 16 字节）
+2. `#[ORM\Id]` — 标记为主键
+3. `#[ORM\GeneratedValue(strategy: 'CUSTOM')]` — 使用自定义生成策略
+4. `#[ORM\CustomIdGenerator(class: UlidGenerator::class)]` — 使用 Symfony 的 ULID 生成器
+
+**关键特性**：
+- **PHP 端生成**：ID 在 PHP 代码中生成（`new Ulid()`），不需要数据库自增
+- **二进制存储**：数据库中是 16 字节二进制，比字符串形式节省空间
+- **时间有序**：ULID 按时间排序，索引性能优于随机 UUID
+- **与迁移的对应**：Version20201 完成了从数据库自增 integer 到 PHP 端生成 ULID 的转变
+
+### 6.3 外键的定义与隐式转换
+
+**实体中外键是「隐身」的**——你在实体代码中看到的是对象属性，而不是数据库列：
+
+```php
+// 实体中定义的是对象引用
+#[ORM\ManyToOne(targetEntity: Invoice::class, inversedBy: 'lines')]
+#[ORM\JoinColumn(nullable: true, onDelete: 'CASCADE')]
+protected ?Invoice $invoice = null;
+```
+
+Doctrine ORM 在运行时会自动处理：
+1. **隐式列名**：根据属性名推断数据库列名（`$invoice` → `invoice_id`）
+2. **类型自动对齐**：外键列类型自动与目标实体的主键类型对齐
+3. **参数自动转换**：查询时绑定的参数会通过 `UlidType` 自动转换为二进制格式
+
+**与迁移的对应**：
+- Version20200 之前：外键列是 integer 类型
+- Version20201：能自动发现的外键随主键一起转换为 ULID
+- Version20300：手动修复遗漏的关联表外键
+
+### 6.4 多对多关联表的演化时间线
+
+关联表（`invoice_contact`、`quote_contact`、`recurringinvoice_contact`）是最特殊的存在，演化最曲折：
+
+```
+Version20000: 关联表存在，复合主键 (invoice_id, contact_id)
+                外键类型：integer，有外键约束
+                       ↓
+Version20200: 删除外键约束（因为主键变复合了）
+                外键列还是 integer，但没了约束
+                       ↓
+Version20201: 手动加 company_id 列 (ULID 类型)
+                外键列：因自动发现机制失效，未正确转换
+                遗留问题
+                       ↓
+Version20300: 手动设置外键列类型为 UlidType
+                添加 company_id 的外键约束
+                修复遗留问题
+                       ↓
+Version20305: 删除 company_id 列（发现是冗余的）
+                回归纯粹的关联表
+```
+
+**为什么关联表这么特殊？**
+
+1. **没有 id 列**：关联表是复合主键，不会被 Version20201 的 migrate 循环命中
+2. **外键约束被删了**：Version20200 删了外键约束，导致「自动发现外键」机制失效
+3. **company_id 先加后删**：从以为需要直接过滤，到发现通过主表 join 自然隔离
+
+**Doctrine 视角下的关联表**：
+
+关联表不是实体，由 Doctrine 自动管理。当你定义 `ManyToMany` 关联时：
+- 自动创建 join table
+- 自动管理表中的数据
+- 通过主实体的查询自动 join 和过滤
+
+这就是为什么 `company_id` 是冗余的——CompanyFilter 作用在主实体上，join 出来的关联数据自然就是隔离的。
+
+### 6.5 CompanyFilter 与 ULID 的叠加
+
+**CompanyFilter 对 ID 类型基本透明**。它的工作原理很简单：
+
+```php
+// 伪代码逻辑
+public function addFilterConstraint(ClassMetadata $targetEntity, $targetTableAlias)
+{
+    // 检查实体是否有 company 字段（通过 CompanyAware trait）
+    if (! $this->hasCompanyField($targetEntity)) {
+        return '';
+    }
+    
+    // 追加 WHERE 条件
+    return $targetTableAlias . '.company_id = ' . $this->getParameter('company_id');
+}
+```
+
+**类型转换的处理**：
+- `company_id` 参数的绑定由 Doctrine DBAL 处理
+- 因为列类型是 `UlidType`，绑定时会自动从 Ulid 对象转换为二进制
+- **对业务完全透明**，开发者不需要关心 ID 是 integer 还是 ULID
+
+**SQLite 特殊适配**：
+
+SQLite 对二进制的处理比较特殊，在 CompanyFilter.php 中有针对 SQLite 的特殊逻辑，使用 `HEX()` 函数确保 ULID 比较的正确性。
+
+### 6.6 从 ID 视角解释「对不上号」
+
+初次接触这个项目时，你可能会有以下疑惑，从 ID 演化视角可以解释清楚：
+
+**疑惑 1：为什么迁移里有 integer 主键，但实体里是 ULID？**
+- 迁移记录了历史：最早确实是 integer
+- 实体只反映当前状态：现在已经是 ULID 了
+- Version20201 是转换的分水岭
+
+**疑惑 2：为什么有的外键在迁移里是手动转换的，有的是自动的？**
+- 有外键约束的：Version20201 的自动发现机制能找到，随主键一起转
+- 没有外键约束的（关联表）：自动发现失效，Version20300 手动修
+- 根本原因：Version20200 的复合主键改造删除了一批外键约束
+
+**疑惑 3：为什么关联表有 company_id 又删掉了？**
+- 这是认知迭代的过程
+- 先加：直觉认为关联表也需要 company_id 来过滤
+- 后删：深入理解后发现 SQL 过滤器只作用在实体上，关联表通过 join 自然隔离
+
+**疑惑 4：Version20300 为什么还有 Ramsey UUID 转换？20201 不是转了吗？**
+- Version20201 转的是主路径上的表，用的就是 Symfony UlidType
+- Version20300 的 Ramsey → Symfony 转换是**兜底/防御性**代码
+- 可能是为了兼容某些特殊升级路径或第三方 bundle
+- 在标准迁移路径（20000→20200→20201→20300）上，这段代码不会执行
+
+### 6.7 外键迁移的自动发现算法
+
+Version20201 中最巧妙的设计之一是「自动发现外键」。它不需要你手动枚举哪些表引用了当前表，而是直接查询数据库元数据：
+
+```
+算法步骤：
+1. 遍历数据库中所有表
+2. 对每个表，列出它的所有外键约束
+3. 如果外键指向当前迁移的表
+4. 记录：表名、列名、是否可空、约束名
+5. 迁移时，这些外键列会随主键一起转换
+```
+
+**优点**：
+- 不需要人工维护外键列表
+- 不会遗漏（只要有数据库约束就会被发现）
+- 新增外键也会自动被处理
+
+**局限**：
+- 依赖数据库外键约束，约束被删了就发现不了
+- 这就是关联表外键被遗漏的根本原因
+
+---
+
+## 七、开发时的心智模型
+
+### 7.1 修改实体时的检查清单
 
 当你修改实体字段时，需要考虑三层是否同步：
 
@@ -533,7 +722,7 @@ Version20300: ULID 单主键 (二进制有序 UUID)
    - [ ] 是否需要调整 Filter？
    - [ ] 是否需要 LifecycleCallback？
 
-### 6.2 常见疑惑解答
+### 7.2 常见疑惑解答
 
 **Q: 为什么实体里看不到 `company_id` 字段？**
 A: 因为它封装在 `CompanyAware` trait 中，属性名是 `$company`（对象），不是 `$company_id`（整数）。Doctrine 会自动管理外键列。
@@ -547,22 +736,51 @@ A: 因为在 Version20100 中已经删除了这些列，改用 `archived` 字段
 **Q: 为什么查询时自动带上了 `company_id` 条件？**
 A: 因为 `CompanyFilter` 是全局启用的 SQL Filter，会自动为所有 CompanyAware 实体的查询添加该条件。
 
+**Q: 主键 ID 从 integer 转 ULID 是在哪一个迁移完成的？**
+A: 核心转换在 [Version20201.php](migrations/Version20201.php) 完成，这是整个迁移历史中最复杂的迁移，用「双写过渡 + 原子切换」策略处理了所有表的主键和外键转换。Version20300 主要是修复关联表外键遗留问题，以及 Ramsey UUID → Symfony ULID 的兜底转换（标准迁移路径不触发）。
+
+**Q: 外键列（如 `invoice_id`）在实体里为什么找不到？**
+A: 因为在实体中，外键是以对象关联的形式存在的（如 `$invoice` 属性，类型是 `Invoice`）。Doctrine 会自动把对象关联映射为数据库中的 `invoice_id` 外键列，列名和类型都由 Doctrine 自动管理。
+
+**Q: 为什么多对多关联表（如 `invoice_contact`）里曾经有 `company_id`，现在又没有了？**
+A: 这是一个「认知迭代」的过程。Version20201 时以为关联表也需要 company_id 来过滤，但后来发现 SQL 过滤器只作用于实体，关联查询通过主实体自动 join 就保证了 company 隔离，冗余的 company_id 反而有数据不一致风险，所以在 Version20305 中删除了。
+
+**Q: ULID 类型的 ID 是在数据库里生成的还是代码里生成的？**
+A: 是在 PHP 代码里生成的。使用 `#[ORM\CustomIdGenerator(class: UlidGenerator::class)]`，在 `persist` 时就已经生成了 ID，不需要等 `flush` 后才能拿到。这是和自增 integer ID 最大的不同。
+
 ---
 
-## 七、关键文件速查表
+## 八、关键文件速查表
 
-| 类别 | 文件 | 作用 |
-|------|------|------|
-| 迁移配置 | [doctrine_migrations.php](config/packages/doctrine_migrations.php) | 迁移路径、存储表配置 |
-| ORM 配置 | [doctrine.php](config/packages/doctrine.php) | 实体映射、过滤器、自定义类型 |
-| 核心 Trait | [Archivable.php](src/CoreBundle/Traits/Entity/Archivable.php) | 归档字段 |
-| 核心 Trait | [TimeStampable.php](src/CoreBundle/Traits/Entity/TimeStampable.php) | 时间戳 |
-| 核心 Trait | [CompanyAware.php](src/CoreBundle/Traits/Entity/CompanyAware.php) | 多租户 |
-| 基类 | [BaseInvoice.php](src/InvoiceBundle/Entity/BaseInvoice.php) | 发票基类 |
-| 值对象 | [Discount.php](src/CoreBundle/Entity/Discount.php) | 折扣 Embeddable |
-| 自定义类型 | [BigIntegerType.php](src/CoreBundle/Doctrine/Type/BigIntegerType.php) | 大整数类型 |
-| 过滤器 | [CompanyFilter.php](src/CoreBundle/Doctrine/Filter/CompanyFilter.php) | 多租户过滤 |
-| 过滤器 | [ArchivableFilter.php](src/CoreBundle/Doctrine/Filter/ArchivableFilter.php) | 归档过滤 |
-| 里程碑迁移 | [Version20000.php](migrations/Version20000.php) | 初始版本 |
-| 里程碑迁移 | [Version20200.php](migrations/Version20200.php) | 多租户架构 |
-| 里程碑迁移 | [Version20300.php](migrations/Version20300.php) | ULID + BigInteger |
+### 8.1 实体与 Trait
+
+| 文件 | 作用 |
+|------|------|
+| [Invoice.php](src/InvoiceBundle/Entity/Invoice.php) | 发票实体（ID 定义、ManyToMany 关联参考） |
+| [Line.php](src/InvoiceBundle/Entity/Line.php) | 发票行实体（ManyToOne 外键参考） |
+| [BaseInvoice.php](src/InvoiceBundle/Entity/BaseInvoice.php) | 发票基类（MappedSuperclass） |
+| [CompanyAware.php](src/CoreBundle/Traits/Entity/CompanyAware.php) | 多租户 Trait |
+| [Archivable.php](src/CoreBundle/Traits/Entity/Archivable.php) | 归档 Trait |
+| [TimeStampable.php](src/CoreBundle/Traits/Entity/TimeStampable.php) | 时间戳 Trait |
+| [Discount.php](src/CoreBundle/Entity/Discount.php) | 折扣值对象（Embeddable） |
+
+### 8.2 运行时映射
+
+| 文件 | 作用 |
+|------|------|
+| [doctrine.php](config/packages/doctrine.php) | Doctrine 配置（自定义类型、过滤器） |
+| [BigIntegerType.php](src/CoreBundle/Doctrine/Type/BigIntegerType.php) | 大整数自定义类型 |
+| [CompanyFilter.php](src/CoreBundle/Doctrine/Filter/CompanyFilter.php) | 多租户 SQL 过滤器 |
+| [ArchivableFilter.php](src/CoreBundle/Doctrine/Filter/ArchivableFilter.php) | 归档 SQL 过滤器 |
+
+### 8.3 关键迁移
+
+| 文件 | 核心作用 |
+|------|---------|
+| [Version20000.php](migrations/Version20000.php) | 初始 Schema，integer 自增主键 |
+| [Version20200.php](migrations/Version20200.php) | 多租户架构，添加 company_id，复合主键 |
+| **[Version20201.php](migrations/Version20201.php)** | **ID 从 integer 转 ULID 的核心迁移（最复杂）** |
+| [Version20300.php](migrations/Version20300.php) | **金额转 BigInteger（核心）** + 修复关联表外键遗留 + Ramsey UUID → Symfony ULID 兜底转换 |
+| [Version20305.php](migrations/Version20305.php) | 删除关联表冗余 company_id |
+| [Version20306.php](migrations/Version20306.php) | 密码重置表重构 |
+| [doctrine_migrations.php](config/packages/doctrine_migrations.php) | 迁移配置 |
