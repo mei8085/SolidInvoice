@@ -32,10 +32,10 @@ SolidInvoice 采用**分层分发**策略，从源码到最终运行共经历 5 
 
 | 模块 | 职责边界 | 主要文件 |
 |------|----------|----------|
-| 安装脚本 | 将已构建的产物部署到目标系统 | [packaging/install.sh](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/packaging/install.sh)、[packaging/nfpm.yaml](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/packaging/nfpm.yaml) |
-| 容器构建 | 生成 Docker 镜像和静态二进制 | [docker/linux-static-build.Dockerfile](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/docker/linux-static-build.Dockerfile)、[docker-bake.hcl](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/docker-bake.hcl) |
-| 环境变量加载 | 多层配置的读取、合并、持久化 | [src/CoreBundle/ConfigWriter.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/src/CoreBundle/ConfigWriter.php)、[src/CoreBundle/Config/Loader/EnvLoader.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/src/CoreBundle/Config/Loader/EnvLoader.php) |
-| 版本号注入 | 从源码常量到运行时二进制的版本传递 | [src/CoreBundle/SolidInvoiceCoreBundle.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/src/CoreBundle/SolidInvoiceCoreBundle.php)、[scripts/bump_version.sh](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/scripts/bump_version.sh) |
+| 安装脚本 | 将已构建的产物部署到目标系统 | [packaging/install.sh](packaging/install.sh)、[packaging/nfpm.yaml](packaging/nfpm.yaml) |
+| 容器构建 | 生成 Docker 镜像和静态二进制 | [docker/linux-static-build.Dockerfile](docker/linux-static-build.Dockerfile)、[docker-bake.hcl](docker-bake.hcl) |
+| 环境变量加载 | 多层配置的读取、合并、持久化 | [src/CoreBundle/ConfigWriter.php](src/CoreBundle/ConfigWriter.php)、[src/CoreBundle/Config/Loader/EnvLoader.php](src/CoreBundle/Config/Loader/EnvLoader.php) |
+| 版本号注入 | 从源码常量到运行时二进制的版本传递 | [src/CoreBundle/SolidInvoiceCoreBundle.php](src/CoreBundle/SolidInvoiceCoreBundle.php)、[scripts/bump_version.sh](scripts/bump_version.sh) |
 
 ---
 
@@ -43,7 +43,7 @@ SolidInvoice 采用**分层分发**策略，从源码到最终运行共经历 5 
 
 ### 1. 通用安装脚本（install.sh）
 
-[packaging/install.sh](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/packaging/install.sh) 是面向最终用户的一键安装入口。
+[packaging/install.sh](packaging/install.sh) 是面向最终用户的一键安装入口。
 
 **核心能力：**
 - 自动检测 OS（Linux/macOS）和架构（amd64/arm64）
@@ -73,7 +73,7 @@ install_systemd_service (可选，Linux 专用)
 
 ### 2. 系统包分发（nFPM）
 
-[packaging/nfpm.yaml](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/packaging/nfpm.yaml) 定义了 deb/rpm/apk 等系统包的构建配置。
+[packaging/nfpm.yaml](packaging/nfpm.yaml) 定义了 deb/rpm/apk 等系统包的构建配置。
 
 **包内结构：**
 ```
@@ -92,11 +92,11 @@ install_systemd_service (可选，Linux 专用)
 
 | 渠道 | 配置文件 | 说明 |
 |------|----------|------|
-| Snap | [packaging/snap/snapcraft.yaml](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/packaging/snap/snapcraft.yaml) | 沙盒化安装 |
-| AUR | [packaging/aur/PKGBUILD](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/packaging/aur/PKGBUILD) | Arch Linux |
-| Scoop | [packaging/scoop/solidinvoice.json](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/packaging/scoop/solidinvoice.json) | Windows |
-| Winget | [packaging/winget/SolidInvoice.SolidInvoice.yaml](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/packaging/winget/SolidInvoice.SolidInvoice.yaml) | Windows |
-| Chocolatey | [packaging/chocolatey/solidinvoice.nuspec](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/packaging/chocolatey/solidinvoice.nuspec) | Windows |
+| Snap | [packaging/snap/snapcraft.yaml](packaging/snap/snapcraft.yaml) | 沙盒化安装 |
+| AUR | [packaging/aur/PKGBUILD](packaging/aur/PKGBUILD) | Arch Linux |
+| Scoop | [packaging/scoop/solidinvoice.json](packaging/scoop/solidinvoice.json) | Windows |
+| Winget | [packaging/winget/SolidInvoice.SolidInvoice.yaml](packaging/winget/SolidInvoice.SolidInvoice.yaml) | Windows |
+| Chocolatey | [packaging/chocolatey/solidinvoice.nuspec](packaging/chocolatey/solidinvoice.nuspec) | Windows |
 
 ---
 
@@ -110,8 +110,8 @@ SolidInvoice 采用 **Docker Buildx + Bake** 实现多架构镜像构建，核�
 
 | 路径 | Dockerfile | 用途 |
 |------|------------|------|
-| 静态编译构建 | [docker/linux-static-build.Dockerfile](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/docker/linux-static-build.Dockerfile) | 多阶段，从源码编译出静态二进制 + 容器镜像 |
-| 轻量化打包 | [docker/package.Dockerfile](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/docker/package.Dockerfile) | 单阶段，将预构建二进制打包成容器 |
+| 静态编译构建 | [docker/linux-static-build.Dockerfile](docker/linux-static-build.Dockerfile) | 多阶段，从源码编译出静态二进制 + 容器镜像 |
+| 轻量化打包 | [docker/package.Dockerfile](docker/package.Dockerfile) | 单阶段，将预构建二进制打包成容器 |
 
 ### 2. 静态编译构建详解
 
@@ -139,7 +139,7 @@ SolidInvoice 采用 **Docker Buildx + Bake** 实现多架构镜像构建，核�
 
 ### 3. Docker Bake 配置
 
-[docker-bake.hcl](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/docker-bake.hcl) 定义了构建矩阵：
+[docker-bake.hcl](docker-bake.hcl) 定义了构建矩阵：
 
 - **多平台**：`linux/amd64`、`linux/arm64`
 - **多标签**：根据 `SOLIDINVOICE_VERSION` 自动生成 major、minor、patch 三级标签
@@ -154,7 +154,7 @@ solidinvoice/solidinvoice:2.3.11
 
 ### 4. FrankenPHP 构建链路
 
-二进制构建的核心是 [frankenphp/build-solidinvoice.sh](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/frankenphp/build-solidinvoice.sh)，它采用**假 xcaddy 替换策略**来复用上游构建脚本。
+二进制构建的核心是 [frankenphp/build-solidinvoice.sh](frankenphp/build-solidinvoice.sh)，它采用**假 xcaddy 替换策略**来复用上游构建脚本。
 
 **构建策略（巧妙的 hack）：**
 ```
@@ -174,13 +174,13 @@ solidinvoice/solidinvoice:2.3.11
 1. 设置 `SOLIDINVOICE_VERSION` → 映射为 `FRANKENPHP_VERSION`
 2. 解压 `app.tar.gz` 到 `dist/embed-app/`
 3. 判断是否为 Fresh Build（xcaddy 未安装），若是则走两阶段构建
-4. 用 [frankenphp/bin/xcaddy](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/frankenphp/bin/xcaddy) 假脚本替换 static-php-cli 的 xcaddy
+4. 用 [frankenphp/bin/xcaddy](frankenphp/bin/xcaddy) 假脚本替换 static-php-cli 的 xcaddy
 5. 运行上游 `build-static.sh`
 6. 将输出从 `frankenphp-{os}-{arch}` 重命名为 `solidinvoice-{os}-{arch}`
 
 ### 5. 假 xcaddy 脚本的编译逻辑
 
-[frankenphp/bin/xcaddy](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/frankenphp/bin/xcaddy) 是关键的"伪装者"脚本：
+[frankenphp/bin/xcaddy](frankenphp/bin/xcaddy) 是关键的"伪装者"脚本：
 
 ```bash
 go build \
@@ -228,7 +228,7 @@ SolidInvoice 的环境变量体系是**五层叠加**的结构，从外到内逐
 
 ### 2. 第 1-2 层：系统与二进制层
 
-在 [frankenphp/app.go](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/frankenphp/app.go#L103-L149) 的 `initializeApp()` 函数中设置默认值：
+在 [frankenphp/app.go](frankenphp/app.go#L103-L149) 的 `initializeApp()` 函数中设置默认值：
 
 ```go
 envVars := map[string]string{
@@ -254,7 +254,7 @@ for key, value := range envVars {
 
 ### 3. 第 3 层：Symfony Dotenv
 
-[public/index.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/public/index.php) 定义了运行时入口：
+[public/index.php](public/index.php) 定义了运行时入口：
 
 ```php
 $_SERVER['APP_RUNTIME_OPTIONS'] = [
@@ -278,7 +278,7 @@ $_SERVER['APP_RUNTIME_OPTIONS'] = [
 > .env.dist 是**模板文件**，不会被自动加载，仅作为 .env 的参考模板。
 ### 4. 第 4 层：Secrets Vault
 
-[config/packages/framework.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/config/packages/framework.php#L41-L44) 配置了 Secrets Vault：
+[config/packages/framework.php](config/packages/framework.php#L41-L44) 配置了 Secrets Vault：
 
 ```php
 $config->secrets()
@@ -287,7 +287,7 @@ $config->secrets()
 ;
 ```
 
-[src/CoreBundle/ConfigWriter.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/src/CoreBundle/ConfigWriter.php) 是操作 Vault 的封装类：
+[src/CoreBundle/ConfigWriter.php](src/CoreBundle/ConfigWriter.php) 是操作 Vault 的封装类：
 
 - 所有配置键自动添加 `SOLIDINVOICE_` 前缀
 - 配置存储路径由 `SOLIDINVOICE_CONFIG_DIR` 决定
@@ -312,7 +312,7 @@ Secrets Vault 本身也是通过这个机制加载的（`AbstractVault` 实现�
 
 **(1) EnvLoader — 旧配置迁移（一次性）**
 
-[src/CoreBundle/Config/Loader/EnvLoader.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/src/CoreBundle/Config/Loader/EnvLoader.php) 是一个**迁移工具**，而非日常配置加载器：
+[src/CoreBundle/Config/Loader/EnvLoader.php](src/CoreBundle/Config/Loader/EnvLoader.php) 是一个**迁移工具**，而非日常配置加载器：
 
 - 检查 `config/env/env.php` 和 `config/env.php`（新旧两个位置）
 - 将旧的数据库参数（`database_host` 等）转换为 `DATABASE_URL`
@@ -323,7 +323,7 @@ Secrets Vault 本身也是通过这个机制加载的（`AbstractVault` 实现�
 
 **(2) BuildIdLoader — 构建 ID 生成**
 
-[src/CoreBundle/Config/Loader/BuildIdLoader.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/src/CoreBundle/Config/Loader/BuildIdLoader.php) 生成唯一构建 ID：
+[src/CoreBundle/Config/Loader/BuildIdLoader.php](src/CoreBundle/Config/Loader/BuildIdLoader.php) 生成唯一构建 ID：
 
 - 若 `SOLIDINVOICE_BUILD_ID` 环境变量已设置（即 Vault 中已有），跳过
 - 否则生成 UUID v7 作为构建 ID 并保存到 Vault
@@ -362,7 +362,7 @@ $dbalConfig->connection('default')
 
 ### 1. 版本号的"家"：源代码常量
 
-[src/CoreBundle/SolidInvoiceCoreBundle.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/src/CoreBundle/SolidInvoiceCoreBundle.php#L24) 是版本号的唯一真相源：
+[src/CoreBundle/SolidInvoiceCoreBundle.php](src/CoreBundle/SolidInvoiceCoreBundle.php#L24) 是版本号的唯一真相源：
 
 ```php
 final public const VERSION = '3.0.0-alpha2';
@@ -376,7 +376,7 @@ final public const VERSION = '3.0.0-alpha2';
 
 ### 2. 版本号更新：bump_version.sh
 
-[scripts/bump_version.sh](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/scripts/bump_version.sh) 负责版本号递增：
+[scripts/bump_version.sh](scripts/bump_version.sh) 负责版本号递增：
 
 **更新三个文件：**
 1. `src/CoreBundle/SolidInvoiceCoreBundle.php` — PHP 常量
@@ -394,19 +394,19 @@ next_version=$(bump_version "$clean_version" 2 1)
 
 ### 3. 构建时传递：build_dist.sh → build_binary.sh
 
-[scripts/build_dist.sh](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/scripts/build_dist.sh) 构建分发归档：
+[scripts/build_dist.sh](scripts/build_dist.sh) 构建分发归档：
 
 - 版本号作为参数传入（或从 git 分支/提交推断）
 - 归档文件名包含版本号：`SolidInvoice-{VERSION}.tar.gz`
 - 归档内的 `.env` 文件写入环境信息（但**不包含版本号**）
 
-[scripts/build_binary.sh](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/scripts/build_binary.sh) 作为 wrapper：
+[scripts/build_binary.sh](scripts/build_binary.sh) 作为 wrapper：
 - 导出 `SOLIDINVOICE_VERSION` 环境变量
 - 调用 `frankenphp/build-solidinvoice.sh`
 
 ### 4. Go 编译注入：假 xcaddy 脚本
 
-在 [frankenphp/bin/xcaddy](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/frankenphp/bin/xcaddy#L105) 中通过 Go 链接器注入：
+在 [frankenphp/bin/xcaddy](frankenphp/bin/xcaddy#L105) 中通过 Go 链接器注入：
 
 ```bash
 go build \
@@ -523,7 +523,7 @@ GitHub Actions CI 触发
 
 ### 3. 安装向导的协作
 
-当应用首次运行且未安装时，[src/InstallBundle/Listener/RequestListener.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/src/InstallBundle/Listener/RequestListener.php) 拦截所有请求：
+当应用首次运行且未安装时，[src/InstallBundle/Listener/RequestListener.php](src/InstallBundle/Listener/RequestListener.php) 拦截所有请求：
 
 1. **检测**：检查 `installed` 标记是否存在于 Vault
 2. **重定向**：未安装则跳转到 `_system_install` 路由
@@ -547,7 +547,7 @@ GitHub Actions CI 触发
 
 | 层面 | 来源 | 用途 |
 |------|------|------|
-| PHP | [SolidInvoiceCoreBundle::VERSION](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/src/CoreBundle/SolidInvoiceCoreBundle.php#L24) | 数据库写入、API 响应、CLI 显示 |
+| PHP | [SolidInvoiceCoreBundle::VERSION](src/CoreBundle/SolidInvoiceCoreBundle.php#L24) | 数据库写入、API 响应、CLI 显示 |
 | Go | 构建时 `-ldflags -X` 注入 | `solidinvoice version` 命令输出 |
 
 **一致性保障**：构建脚本 `build_binary.sh` 将同一个 `SOLIDINVOICE_VERSION` 同时传递给 dist 构建和 Go 编译。但 dist 包内的 PHP 代码版本是**源码中硬编码**的，而非构建时注入。
@@ -575,7 +575,7 @@ GitHub Actions CI 触发
 | 直接运行 PHP（test 环境） | `{项目根}/var/cache/test/config/` | `config/services.php` test 专用 |
 | Snap 安装 | `$SNAP_COMMON/config` | `snapcraft.yaml` |
 
-这也是为什么有 `SOLIDINVOICE_CONFIG_DIR` 环境变量的原因解耦配置位置与应用代码。
+这也是为什么有 `SOLIDINVOICE_CONFIG_DIR` 环境变量的原因——解耦配置位置与应用代码。
 ### 4. 安装前与安装后的 APP_SECRET
 
 **安装前**：`RequestListener` 用 Session ID 作为临时 `APP_SECRET`
@@ -589,7 +589,7 @@ GitHub Actions CI 触发
 
 ### 5. 嵌入式应用的解压与缓存
 
-[frankenphp/app.go](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/frankenphp/app.go#L686-L703) 中的 `extractEmbeddedApp` 函数有一个巧妙的缓存机制：
+[frankenphp/app.go](frankenphp/app.go#L686-L703) 中的 `extractEmbeddedApp` 函数有一个巧妙的缓存机制：
 
 ```go
 appPath := filepath.Join(appDir, "."+appName, "app_"+string(embeddedAppChecksum))
@@ -603,7 +603,7 @@ appPath := filepath.Join(appDir, "."+appName, "app_"+string(embeddedAppChecksum)
 
 ### 6. 构建脚本的 --local 模式
 
-[scripts/build_dist.sh](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/scripts/build_dist.sh) 和 [scripts/build_binary.sh](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/scripts/build_binary.sh) 都支持 `--local` 模式：
+[scripts/build_dist.sh](scripts/build_dist.sh) 和 [scripts/build_binary.sh](scripts/build_binary.sh) 都支持 `--local` 模式：
 
 | 模式 | 行为 | 适用场景 |
 |------|------|----------|
@@ -617,39 +617,39 @@ appPath := filepath.Join(appDir, "."+appName, "app_"+string(embeddedAppChecksum)
 ## 相关文件索引
 
 ### 构建脚本
-- [scripts/build_dist.sh](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/scripts/build_dist.sh) — 分发归档构建
-- [scripts/build_binary.sh](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/scripts/build_binary.sh) — 二进制构建包装器
-- [scripts/bump_version.sh](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/scripts/bump_version.sh) — 版本号递增
-- [scripts/create_release.sh](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/scripts/create_release.sh) — GitHub Release 创建
+- [scripts/build_dist.sh](scripts/build_dist.sh) — 分发归档构建
+- [scripts/build_binary.sh](scripts/build_binary.sh) — 二进制构建包装器
+- [scripts/bump_version.sh](scripts/bump_version.sh) — 版本号递增
+- [scripts/create_release.sh](scripts/create_release.sh) — GitHub Release 创建
 
 ### 容器/FrankenPHP
-- [docker/linux-static-build.Dockerfile](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/docker/linux-static-build.Dockerfile) — 静态编译 Dockerfile
-- [docker/package.Dockerfile](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/docker/package.Dockerfile) — 轻量打包 Dockerfile
-- [docker-bake.hcl](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/docker-bake.hcl) — Buildx Bake 配置
-- [frankenphp/build-solidinvoice.sh](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/frankenphp/build-solidinvoice.sh) — 二进制构建脚本
-- [frankenphp/build-static.sh](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/frankenphp/build-static.sh) — 上游 FrankenPHP 构建脚本
-- [frankenphp/bin/xcaddy](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/frankenphp/bin/xcaddy) — 假 xcaddy 脚本
-- [frankenphp/app.go](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/frankenphp/app.go) — Go 主程序
+- [docker/linux-static-build.Dockerfile](docker/linux-static-build.Dockerfile) — 静态编译 Dockerfile
+- [docker/package.Dockerfile](docker/package.Dockerfile) — 轻量打包 Dockerfile
+- [docker-bake.hcl](docker-bake.hcl) — Buildx Bake 配置
+- [frankenphp/build-solidinvoice.sh](frankenphp/build-solidinvoice.sh) — 二进制构建脚本
+- [frankenphp/build-static.sh](frankenphp/build-static.sh) — 上游 FrankenPHP 构建脚本
+- [frankenphp/bin/xcaddy](frankenphp/bin/xcaddy) — 假 xcaddy 脚本
+- [frankenphp/app.go](frankenphp/app.go) — Go 主程序
 
 ### 安装部署
-- [packaging/install.sh](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/packaging/install.sh) — 通用安装脚本
-- [packaging/nfpm.yaml](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/packaging/nfpm.yaml) — 系统包配置
-- [packaging/systemd/solidinvoice.service](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/packaging/systemd/solidinvoice.service) — systemd 服务单元
-- [packaging/systemd/solidinvoice.env](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/packaging/systemd/solidinvoice.env) — 环境配置模板
+- [packaging/install.sh](packaging/install.sh) — 通用安装脚本
+- [packaging/nfpm.yaml](packaging/nfpm.yaml) — 系统包配置
+- [packaging/systemd/solidinvoice.service](packaging/systemd/solidinvoice.service) — systemd 服务单元
+- [packaging/systemd/solidinvoice.env](packaging/systemd/solidinvoice.env) — 环境配置模板
 
 ### 环境变量与配置
-- [src/CoreBundle/ConfigWriter.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/src/CoreBundle/ConfigWriter.php) — 配置写入器
-- [src/CoreBundle/Config/Loader/EnvLoader.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/src/CoreBundle/Config/Loader/EnvLoader.php) — 旧配置迁移加载器
-- [src/CoreBundle/Config/Loader/BuildIdLoader.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/src/CoreBundle/Config/Loader/BuildIdLoader.php) — 构建 ID 生成器
-- [public/index.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/public/index.php) — 应用入口
-- [.env.dist](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/.env.dist) — 环境变量模板
+- [src/CoreBundle/ConfigWriter.php](src/CoreBundle/ConfigWriter.php) — 配置写入器
+- [src/CoreBundle/Config/Loader/EnvLoader.php](src/CoreBundle/Config/Loader/EnvLoader.php) — 旧配置迁移加载器
+- [src/CoreBundle/Config/Loader/BuildIdLoader.php](src/CoreBundle/Config/Loader/BuildIdLoader.php) — 构建 ID 生成器
+- [public/index.php](public/index.php) — 应用入口
+- [.env.dist](.env.dist) — 环境变量模板
 
 ### 安装流程
-- [src/InstallBundle/Command/InstallCommand.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/src/InstallBundle/Command/InstallCommand.php) — CLI 安装命令
-- [src/InstallBundle/Listener\RequestListener.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/src/InstallBundle/Listener\RequestListener.php) — 安装请求拦截器
-- [src/InstallBundle/Step/GenerateSecretStep.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/src/InstallBundle/Step/GenerateSecretStep.php) — 密钥生成步骤
-- [src/InstallBundle/Step/CreateDatabaseStep.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/src/InstallBundle/Step/CreateDatabaseStep.php) — 创建数据库步骤
-- [src/InstallBundle/Step/RunMigrationsStep.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/src/InstallBundle/Step/RunMigrationsStep.php) — 执行迁移步骤
+- [src/InstallBundle/Command/InstallCommand.php](src/InstallBundle/Command/InstallCommand.php) — CLI 安装命令
+- [src/InstallBundle/Listener/RequestListener.php](src/InstallBundle/Listener/RequestListener.php) — 安装请求拦截器
+- [src/InstallBundle/Step/GenerateSecretStep.php](src/InstallBundle/Step/GenerateSecretStep.php) — 密钥生成步骤
+- [src/InstallBundle/Step/CreateDatabaseStep.php](src/InstallBundle/Step/CreateDatabaseStep.php) — 创建数据库步骤
+- [src/InstallBundle/Step/RunMigrationsStep.php](src/InstallBundle/Step/RunMigrationsStep.php) — 执行迁移步骤
 
 ### 版本号
-- [src/CoreBundle/SolidInvoiceCoreBundle.php](file:///d:/fz/0508-2/solo-dogfeeding/code/120-SolidInvoice/src/CoreBundle/SolidInvoiceCoreBundle.php) — 版本号常量定义
+- [src/CoreBundle/SolidInvoiceCoreBundle.php](src/CoreBundle/SolidInvoiceCoreBundle.php) — 版本号常量定义
