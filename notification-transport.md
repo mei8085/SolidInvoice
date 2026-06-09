@@ -105,23 +105,62 @@ abstract class NotificationMessage extends Notification
 }
 ```
 
-### 2.3 所有通知类型对照表
+### 2.3 所有通知类型与触发入口对照表
 
-| 通知类 | 事件名 (EVENT 常量) | 分类 | 触发入口 |
-|--------|---------------------|------|----------|
-| [InvoiceStatusNotification](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/Notification/InvoiceStatusNotification.php) | `invoice_status_update` | INVOICE | [WorkFlowSubscriber](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/Listener/WorkFlowSubscriber.php) 监听 `workflow.invoice.entered` 和 `workflow.recurring_invoice.entered` 事件 |
-| [InvoiceOverdueNotification](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/Notification/InvoiceOverdueNotification.php) | `invoice_overdue` | INVOICE | [InvoiceOverdueListener](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/Listener/InvoiceOverdueListener.php) 监听 `workflow.invoice.entered.overdue` 事件 |
-| [InvoiceReminderNotification](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/Notification/InvoiceReminderNotification.php) | `invoice_reminder` | INVOICE | [SendInvoiceReminderHandler](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/MessageHandler/SendInvoiceReminderHandler.php) 消息处理器 |
-| [InvoiceReminderStoppedNotification](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/Notification/InvoiceReminderStoppedNotification.php) | `invoice_reminder_stopped` | INVOICE | [SendInvoiceReminderHandler](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/MessageHandler/SendInvoiceReminderHandler.php) 中 `reminderType === Overdue14` 时触发 |
-| [QuoteStatusNotification](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/QuoteBundle/Notification/QuoteStatusNotification.php) | `quote_status_update` | QUOTE | [QuoteBundle WorkFlowSubscriber](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/QuoteBundle/Listener/WorkFlowSubscriber.php) 监听 `workflow.quote.entered` 事件 |
-| [PaymentReceivedNotification](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/PaymentBundle/Notification/PaymentReceivedNotification.php) | `payment_made` | PAYMENT | [PaymentReceivedListener](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/PaymentBundle/Listener/PaymentReceivedListener.php) 监听 `PaymentEvents::PAYMENT_COMPLETE` ('payment.complete') |
-| [ClientCreateNotification](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/ClientBundle/Notification/ClientCreateNotification.php) | `client_create` | CLIENT | [ClientListener](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/ClientBundle/Listener/ClientListener.php) 监听 Doctrine `postPersist` 生命周期事件 |
+| 通知类 | 事件名 | 分类 | 触发入口数量 | 触发入口文件 |
+|--------|--------|------|-------------|-------------|
+| [InvoiceStatusNotification](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/Notification/InvoiceStatusNotification.php) | `invoice_status_update` | INVOICE | **3 个** | ① [InvoiceManager::applyTransition()](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/Manager/InvoiceManager.php#L176-L196)<br>② [Invoice WorkFlowSubscriber](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/Listener/WorkFlowSubscriber.php#L51-L78)<br>③ [SendInvoiceReminderHandler](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/MessageHandler/SendInvoiceReminderHandler.php) 间接 |
+| [InvoiceOverdueNotification](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/Notification/InvoiceOverdueNotification.php) | `invoice_overdue` | INVOICE | 1 个 | [InvoiceOverdueListener](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/Listener/InvoiceOverdueListener.php) |
+| [InvoiceReminderNotification](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/Notification/InvoiceReminderNotification.php) | `invoice_reminder` | INVOICE | 1 个 | [SendInvoiceReminderHandler](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/MessageHandler/SendInvoiceReminderHandler.php) |
+| [InvoiceReminderStoppedNotification](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/Notification/InvoiceReminderStoppedNotification.php) | `invoice_reminder_stopped` | INVOICE | 1 个 | [SendInvoiceReminderHandler](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/MessageHandler/SendInvoiceReminderHandler.php) |
+| [QuoteStatusNotification](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/QuoteBundle/Notification/QuoteStatusNotification.php) | `quote_status_update` | QUOTE | **2 个** | ① [QuoteMailer::applyTransition()](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/QuoteBundle/Mailer/QuoteMailer.php#L40-L60)<br>② [Quote WorkFlowSubscriber](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/QuoteBundle/Listener/WorkFlowSubscriber.php#L69-L90) |
+| [PaymentReceivedNotification](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/PaymentBundle/Notification/PaymentReceivedNotification.php) | `payment_made` | PAYMENT | 1 个 | [PaymentReceivedListener](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/PaymentBundle/Listener/PaymentReceivedListener.php) |
+| [ClientCreateNotification](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/ClientBundle/Notification/ClientCreateNotification.php) | `client_create` | CLIENT | 1 个 | [ClientListener](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/ClientBundle/Listener/ClientListener.php) |
 
-### 2.4 触发入口详解
+> **重要概念区分：** 通知系统的"邮件通道"≠ 业务邮件发送。
+> - **通知系统**：给**内部用户**发通知（状态变更提醒），走 `email` channel（走 Notifier → EmailNotification）
+> - **业务邮件**：给**客户**发实体邮件（发票/报价 PDF），走 `MailerInterface::send()`（直接发 InvoiceEmail/QuoteEmail）
 
-#### 2.4.1 发票状态变更
+---
 
-**监听器：** [WorkFlowSubscriber](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/Listener/WorkFlowSubscriber.php#L43-L49)
+### 2.4 发票状态通知（invoice_status_update）触发入口详解
+
+发票状态通知有 **3 个独立触发点**，分别对应不同的业务场景。
+
+#### 2.4.1 InvoiceManager - 创建发票时
+
+**文件：** [InvoiceManager::applyTransition()](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/Manager/InvoiceManager.php#L176-L196)
+
+```php
+private function applyTransition(Invoice $invoice): void
+{
+    if (! $this->invoiceStateMachine->can($invoice, Graph::TRANSITION_NEW)) {
+        throw new InvalidTransitionException(Graph::TRANSITION_NEW);
+    }
+
+    $oldStatus = $invoice->getStatus();
+    $this->invoiceStateMachine->apply($invoice, Graph::TRANSITION_NEW);
+    $newStatus = $invoice->getStatus();
+
+    $parameters = [
+        'invoice' => $invoice,
+        'old_status' => $oldStatus,
+        'new_status' => $newStatus,
+        'transition' => Graph::TRANSITION_NEW, // 'new'
+    ];
+
+    $this->notification->sendNotification(new InvoiceStatusNotification($parameters));
+}
+```
+
+- **触发时机：** 创建发票时（`create()` → `applyTransition()`）
+- **Transition：** `new`（从 New 状态转换到下一状态）
+- **参数特点：** 包含 `old_status`、`new_status`、`transition` 完整上下文
+- **调用者：** [InvoiceManager::create()](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/Manager/InvoiceManager.php#L154-L171)
+
+#### 2.4.2 WorkFlowSubscriber - 工作流状态变更时
+
+**文件：** [WorkFlowSubscriber](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/Listener/WorkFlowSubscriber.php#L43-L78)
 
 ```php
 public static function getSubscribedEvents(): array
@@ -131,18 +170,237 @@ public static function getSubscribedEvents(): array
         'workflow.recurring_invoice.entered' => 'onWorkflowTransitionApplied',
     ];
 }
-```
 
-触发条件：状态不是 `New` 时发送通知（[第 75-77 行](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/Listener/WorkFlowSubscriber.php#L75-L77)）：
-```php
-if (! $isNew) {
-    $this->notification->sendNotification(new InvoiceStatusNotification(['invoice' => $invoice]));
+public function onWorkflowTransitionApplied(Event $event): void
+{
+    $invoice = $event->getSubject();
+    $isNew = \in_array($invoice->getStatus(), [InvoiceStatus::New, InvoiceStatus::Draft], true);
+
+    if (! $isNew) {
+        $this->notification->sendNotification(
+            new InvoiceStatusNotification(['invoice' => $invoice])
+        );
+    }
 }
 ```
 
-#### 2.4.2 发票逾期
+- **触发时机：** 任何工作流状态进入新状态时（所有 transition）
+- **监听事件：** `workflow.invoice.entered`（所有状态）、`workflow.recurring_invoice.entered`
+- **触发条件：** 状态不是 `New` 或 `Draft` 时才发送
+- **参数特点：** 只传 `invoice`，没有 old_status/new_status/transition
+- **覆盖的 transitions：** accept, pay, cancel, overdue, reopen, archive, activate 等（见 [Graph.php](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/Model/Graph.php)）
 
-**监听器：** [InvoiceOverdueListener](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/Listener/InvoiceOverdueListener.php#L38-L43)
+#### 2.4.3 SendAction - 发送发票邮件时
+
+**文件：** [Invoice Send Action](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/Action/Transition/Send.php)
+
+```php
+public function __invoke(Request $request, Invoice $invoice): RedirectResponse
+{
+    // ... 邮件验证检查 ...
+    
+    if (InvoiceStatus::Pending !== $invoice->getStatus() 
+        && $this->invoiceStateMachine->can($invoice, Graph::TRANSITION_ACCEPT)) {
+        $this->invoiceStateMachine->apply($invoice, Graph::TRANSITION_ACCEPT);
+    }
+
+    $this->save($invoice);
+    $this->mailer->send(new InvoiceEmail($invoice)); // 直接发业务邮件给客户
+    
+    // ⚠️ 注意：这里没有调用 NotificationManager
+    // 通知是通过 WorkFlowSubscriber 间接触发的（accept 转换）
+}
+```
+
+- **触发方式：** 间接触发（通过工作流 `accept` 转换触发 WorkFlowSubscriber）
+- **业务动作：** 给客户发送发票邮件（业务邮件，不是通知系统的 email channel）
+- **通知触发：** `apply('accept')` → WorkFlowSubscriber 监听 `entered` 事件 → 触发通知
+
+> **关键区别：** 发票发送时，给客户的邮件是直接通过 `MailerInterface` 发送的业务邮件；
+> 而给内部用户的通知是通过工作流事件间接触发的。
+
+#### 2.4.4 发票状态通知触发汇总
+
+| 触发入口 | 触发方式 | Transition | 参数完整度 | 通知给 |
+|---------|---------|-----------|-----------|--------|
+| InvoiceManager::create() | 直接调用 sendNotification | new | 完整（有 old/new status） | 内部用户 |
+| WorkFlowSubscriber | 监听 workflow.entered | 所有状态变更 | 只有 invoice 对象 | 内部用户 |
+| SendAction | 间接（通过工作流触发 WorkFlowSubscriber） | accept | 只有 invoice 对象 | 内部用户 |
+
+---
+
+### 2.5 报价状态通知（quote_status_update）触发入口详解
+
+报价状态通知有 **2 个触发点**，设计模式与发票类似但有差异。
+
+#### 2.5.1 QuoteMailer - 发送报价时
+
+**文件：** [QuoteMailer::applyTransition()](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/QuoteBundle/Mailer/QuoteMailer.php#L40-L74)
+
+```php
+final class QuoteMailer
+{
+    private function applyTransition(Quote $quote): void
+    {
+        if (! $this->quoteStateMachine->can($quote, Graph::TRANSITION_SEND)) {
+            throw new InvalidTransitionException(Graph::TRANSITION_SEND);
+        }
+
+        $oldStatus = $quote->getStatus();
+        $this->quoteStateMachine->apply($quote, Graph::TRANSITION_SEND);
+        $newStatus = $quote->getStatus();
+
+        $parameters = [
+            'quote' => $quote,
+            'old_status' => $oldStatus,
+            'new_status' => $newStatus,
+            'transition' => Graph::TRANSITION_SEND, // 'send'
+        ];
+
+        $this->notification->sendNotification(new QuoteStatusNotification($parameters));
+    }
+
+    public function send(Quote $quote): Quote
+    {
+        if (QuoteStatus::Draft === $quote->getStatus()) {
+            $this->applyTransition($quote); // 状态转换 + 通知
+        } else {
+            $this->mailer->send(new QuoteEmail($quote)); // 只重发邮件，不触发通知
+        }
+        return $quote;
+    }
+}
+```
+
+- **触发时机：** 报价从草稿状态发送时（状态转换 send）
+- **Transition：** `send`（Draft → Pending）
+- **参数特点：** 包含 `old_status`、`new_status`、`transition` 完整上下文
+- **调用者：** [Quote Send Action](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/QuoteBundle/Action/Transition/Send.php)
+- **特殊逻辑：** 如果不是草稿状态（已发送过），只重发邮件，不触发通知
+
+> **和发票的区别：** 报价发送是在 QuoteMailer 里**显式**调用通知；
+> 而发票发送是通过 WorkFlowSubscriber **隐式**触发。
+
+#### 2.5.2 WorkFlowSubscriber - 工作流状态变更时
+
+**文件：** [QuoteBundle WorkFlowSubscriber](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/QuoteBundle/Listener/WorkFlowSubscriber.php#L49-L90)
+
+```php
+public static function getSubscribedEvents(): array
+{
+    return [
+        'workflow.quote.entered.accepted' => 'onQuoteAccepted',
+        'workflow.quote.entered' => 'onWorkflowTransitionApplied',
+    ];
+}
+
+public function onQuoteAccepted(Event $event): void
+{
+    $quote = $event->getSubject();
+    // 接受报价时：触发通知 + 转换为发票
+    $this->notification->sendNotification(new QuoteStatusNotification(['quote' => $quote]));
+    // ... 创建发票逻辑 ...
+}
+
+public function onWorkflowTransitionApplied(Event $event): void
+{
+    $quote = $event->getSubject();
+    $isNew = \in_array($quote->getStatus(), [QuoteStatus::New, QuoteStatus::Draft], true);
+
+    if (! $isNew) {
+        $this->notification->sendNotification(
+            new QuoteStatusNotification(['quote' => $quote])
+        );
+    }
+}
+```
+
+- **触发时机：** 报价工作流状态变更时
+- **两个监听事件：**
+  - `workflow.quote.entered.accepted` - 专门处理已接受状态（同时会创建发票）
+  - `workflow.quote.entered` - 通用状态变更（除 New/Draft 外都触发）
+- **参数特点：** 只传 `quote` 对象
+- **覆盖的 transitions：** send, accept, decline, cancel, reopen, archive, publish 等
+
+> **注意：** `send` 转换会被触发两次通知吗？
+> 不会。QuoteMailer 里的 `applyTransition` 先执行了 `apply('send')`，
+> 这会触发 WorkFlowSubscriber 的 `entered` 事件 → 发一次通知；
+> 然后 QuoteMailer 又显式调用 `sendNotification` → 再发一次？
+> 实际上需要看状态：Draft → send 转换后状态是 Pending，不是 New/Draft，
+> 所以 WorkFlowSubscriber 会触发一次。加上 QuoteMailer 的显式调用，可能是两次。
+> 这可能是一个需要注意的设计点。
+
+#### 2.5.3 报价状态通知触发汇总
+
+| 触发入口 | 触发方式 | Transition | 参数完整度 | 说明 |
+|---------|---------|-----------|-----------|------|
+| QuoteMailer::send() | 直接调用 sendNotification | send | 完整（有 old/new status） | 只有 Draft→Pending 时触发 |
+| WorkFlowSubscriber (entered.accepted) | 监听 accepted 事件 | accept | 只有 quote 对象 | 客户接受报价时 |
+| WorkFlowSubscriber (entered) | 监听所有 entered 事件 | 所有状态变更 | 只有 quote 对象 | 通用状态变更通知 |
+
+---
+
+### 2.6 发票 vs 报价：通知触发模式对比
+
+| 对比项 | 发票 (Invoice) | 报价 (Quote) |
+|--------|---------------|-------------|
+| 发送操作的通知触发方式 | 间接（通过 WorkFlowSubscriber） | 直接（QuoteMailer 显式调用） |
+| 创建时的通知触发方式 | 直接（InvoiceManager::applyTransition） | 没有专门的创建管理器 |
+| 工作流监听器 | 只有通用 entered 监听 | 有 accepted 专门监听 + 通用 entered |
+| 接受状态特殊处理 | 无（InvoiceMailerListener 只发业务邮件） | 有（创建发票 + 发通知） |
+| 重发是否触发通知 | 不触发（SendAction 直接发邮件，不调用通知） | 不触发（QuoteMailer 非草稿状态只发邮件） |
+
+---
+
+### 2.7 其他通知触发入口
+
+#### 2.7.1 支付完成通知
+
+**监听器：** [PaymentReceivedListener](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/PaymentBundle/Listener/PaymentReceivedListener.php#L27-L43)
+
+```php
+public static function getSubscribedEvents(): array
+{
+    return [
+        PaymentEvents::PAYMENT_COMPLETE => 'onPaymentCapture',
+    ];
+}
+
+public function onPaymentCapture(PaymentEvent $event): void
+{
+    $this->notification->sendNotification(
+        new PaymentReceivedNotification(['payment' => $event->getPayment()])
+    );
+}
+```
+
+**事件常量：** [PaymentEvents::PAYMENT_COMPLETE](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/PaymentBundle/Event/PaymentEvents.php#L18) = `'payment.complete'`
+
+**事件派发位置：** 支付回调完成时（`PaymentBundle/Action/Done.php` 等）
+
+#### 2.7.2 客户创建通知
+
+**监听器：** [ClientListener](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/ClientBundle/Listener/ClientListener.php#L79-L90)
+
+```php
+#[AsDoctrineListener(Events::postPersist)]
+public function postPersist(LifecycleEventArgs $event): void
+{
+    $entity = $event->getObject();
+    if (! $entity instanceof Client) {
+        return;
+    }
+    $this->notification->sendNotification(
+        new ClientCreateNotification(['client' => $entity])
+    );
+}
+```
+
+**触发时机：** Doctrine `postPersist` 生命周期事件（新客户保存到数据库后）
+
+#### 2.7.3 发票逾期通知
+
+**监听器：** [InvoiceOverdueListener](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/Listener/InvoiceOverdueListener.php#L38-L59)
 
 ```php
 public static function getSubscribedEvents(): array
@@ -153,65 +411,17 @@ public static function getSubscribedEvents(): array
 }
 ```
 
-#### 2.4.3 支付完成
+**触发时机：** 发票进入 `overdue`（逾期）状态时
 
-**监听器：** [PaymentReceivedListener](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/PaymentBundle/Listener/PaymentReceivedListener.php#L27-L32)
+#### 2.7.4 发票催缴通知
 
-```php
-public static function getSubscribedEvents(): array
-{
-    return [
-        PaymentEvents::PAYMENT_COMPLETE => 'onPaymentCapture',
-    ];
-}
-```
+**处理器：** [SendInvoiceReminderHandler](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/InvoiceBundle/MessageHandler/SendInvoiceReminderHandler.php)
 
-**事件常量：** [PaymentEvents](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/PaymentBundle/Event/PaymentEvents.php#L18)
-```php
-public const PAYMENT_COMPLETE = 'payment.complete';
-```
+两种通知：
+- `invoice_reminder` - 催缴提醒（Overdue7、Overdue30 等）
+- `invoice_reminder_stopped` - 催缴停止（Overdue14）
 
-**事件派发位置：** `PaymentBundle/Action/Done.php` 和 `PaymentBundle/Action/Prepare.php`
-
-#### 2.4.4 客户创建
-
-**监听器：** [ClientListener](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/ClientBundle/Listener/ClientListener.php#L27-L29)
-
-```php
-#[AsDoctrineListener(Events::prePersist)]
-#[AsDoctrineListener(Events::postPersist)]
-#[AsDoctrineListener(Events::postLoad)]
-final class ClientListener
-```
-
-触发时机：`postPersist` 生命周期中（[第 79-89 行](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/ClientBundle/Listener/ClientListener.php#L79-L89)）：
-```php
-public function postPersist(LifecycleEventArgs $event): void
-{
-    $entity = $event->getObject();
-    if (! $entity instanceof Client) {
-        return;
-    }
-    // client is created
-    $this->notification->sendNotification(new ClientCreateNotification(['client' => $entity]));
-}
-```
-
-#### 2.4.5 报价状态变更
-
-**监听器：** [QuoteBundle WorkFlowSubscriber](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/QuoteBundle/Listener/WorkFlowSubscriber.php#L49-L55)
-
-```php
-public static function getSubscribedEvents(): array
-{
-    return [
-        'workflow.quote.entered.accepted' => 'onQuoteAccepted',
-        'workflow.quote.entered' => 'onWorkflowTransitionApplied',
-    ];
-}
-```
-
-触发条件：状态不是 `New` 时发送（[第 87-89 行](file:///d:/fz/0508-2/solo-dogfeeding/code/116-SolidInvoice/src/QuoteBundle/Listener/WorkFlowSubscriber.php#L87-L89)）。
+**触发方式：** Messenger 消息处理器，由定时任务或手动触发
 
 ---
 
