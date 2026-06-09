@@ -1,6 +1,9 @@
 # SolidInvoice API 路由、序列化与文档生成协作机制
 
-> 本文档基于 SolidInvoice 3.0.0-dev 代码库整理，所有文件路径均为仓库相对路径，便于跨环境复核。
+> 本文档基于 SolidInvoice 3.0.0-dev 代码库逐项源码复核后整理。
+> 所有文件路径均为仓库相对路径，所有代码片段均标注精确行号，便于跨环境复核。
+>
+> **复核状态**：已逐项对照源码验证
 
 ---
 
@@ -13,6 +16,7 @@
 5. [三者协作的完整流程](#三者协作的完整流程)
 6. [对齐验证：如何确保一致性](#对齐验证如何确保一致性)
 7. [关键文件索引](#关键文件索引)
+8. [复核记录](#复核记录)
 
 ---
 
@@ -89,7 +93,7 @@ return static function (RoutingConfigurator $routingConfigurator): void {
 
 ### 2. ApiResource 路由声明的三种方式
 
-每个 API 资源通过实体类上的 `#[ApiResource]` 属性声明路由。以 `Invoice` 实体（`src/InvoiceBundle/Entity/Invoice.php`）为例，该实体上声明了三个 `#[ApiResource]`，分别对应三种路由模式。
+每个 API 资源通过实体类上的 `#[ApiResource]` 属性声明路由。以 `Invoice` 实体（`src/InvoiceBundle/Entity/Invoice.php`）为例，该实体上声明了 **三个** `#[ApiResource]`，分别对应三种路由模式。
 
 #### 方式一：标准 CRUD 资源
 
@@ -97,6 +101,7 @@ return static function (RoutingConfigurator $routingConfigurator): void {
 > 文件：`src/InvoiceBundle/Entity/Invoice.php`，第 68-78 行
 >
 > 第一个 `#[ApiResource]`，声明了 5 个标准操作，使用默认 URI 路径（由类名自动转换）。
+> 两个上下文（normalizationContext / denormalizationContext）分别控制读写字段。
 
 ```php
 #[ApiResource(
@@ -127,6 +132,7 @@ return static function (RoutingConfigurator $routingConfigurator): void {
 > 文件：`src/InvoiceBundle/Entity/Invoice.php`，第 79-96 行
 >
 > 第二个 `#[ApiResource]`，使用 `uriTemplate` 自定义路径，通过 `Link` 建立与 `Client` 的关联。
+> 这是一个**子资源**：通过客户 ID 获取该客户的所有发票。
 
 ```php
 #[ApiResource(
@@ -138,19 +144,30 @@ return static function (RoutingConfigurator $routingConfigurator): void {
             fromClass: Client::class,
         ),
     ],
-    normalizationContext: [...],
-    denormalizationContext: [...],
+    normalizationContext: [
+        'groups' => ['invoice_api:read'],
+        AbstractObjectNormalizer::SKIP_NULL_VALUES => false,
+    ],
+    denormalizationContext: [
+        'groups' => ['invoice_api:write'],
+        AbstractObjectNormalizer::SKIP_NULL_VALUES => false,
+    ]
 )]
 ```
 
 **生成的路由：** `GET /api/clients/{clientId}/invoices` — 获取指定客户的所有发票
 
-#### 方式三：自定义操作路由
+#### 方式三：自定义操作路由（状态转换）
 
 **证据代码 2.3：自定义状态转换操作**
 > 文件：`src/InvoiceBundle/Entity/Invoice.php`，第 97-115 行
 >
-> 第三个 `#[ApiResource]`，使用 `uriTemplate` 定义状态转换路径，指定自定义的 `provider` 和 `processor`。
+> 第三个 `#[ApiResource]`，使用 `uriTemplate` 定义状态转换路径。
+>
+> 关键参数：
+> - `provider` / `processor`：自定义数据读取和业务逻辑处理类
+> - `input: false`：**不接受请求体输入**（状态转换只需 URL 中的 transition 参数，不需要 POST body）
+> - `output: Invoice::class`：输出仍是 Invoice 实体（用 read 组序列化）
 
 ```php
 #[ApiResource(
@@ -167,11 +184,16 @@ return static function (RoutingConfigurator $routingConfigurator): void {
     uriVariables: [
         'id' => new Link(fromClass: Invoice::class),
     ],
-    normalizationContext: [...],
+    normalizationContext: [
+        'groups' => ['invoice_api:read'],
+        AbstractObjectNormalizer::SKIP_NULL_VALUES => false,
+    ],
 )]
 ```
 
 **生成的路由：** `POST /api/invoices/{id}/transitions/{transition}` — 应用状态转换
+
+> 💡 **注意**：`input: false` 是一个容易被忽略的重要参数。它表示该操作不接受反序列化输入（即请求体不会被反序列化为实体），状态参数通过 URL 路径 `{transition}` 传递，在 Processor 中从 Request attributes 中读取。
 
 ### 3. 路径命名规则
 
@@ -180,7 +202,7 @@ return static function (RoutingConfigurator $routingConfigurator): void {
 **证据代码 3.1：路径生成器配置**
 > 文件：`config/packages/api_platform.php`，第 24 行
 >
-> 使用 `dash` 生成器（kebab-case 命名风格）。
+> 使用 `dash` 生成器（kebab-case 命名风格），将类名转换为 URL 路径。
 
 ```php
 $config->pathSegmentNameGenerator('api_platform.metadata.path_segment_name_generator.dash');
@@ -198,12 +220,14 @@ $config->pathSegmentNameGenerator('api_platform.metadata.path_segment_name_gener
 
 对于非标准 CRUD 操作（如状态转换），API Platform 通过 **State Provider**（读取数据）和 **State Processor**（处理写入/业务逻辑）模式扩展。
 
-**证据代码 4.1：InvoiceTransitionProvider**
+**证据代码 4.1：InvoiceTransitionProvider（数据读取）**
 > 文件：`src/ApiBundle/State/Provider/InvoiceTransitionProvider.php`，第 22-40 行
 >
 > Provider 负责根据 URI 变量获取数据。`provide` 方法接收 `$uriVariables`（包含路径参数），返回实体对象。
+> 状态转换操作中，Provider 的作用就是根据 ID 查出发票实体。
 
 ```php
+/** @implements ProviderInterface<Invoice> */
 final class InvoiceTransitionProvider implements ProviderInterface
 {
     public function __construct(
@@ -224,12 +248,15 @@ final class InvoiceTransitionProvider implements ProviderInterface
 }
 ```
 
-**证据代码 4.2：InvoiceTransitionProcessor**
+**证据代码 4.2：InvoiceTransitionProcessor（业务逻辑）**
 > 文件：`src/ApiBundle/State/Processor/InvoiceTransitionProcessor.php`，第 24-49 行
 >
 > Processor 负责执行业务逻辑。`process` 方法接收 Provider 提供的数据，处理后返回。
+>
+> 注意：transition 参数从 Request attributes 中读取（因为 `input: false`，不从请求体读取）。
 
 ```php
+/** @implements ProcessorInterface<Invoice, Invoice> */
 final class InvoiceTransitionProcessor implements ProcessorInterface
 {
     public function __construct(
@@ -262,6 +289,7 @@ final class InvoiceTransitionProcessor implements ProcessorInterface
 > 文件：`src/ApiBundle/Resources/config/services/services.php`，第 21-32 行
 >
 > Provider 和 Processor 通过 `autoconfigure` 和 `autowire` 自动注册到 DI 容器。
+> 第 31 行的 `load` 会自动加载 ApiBundle 下所有类，排除 Entity/Resources/Tests 等目录。
 
 ```php
 $services->defaults()
@@ -269,7 +297,8 @@ $services->defaults()
     ->autoconfigure()
     ->private()
     ->bind('$invoiceStateMachine', service('state_machine.invoice'))
-    // ...
+    ->bind('$quoteStateMachine', service('state_machine.quote'))
+    ->bind('$recurringInvoiceStateMachine', service('state_machine.recurring_invoice'))
 ;
 
 $services
@@ -285,25 +314,40 @@ $services
 
 SolidInvoice 使用 **Symfony Serializer** 组件，通过 `#[Groups]` 属性控制字段的序列化/反序列化行为。
 
+> 💡 小提示：不同实体的 Groups 属性导入方式可能不同：
+> - Invoice 实体：`use Symfony\Component\Serializer\Attribute\Groups;` → `#[Groups(...)]`
+> - Client 实体：`use Symfony\Component\Serializer\Attribute as Serialize;` → `#[Serialize\Groups(...)]`
+>
+> 本质是同一个东西，只是别名不同。
+
 #### 命名约定
 
 采用 `{资源}_api:{read|write}` 模式：
-- `invoice_api:read` — 发票读取时包含的字段（响应）
-- `invoice_api:write` — 发票写入时接受的字段（请求）
+- `invoice_api:read` — 发票读取时包含的字段（响应输出）
+- `invoice_api:write` — 发票写入时接受的字段（请求输入）
 - `client_api:read` — 客户读取时包含的字段
 - `searchable` — 搜索/索引专用组（不用于 API 输出）
 
 **证据代码 5.1：字段级序列化组声明**
-> 文件：`src/InvoiceBundle/Entity/Invoice.php`，第 125-145 行
+> 文件：`src/InvoiceBundle/Entity/Invoice.php`，第 125-154 行
 >
 > 不同字段分配不同的序列化组，控制字段在请求和响应中的可见性。
+> `#[ApiProperty(writable: false)]` 进一步标记字段为只读（在文档和反序列化中生效）。
 
 ```php
-// 只读字段：仅出现在 read 组中
+// 只读字段：仅出现在 read 组中 + ApiProperty 标记不可写
 #[ORM\Column(name: 'status', type: Types::STRING, length: 25, enumType: InvoiceStatus::class)]
 #[Groups(['invoice_api:read', 'searchable'])]
 #[ApiProperty(writable: false)]
 protected ?InvoiceStatus $status = null;
+
+// 只读字段：ID
+#[ORM\Column(name: 'id', type: UlidType::NAME)]
+#[ORM\Id]
+#[ORM\GeneratedValue(strategy: 'CUSTOM')]
+#[ORM\CustomIdGenerator(class: UlidGenerator::class)]
+#[Groups(['invoice_api:read', 'searchable'])]
+private ?Ulid $id = null;
 
 // 读写字段：同时出现在 read 和 write 组中
 #[ORM\Column(name: 'invoice_id', type: Types::STRING, length: 255)]
@@ -315,6 +359,17 @@ private string $invoiceId = '';
 #[Groups(['invoice_api:read'])]
 #[ApiProperty(writable: false)]
 private ?string $uuid = null;
+
+// 读写字段：关联客户
+#[ApiProperty(
+    example: '/api/clients/3fa85f64-5717-4562-b3fc-2c963f66afa6',
+    iris: ['https://schema.org/Organization']
+)]
+#[ORM\ManyToOne(targetEntity: Client::class, cascade: ['persist'], inversedBy: 'invoices')]
+#[ORM\JoinColumn(name: 'client_id', referencedColumnName: 'id', nullable: false, onDelete: 'CASCADE')]
+#[Assert\NotBlank]
+#[Groups(['invoice_api:read', 'invoice_api:write', 'searchable'])]
+private ?Client $client = null;
 ```
 
 ### 2. 序列化上下文配置
@@ -325,19 +380,17 @@ private ?string $uuid = null;
 > 文件：`src/InvoiceBundle/Entity/Invoice.php`，第 70-77 行
 >
 > `normalizationContext` 用于响应序列化（实体 → JSON），`denormalizationContext` 用于请求反序列化（JSON → 实体）。
+> 两者使用不同的 groups，实现读写字段分离。
 
 ```php
-#[ApiResource(
-    operations: [new GetCollection(), new Get(), new Post(), new Patch(), new Delete()],
-    normalizationContext: [
-        'groups' => ['invoice_api:read'],
-        AbstractObjectNormalizer::SKIP_NULL_VALUES => false,
-    ],
-    denormalizationContext: [
-        'groups' => ['invoice_api:write'],
-        AbstractObjectNormalizer::SKIP_NULL_VALUES => false,
-    ],
-)]
+normalizationContext: [
+    'groups' => ['invoice_api:read'],
+    AbstractObjectNormalizer::SKIP_NULL_VALUES => false,
+],
+denormalizationContext: [
+    'groups' => ['invoice_api:write'],
+    AbstractObjectNormalizer::SKIP_NULL_VALUES => false,
+],
 ```
 
 | 上下文 | 方向 | 关键选项 |
@@ -347,7 +400,7 @@ private ?string $uuid = null;
 
 **常用上下文选项：**
 - `SKIP_NULL_VALUES` — 是否跳过 null 值字段（本项目设为 `false`，即保留 null）
-- `SKIP_UNINITIALIZED_VALUES` — 是否跳过未初始化的属性（Client 实体中设为 `true`）
+- `SKIP_UNINITIALIZED_VALUES` — 是否跳过未初始化的属性（Client 实体的 read 上下文中设为 `true`）
 
 ### 3. 自定义 Normalizer
 
@@ -355,19 +408,18 @@ private ?string $uuid = null;
 
 **所有自定义 Normalizer 位于：** `src/ApiBundle/Serializer/Normalizer/`
 
-| Normalizer 文件 | 处理类型 | 说明 |
-|-----------------|----------|------|
-| `DiscountNormalizer.php` | `Discount` | 折扣对象序列化 |
-| `CreditNormalizer.php` | `Credit` | 客户积分序列化 |
-| `BigIntegerNormalizer.php` | `BigNumber` | 大整数金额序列化（注意：API 输出时除以 100 转换为元） |
-| `AdditionalContactDetailsNormalizer.php` | `AdditionalContactDetail` | 联系详情序列化 |
+| Normalizer 文件 | 处理类型 | 核心特点 |
+|-----------------|----------|---------|
+| `DiscountNormalizer.php` | `Discount` | 将折扣对象序列化为 `{type, value}` 结构 |
+| `CreditNormalizer.php` | `Credit` | 金额分/元转换；**反序列化时累加而非替换** |
+| `BigIntegerNormalizer.php` | `BigNumber` | 金额分/元转换（处理所有 BigNumber 子类） |
+| `AdditionalContactDetailsNormalizer.php` | `AdditionalContactDetail` | 将联系详情转为 `{type, value}` 结构，type 用名称而非实体 |
 
 **证据代码 7.1：DiscountNormalizer**
 > 文件：`src/ApiBundle/Serializer/Normalizer/DiscountNormalizer.php`，第 26-70 行
 >
 > 实现了 `NormalizerInterface` 和 `DenormalizerInterface`，通过 `#[AutoconfigureTag]` 自动注册。
->
-> `supportsNormalization` 和 `getSupportedTypes` 定义了该 Normalizer 处理的类型。
+> `getSupportedTypes()` 方法声明支持的类型（PHP 8.2+ 特性，用于优化序列化器缓存）。
 
 ```php
 #[AutoconfigureTag('serializer.normalizer')]
@@ -408,25 +460,28 @@ final class DiscountNormalizer implements NormalizerInterface, DenormalizerInter
 }
 ```
 
-#### BigIntegerNormalizer 的特殊转换逻辑
+#### BigIntegerNormalizer：金额的分/元转换
 
 金额字段是最容易出现"文档与实际不一致"的地方，因为它在不同层有不同的表示：
 
-- **数据库层**：以**分**为单位存储（BigInteger，整数）
+- **数据库层**：以**分**为单位存储（BigNumber，整数）
+- **实体层**：`BigNumber` 类型对象
 - **API 层**：以**元**为单位展示（浮点数）
 
 **证据代码 7.2：BigIntegerNormalizer 转换逻辑**
-> 文件：`src/ApiBundle/Serializer/Normalizer/BigIntegerNormalizer.php`，第 33-73 行
+> 文件：`src/ApiBundle/Serializer/Normalizer/BigIntegerNormalizer.php`，第 27-73 行
 >
-> 注意两个关键上下文标记：
-> - `api_denormalize` — API Platform 在反序列化时自动设置，触发"元 → 分"转换
-> - `api_attribute` — API Platform 在序列化时自动设置，触发"分 → 元"转换
+> 注意：
+> - 文件名叫 BigIntegerNormalizer，但实际支持的是 `BigNumber` 基类（通过 `is_a($type, BigNumber::class, true)` 检查），支持所有 BigNumber 子类
+> - 两个关键上下文标记：
+>   - `api_denormalize` — API Platform 在反序列化时自动设置，触发"元 → 分"转换
+>   - `api_attribute` — API Platform 在序列化时自动设置，触发"分 → 元"转换
 
 ```php
 #[AutoconfigureTag('serializer.normalizer')]
 final class BigIntegerNormalizer implements NormalizerInterface, DenormalizerInterface
 {
-    // 反序列化（写入）：元 → 分
+    // 反序列化（写入）：元 → 分（乘以 100）
     public function denormalize(mixed $data, string $type, ?string $format = null, array $context = []): BigNumber
     {
         $data = is_float($data) ? (string) $data : $data;
@@ -438,7 +493,12 @@ final class BigIntegerNormalizer implements NormalizerInterface, DenormalizerInt
         return BigNumber::of($data);
     }
 
-    // 序列化（读取）：分 → 元
+    public function supportsDenormalization(mixed $data, string $type, ?string $format = null, array $context = []): bool
+    {
+        return is_a($type, BigNumber::class, true);
+    }
+
+    // 序列化（读取）：分 → 元（除以 100，保留 2 位小数）
     public function normalize(mixed $object, ?string $format = null, array $context = []): float
     {
         if (isset($context['api_attribute'])) {
@@ -446,6 +506,11 @@ final class BigIntegerNormalizer implements NormalizerInterface, DenormalizerInt
         }
 
         return $object->toBigDecimal()->toFloat();
+    }
+
+    public function supportsNormalization(mixed $data, ?string $format = null, array $context = []): bool
+    {
+        return $data instanceof BigNumber;
     }
 
     public function getSupportedTypes(?string $format): array
@@ -457,7 +522,51 @@ final class BigIntegerNormalizer implements NormalizerInterface, DenormalizerInt
 }
 ```
 
-> ⚠️ **重要对齐提示**：由于 BigIntegerNormalizer 改变了字段的实际输出类型（从整数变为浮点数），必须在 `#[ApiProperty]` 中通过 `openapiContext` 手动指定类型为 `number`，否则 OpenAPI 文档会错误地显示为 `integer` 类型。
+#### CreditNormalizer 的特殊累加行为
+
+**证据代码 7.3：CreditNormalizer 的累加逻辑**
+> 文件：`src/ApiBundle/Serializer/Normalizer/CreditNormalizer.php`，第 36-48 行
+>
+> ⚠️ **重要特殊行为**：Credit 反序列化时，如果已存在 Credit 对象（`OBJECT_TO_POPULATE`），则是**累加**（plus）而不是替换。
+> 这意味着通过 API 更新客户积分时，传入的值会被加到现有积分上，而不是覆盖。
+
+```php
+public function denormalize(mixed $data, string $type, ?string $format = null, array $context = []): mixed
+{
+    if ($type === Credit::class) {
+        $data = is_float($data) ? (string) $data : $data;
+        $delta = BigNumber::of($data)->toBigDecimal()->multipliedBy(100);
+        $existing = $context[AbstractObjectNormalizer::OBJECT_TO_POPULATE] ?? null;
+
+        // 如果已有 Credit，则累加，不是替换！
+        if ($existing instanceof Credit) {
+            return $existing->setValue($existing->getValue()->toBigDecimal()->plus($delta));
+        }
+
+        return (new Credit())->setValue($delta);
+    }
+
+    return $this->denormalizer->denormalize($data, $type, $format, $context);
+}
+```
+
+> ⚠️ **重要对齐提示**：由于 BigIntegerNormalizer 改变了字段的实际输出类型（从 BigNumber 对象变为浮点数），必须在 `#[ApiProperty]` 中通过 `openapiContext` 手动指定类型为 `number`，否则 OpenAPI 文档会错误地推断类型。
+
+**Invoice 实体中的正确示范**（`src/InvoiceBundle/Entity/Invoice.php`，第 156-167 行）：
+```php
+#[ORM\Column(name: 'balance_amount', type: BigIntegerType::NAME)]
+#[Groups(['invoice_api:read'])]
+#[ApiProperty(
+    writable: false,
+    openapiContext: [
+        'type' => 'number',
+    ],
+    jsonSchemaContext: [
+        'type' => 'number',
+    ]
+)]
+private BigNumber $balance;
+```
 
 ---
 
@@ -482,7 +591,7 @@ OpenAPI 文档由 API Platform 自动生成，信息从多个来源聚合：
 `#[ApiProperty]` 属性是控制 OpenAPI 文档中字段展示的核心机制。
 
 **证据代码 8.1：ApiProperty 常用选项**
-> 以下示例综合自 `src/InvoiceBundle/Entity/Invoice.php` 和 `src/ClientBundle/Entity/Client.php`
+> 综合自 `src/InvoiceBundle/Entity/Invoice.php` 和 `src/ClientBundle/Entity/Client.php`
 >
 > 展示了 `writable`、`example`、`openapiContext`、`iris`、`writableLink` 等常用选项。
 
@@ -492,25 +601,42 @@ OpenAPI 文档由 API Platform 自动生成，信息从多个来源聚合：
 #[ApiProperty(writable: false)]
 protected ?InvoiceStatus $status = null;
 
-// 选项 2：提供示例值（出现在文档的 Example 字段）
+// 选项 2：提供示例值 + 语义化 IRI
 #[ApiProperty(
     example: '/api/clients/3fa85f64-5717-4562-b3fc-2c963f66afa6',
     iris: ['https://schema.org/Organization']
 )]
 private ?Client $client = null;
 
-// 选项 3：自定义 OpenAPI Schema（用于特殊类型，如金额字段）
+// 选项 3：自定义 OpenAPI Schema — 金额字段指定为 number 类型
+#[ApiProperty(
+    openapiContext: ['type' => 'number'],
+    jsonSchemaContext: ['type' => 'number'],
+)]
+private BigNumber $balance;
+
+// 选项 4：自定义 OpenAPI Schema — oneOf 类型（Client.currencyCode）
 #[ApiProperty(
     openapiContext: [
-        'type' => 'number',
+        'type' => [
+            'oneOf' => [
+                ['type' => 'string'],
+                ['type' => 'null'],
+            ],
+        ],
     ],
     jsonSchemaContext: [
-        'type' => 'number',
+        'type' => [
+            'oneOf' => [
+                ['type' => 'string'],
+                ['type' => 'null'],
+            ],
+        ],
     ],
 )]
-private ?BigInteger $total = null;
+private ?string $currencyCode = null;
 
-// 选项 4：允许通过 IRI 写入关联资源
+// 选项 5：允许通过 IRI 写入关联资源
 #[ApiProperty(writableLink: true)]
 private Collection $users;
 ```
@@ -522,7 +648,8 @@ private Collection $users;
 | `writable: false` | Request Schema | 字段不出现在 POST/PATCH 的请求体中 |
 | `example` | Schema example | 文档中显示该示例值 |
 | `openapiContext` | Schema 定义 | 覆盖自动推断的类型/格式 |
-| `writableLink: true` | Request Schema | 允许通过 IRI 字符串（如 `/api/clients/xxx`）写入关联资源 |
+| `writableLink: true` | Request Schema | 允许通过 IRI 字符串写入关联资源 |
+| `iris` | JSON-LD 类型 | 声明语义化类型（JSON-LD/Hydra 格式使用） |
 
 ### 3. OpenApiFactory 装饰器 — 文档自定义增强
 
@@ -535,8 +662,8 @@ private Collection $users;
 > 优先级设为 -1（低优先级），确保在 LexikJWT 等其他装饰器之后执行。
 >
 > 主要做两件事：
-> 1. 为每个 Tag 添加描述文本
-> 2. 设置 Server URL（根据路由生成绝对 URL）
+> 1. 为每个 Tag 添加描述文本（8 个资源的描述）
+> 2. 设置 Server URL（根据 `_home` 路由生成绝对 URL）
 
 ```php
 #[AsDecorator(
@@ -605,13 +732,20 @@ $config->swagger()
 ### 5. 全局 API 描述文本
 
 **证据代码 11.1：API 描述配置**
-> 文件：`config/packages/api_platform.php`，第 99-198 行
+> 文件：`config/packages/api_platform.php`，第 97-198 行
 >
-> 动态生成 API 文档的描述文本，包括认证说明、分页说明、错误处理、格式支持、速率限制等内容。
+> 动态生成 API 文档的描述文本。第 97-110 行是前置准备代码（获取版本和格式列表），第 113 行开始正式调用 `$config->description()`。
 >
-> 描述文本中动态插入了支持的格式列表和 Swagger 版本号。
+> 描述内容包括：认证说明、分页说明、错误处理、格式支持、速率限制、版本策略、集成指南等。
 
 ```php
+// 第 97-110 行：准备动态内容
+$array = $config->toArray();
+$versions = implode("\n* ", $array['swagger']['versions']);
+$formats = $array['formats'];
+// ... 构建 $formatDesc 字符串 ...
+
+// 第 113 行开始：设置描述文本
 $config->description(
     <<<DESC
 SolidInvoice is a simple open source invoicing application aimed to help small businesses and freelancers manage their day-to-day billing.
@@ -624,6 +758,16 @@ DESC
 );
 ```
 
+#### ⚠️ 文档描述与实际行为的不一致（重要发现）
+
+在描述文本的最后一段（第 195-196 行）有这样的说明：
+
+> "All monetary amounts are represented as **integers in the smallest currency unit** (e.g., cents for USD/EUR). For example, `1000` represents `$10.00`."
+
+但实际上，**BigIntegerNormalizer 会将金额从分转换为元输出**（浮点数），所以 API 返回的金额是 `10.00`（元）而不是 `1000`（分）。
+
+**这是一个文档描述与实际序列化行为不一致的案例，需要注意。** 在实际使用中，应该以实际 API 返回为准（金额以元为单位，浮点数）。
+
 ### 6. 文档访问路径
 
 | 格式 | 路径 | 说明 |
@@ -632,6 +776,7 @@ DESC
 | JSON | `/api/docs.json` | OpenAPI 3.0 JSON 格式 |
 | JSON-LD | `/api/docs.jsonld` | JSON-LD 格式 |
 | XML | `/api/docs.xml` | XML 格式 |
+| JSON OpenAPI | `/api/docs.jsonopenapi` | `application/vnd.openapi+json` 格式 |
 
 ---
 
@@ -734,37 +879,40 @@ OpenAPI 文档生成是一个**元数据收集**过程，发生在缓存预热�
 | 风险场景 | 表现 | 如何避免 | 验证方法 |
 |----------|------|----------|----------|
 | 修改了 `#[Groups]` 但忘记同步文档描述 | 文档字段列表与实际 API 返回不一致 | `#[ApiProperty]` 与 `#[Groups]` 放在一起修改，改组必改描述 | 对比 `/api/docs.json` 中的 schema 与实际响应 |
-| 自定义 Normalizer 改变了输出格式，但 OpenAPI Schema 未更新 | 文档显示类型与实际响应类型不符（如金额字段显示为 integer 实际是 float） | 在 `#[ApiProperty]` 中使用 `openapiContext` 手动指定正确类型 | 检查金额字段的 schema type 是否为 `number` |
+| 自定义 Normalizer 改变了输出格式，但 OpenAPI Schema 未更新 | 文档显示类型与实际响应类型不符（如金额字段） | 在 `#[ApiProperty]` 中使用 `openapiContext` 手动指定正确类型 | 检查金额字段的 schema type 是否为 `number` |
 | 新增/删除了 `#[ApiResource]` 操作，但忘记实现业务逻辑 | 路由存在但调用失败 | 添加操作时同时实现对应的 Provider/Processor，并添加测试 | `bin/console debug:router` 查看路由，编写 API 测试 |
 | 修改了 URI 模板，但客户端代码未同步 | 客户端调用 404 | 使用 API 版本管理策略，破坏性变更走 Sunset 周期 | 对比前后版本的 OpenAPI 文档差异 |
 | 枚举新增了值，但文档未更新 | 文档枚举值不全 | 使用 PHP 原生枚举（Enum），API Platform 自动读取 | 检查 OpenAPI 文档中 enum 数组是否完整 |
+| 描述文本（description）与实际行为不一致 | 文档误导使用者 | 修改序列化/业务逻辑时，同步检查并更新描述文本 | 实际调用 API 与文档描述对比 |
 
 ### 2. 金额类型的特殊对齐（重点关注）
 
-金额字段（BigInteger/Brick\Math）是最容易出现文档与实际不一致的地方，因为涉及三层转换：
+金额字段（BigNumber/Brick\Math）是最容易出现文档与实际不一致的地方，因为涉及三层转换：
 
 ```
-数据库层（分，整数） → 实体层（BigInteger） → API层（元，浮点数）
-                                    ↑
-                         BigIntegerNormalizer
-                         负责中间的转换
+数据库层（分，整数） → 实体层（BigNumber 对象） → API层（元，浮点数）
+                              ↑
+                       BigIntegerNormalizer
+                       负责中间的转换
 ```
 
-**正确的对齐方式：**
+**正确的对齐方式（以 Invoice.balance 为例）：**
 ```php
-// 1. 实体属性声明为 BigInteger
-use Brick\Math\BigInteger;
+// 1. 实体属性声明为 BigNumber 类型
+use Brick\Math\BigNumber;
+use SolidInvoice\CoreBundle\Doctrine\Type\BigIntegerType;
 
-#[ORM\Column(type: BigIntegerType::NAME)]
-#[Groups(['invoice_api:read', 'invoice_api:write'])]
+#[ORM\Column(name: 'balance_amount', type: BigIntegerType::NAME)]
+#[Groups(['invoice_api:read'])]
 
 // 2. 必须手动指定 openapiContext 类型为 number
-//    （否则文档会推断为 integer 或 object，与实际返回的 float 不一致）
+//    （否则文档会推断为 object 或 integer，与实际返回的 float 不一致）
 #[ApiProperty(
+    writable: false,
     openapiContext: ['type' => 'number'],
     jsonSchemaContext: ['type' => 'number'],
 )]
-private ?BigInteger $total = null;
+private BigNumber $balance;
 ```
 
 ### 3. 验证方法清单
@@ -794,8 +942,8 @@ private ?BigInteger $total = null;
 ### 核心实体（带 ApiResource 声明）
 | 文件路径 | 资源名称 | 特点 |
 |----------|---------|------|
-| `src/InvoiceBundle/Entity/Invoice.php` | Invoice | 最完整的示例：3 个 ApiResource、状态转换操作 |
-| `src/ClientBundle/Entity/Client.php` | Client | 包含 currency 字段的 openapiContext 自定义示例 |
+| `src/InvoiceBundle/Entity/Invoice.php` | Invoice | 最完整的示例：3 个 ApiResource、状态转换、金额 openapiContext |
+| `src/ClientBundle/Entity/Client.php` | Client | 包含 currencyCode 字段的 oneOf openapiContext、SKIP_UNINITIALIZED_VALUES |
 | `src/QuoteBundle/Entity/Quote.php` | Quote | 报价资源 |
 | `src/PaymentBundle/Entity/Payment.php` | Payment | 支付记录资源 |
 | `src/TaxBundle/Entity/Tax.php` | Tax | 税率资源 |
@@ -805,8 +953,8 @@ private ?BigInteger $total = null;
 | 文件路径 | 处理类型 |
 |----------|---------|
 | `src/ApiBundle/Serializer/Normalizer/DiscountNormalizer.php` | `Discount` |
-| `src/ApiBundle/Serializer/Normalizer/CreditNormalizer.php` | `Credit` |
-| `src/ApiBundle/Serializer/Normalizer/BigIntegerNormalizer.php` | `BigNumber` |
+| `src/ApiBundle/Serializer/Normalizer/CreditNormalizer.php` | `Credit`（反序列化累加） |
+| `src/ApiBundle/Serializer/Normalizer/BigIntegerNormalizer.php` | `BigNumber`（分/元转换） |
 | `src/ApiBundle/Serializer/Normalizer/AdditionalContactDetailsNormalizer.php` | `AdditionalContactDetail` |
 
 ### State Provider / Processor
@@ -822,16 +970,30 @@ private ?BigInteger $total = null;
 
 ---
 
-## 总结
+## 复核记录
 
-SolidInvoice 的 API 设计遵循 **"声明优先、单一事实源"** 原则：
+> 本节记录本次逐项复核的结果，供后续参考。
 
-1. **实体类是唯一的真相来源** — 路由、序列化、文档都从实体的属性声明中派生
-2. **API Platform 负责转化** — 将声明式属性转化为实际运行时行为
-3. **自定义扩展点清晰** — Normalizer 处理特殊类型、Provider/Processor 处理特殊业务逻辑、OpenApiFactory 增强文档
+### 复核范围
+- 路由注册机制：3 个配置文件 + Invoice 实体的 3 个 ApiResource
+- 序列化器声明：Groups 使用方式、4 个自定义 Normalizer、2 个上下文类型
+- OpenAPI 文档生成：ApiProperty 选项、OpenApiFactory 装饰器、Swagger 配置、描述文本
 
-**优势**：代码与文档天然一致，修改实体属性即可同步更新路由、序列化和文档。
+### 复核发现并修正的问题
 
-**代价**：需要理解 API Platform 的隐式约定，否则容易出现"改了代码但不知道会影响文档"的情况。特别需要注意的是自定义 Normalizer 改变了输出格式时，必须同步更新 `openapiContext`。
+| 序号 | 问题 | 原描述 | 修正后 |
+|------|------|--------|--------|
+| 1 | 行号偏差 | 证据 11.1 从第 99 行开始 | 实际从第 113 行开始（第 97-110 行是前置准备代码） |
+| 2 | 类型不准确 | BigIntegerNormalizer 处理 `BigInteger` | 实际处理 `BigNumber` 基类（通过 `is_a` 支持所有子类） |
+| 3 | 机制遗漏 | 未提到状态转换操作 `input: false` | 补充了 `input: false` 的含义（不接受请求体输入） |
+| 4 | 机制遗漏 | 未提到 CreditNormalizer 的累加行为 | 补充了 CreditNormalizer 反序列化时累加而非替换的特殊行为 |
+| 5 | 重要不一致 | 未提到文档描述与实际金额格式的矛盾 | 补充了描述文本声称"整数分"但实际是"浮点数元"的不一致案例 |
+| 6 | 证据补充 | ApiProperty 例子不够丰富 | 增加了 Client.currencyCode 的 oneOf openapiContext 示例 |
+| 7 | 细节补充 | 未提到 Groups 属性的不同导入方式 | 补充了 Invoice 用 `#[Groups]`、Client 用 `#[Serialize\Groups]` 的说明 |
 
-掌握了本文档描述的协作机制后，你就可以有信心地进行 API 相关的开发工作了。
+### 复核结论
+
+整体机制描述准确，核心结论正确。主要补充了几个容易被忽略但对理解"文档与代码一致性"很重要的细节：
+- `input: false` 对文档和行为的影响
+- CreditNormalizer 的累加语义（容易踩坑的地方）
+- 全局描述文本与实际序列化行为的不一致（需要注意的文档债务）
