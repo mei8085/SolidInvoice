@@ -872,6 +872,381 @@ OpenAPI 文档生成是一个**元数据收集**过程，发生在缓存预热�
 
 ---
 
+---
+
+## API 安全及文档访问边界
+
+> 本节核对 API 认证机制、文档访问权限、以及与 OpenAPI/Swagger 描述的一致性。
+
+### 1. 安全防火墙配置概览
+
+API 相关的安全配置定义在 `config/packages/security.php` 中，共涉及 **7 个防火墙**和 **1 组访问控制规则**，按匹配顺序排列：
+
+| 防火墙名称 | 匹配路径 | 是否需要认证 | 认证方式 | 作用 |
+|-----------|---------|-------------|----------|------|
+| `api_doc` | `^/api/docs` | ❌ 不需要 | security: false | API 文档页面公开访问 |
+| `api_login` | `^/api/login` | ❌ 不需要 | form_login | 登录获取 API Token |
+| `api` | `^/api` | ✅ 需要 | ApiTokenAuthenticator | 普通 API 接口认证 |
+| `mcp_oauth_endpoints` | `^/oauth/(token\|register\|revoke)$` | ❌ 不需要 | security: false | MCP OAuth 端点 |
+| `mcp_well_known` | `^/.well-known/...` | ❌ 不需要 | security: false | Well-known 发现端点 |
+| `api_well_known` | `^/.well-known/api-catalog$` | ❌ 不需要 | security: false | API 目录发现端点 |
+| `mcp` | `^/_mcp` | ✅ 需要 | McpOAuthAuthenticator | MCP 端点认证 |
+
+> 💡 **重要**：防火墙按定义顺序匹配，先匹配到的先处理。`api_doc` 在 `api` 之前，所以文档页面不受 API token 认证保护。
+
+**证据代码 12.1：API 相关防火墙配置**
+> 文件：`config/packages/security.php`，第 49-77 行
+>
+> 三个 API 相关防火墙依次排列：api_doc（公开）→ api_login（登录）→ api（需要 token）。
+
+```php
+// 文档页面：公开访问，无需认证
+$config
+    ->firewall('api_doc')
+    ->pattern('^/api/docs')
+    ->lazy(true)
+    ->security(false);
+
+// 登录端点：公开访问，form_login 处理
+$config
+    ->firewall('api_login')
+    ->pattern('^/api/login')
+    ->stateless(true)
+    ->security(false)
+    ->formLogin()
+    ->provider('api_token_user_provider')
+    ->checkPath('/api/login')
+    ->successHandler(AuthenticationSuccessHandler::class)
+    ->failureHandler(AuthenticationFailHandler::class);
+
+// 普通 API：需要 API Token 认证
+$config
+    ->firewall('api')
+    ->pattern('^/api')
+    ->stateless(true)
+    ->provider('api_token_user_provider')
+    ->customAuthenticators([ApiTokenAuthenticator::class]);
+```
+
+### 2. 登录检查路由的手工注册流程
+
+登录路由 `api_login_check` 是**手工注册**的，不走 API Platform 的自动扫描机制。
+
+#### 注册流程（三步）
+
+```
+① 全局路由前缀
+   config/routes/api_platform.php 第 17 行
+   → 给 ApiBundle 路由统一加上 /api 前缀
+   ↓
+② 手工注册登录路由
+   src/ApiBundle/Resources/config/routing.php 第 17 行
+   → $routingConfigurator->add('api_login_check', '/login');
+   → 最终路径为 /api/login
+   ↓
+③ 关联 form_login 安全配置
+   config/packages/security.php 第 61-69 行
+   → checkPath 指向 /api/login
+   → 配置 successHandler 和 failureHandler
+```
+
+**证据代码 12.2：手工注册的登录路由**
+> 文件：`src/ApiBundle/Resources/config/routing.php`，第 16-20 行
+>
+> 注意：第 17 行是手工注册的登录路由（`add` 方法），第 19 行是 API Platform 自动加载（`import` 方法）。
+> 登录路由不参与 ApiResource 的自动生成。
+
+```php
+return static function (RoutingConfigurator $routingConfigurator): void {
+    $routingConfigurator->add('api_login_check', '/login');  // 手工注册
+
+    $routingConfigurator->import('.', 'api_platform');        // 自动加载
+};
+```
+
+#### 登录成功流程
+
+登录成功后，`AuthenticationSuccessHandler` 会创建一个新的 API Token 并返回。
+
+**证据代码 12.3：登录成功处理器**
+> 文件：`src/ApiBundle/Event/Listener/AuthenticationSuccessHandler.php`，第 24-60 行
+>
+> 关键行为：
+> 1. 接收 `token_name` 请求参数（默认 "API Token"）
+> 2. 检查同名 token 是否已存在（存在则返回 409 Conflict）
+> 3. 调用 `ApiTokenManager` 创建新 token
+> 4. 返回明文 token（只返回一次，之后无法再获取明文）
+
+```php
+class AuthenticationSuccessHandler implements AuthenticationSuccessHandlerInterface
+{
+    public function onAuthenticationSuccess(Request $request, TokenInterface $token): ?Response
+    {
+        $user = $token->getUser();
+        $name = $request->request->get('token_name') ?: 'API Token';
+
+        // 检查同名 token 是否存在
+        foreach ($user->getApiTokens() as $existing) {
+            if ($existing->getName() === $name) {
+                return new JsonResponse(
+                    ['error' => 'token_name_already_exists', 'message' => '...'],
+                    Response::HTTP_CONFLICT,
+                );
+            }
+        }
+
+        // 创建新 token，返回明文
+        $generated = $this->tokenManager->create($user, $name);
+        return new JsonResponse(['token' => $generated->plaintext]);
+    }
+}
+```
+
+#### 登录失败流程
+
+**证据代码 12.4：登录失败处理器**
+> 文件：`src/ApiBundle/Event/Listener/AuthenticationFailHandler.php`，第 22-33 行
+>
+> 失败时返回 401 状态码和 JSON 格式的错误信息。
+
+```php
+class AuthenticationFailHandler implements AuthenticationFailureHandlerInterface
+{
+    public function onAuthenticationFailure(Request $request, AuthenticationException $exception): Response
+    {
+        return new JsonResponse(
+            ['code' => Response::HTTP_UNAUTHORIZED, 'message' => $exception->getMessage()],
+            Response::HTTP_UNAUTHORIZED,
+        );
+    }
+}
+```
+
+> ⚠️ **文档一致性问题**：`/api/login` 路由是手工注册的，**不在 OpenAPI 文档中出现**。
+> OpenAPI 文档只包含通过 `#[ApiResource]` 声明的端点，登录端点作为"特殊端点"游离在文档之外。
+> 这是路由注册与 API 文档的一个重要边界差异。
+
+### 3. 绕过认证的文档页面
+
+`/api/docs` 路径下的所有文档页面都**绕过了 API 认证**，公开可访问。
+
+#### 具体包含的路径
+
+| 路径 | 格式 | 是否公开 |
+|------|------|---------|
+| `/api/docs` | HTML (Swagger UI) | ✅ 公开 |
+| `/api/docs.json` | JSON | ✅ 公开 |
+| `/api/docs.jsonld` | JSON-LD | ✅ 公开 |
+| `/api/docs.xml` | XML | ✅ 公开 |
+| `/api/docs.jsonopenapi` | OpenAPI JSON | ✅ 公开 |
+
+**证据代码 12.5：文档防火墙配置**
+> 文件：`config/packages/security.php`，第 50-53 行
+>
+> `pattern: ^/api/docs` 匹配所有以 `/api/docs` 开头的路径，`security: false` 表示完全禁用安全检查。
+
+```php
+$config
+    ->firewall('api_doc')
+    ->pattern('^/api/docs')
+    ->lazy(true)
+    ->security(false);
+```
+
+#### 文档公开带来的影响
+
+- **正面**：开发者无需登录即可查看 API 文档，便于集成
+- **负面**：API 的结构、字段、操作等信息完全暴露
+- **注意**：文档公开不代表数据公开，实际调用 API 仍需要 token
+
+> 💡 **与文档描述的一致性**：OpenAPI 文档的描述文本（`config/packages/api_platform.php` 第 117-125 行）只说明了如何使用 token 认证，但没有提到文档页面本身是公开的。文档本身没有"认证页面"的概念。
+
+### 4. 普通 API 的 Token 认证流程
+
+`^/api` 路径下（除了 `/api/docs` 和 `/api/login`）的所有 API 接口都需要 token 认证。
+
+#### 认证器：ApiTokenAuthenticator
+
+**证据代码 12.6：ApiTokenAuthenticator 认证逻辑**
+> 文件：`src/ApiBundle/Security/ApiTokenAuthenticator.php`，第 38-145 行
+>
+> 核心方法：
+> - `supports()` — 判断是否需要认证（检查 header 或 query 中是否有 token）
+> - `authenticate()` — 提取 token 并查找用户
+> - `onAuthenticationSuccess()` — 认证成功后的处理（记录历史、切换公司）
+> - `onAuthenticationFailure()` — 认证失败返回 401
+
+```php
+class ApiTokenAuthenticator extends AbstractAuthenticator
+{
+    // 判断是否支持本次请求
+    public function supports(Request $request): bool
+    {
+        return $request->headers->has('X-API-TOKEN') || $request->query->has('token');
+    }
+
+    // 认证逻辑
+    public function authenticate(Request $request): Passport
+    {
+        $apiToken = $request->headers->get('X-API-TOKEN', $request->query->get('token'));
+
+        if (null === $apiToken) {
+            throw new CustomUserMessageAuthenticationException('No API token provided');
+        }
+
+        $userIdentifier = $this->userProvider->getUsernameForToken($apiToken);
+
+        if (! $userIdentifier) {
+            throw new CustomUserMessageAuthenticationException('Invalid API token');
+        }
+
+        return new SelfValidatingPassport(new UserBadge($userIdentifier));
+    }
+
+    // 认证成功后的处理
+    public function onAuthenticationSuccess(Request $request, TokenInterface $token, string $firewallName): ?Response
+    {
+        // 1. 记录访问历史（方法、IP、请求数据、User-Agent、资源路径）
+        // 2. 验证公司匹配（自定义域名时）
+        // 3. 切换公司上下文
+        // 4. 检查权限（返回 403 如果无权限）
+    }
+}
+```
+
+#### 用户提供者：ApiTokenUserProvider
+
+**证据代码 12.7：ApiTokenUserProvider**
+> 文件：`src/ApiBundle/Security/Provider/ApiTokenUserProvider.php`，第 27-64 行
+>
+> 通过 token 查找对应的用户名，再通过用户名加载用户实体。
+> `getUsernameForToken` 方法由 Authenticator 直接调用。
+
+```php
+class ApiTokenUserProvider implements UserProviderInterface
+{
+    // 根据 token 获取用户名
+    public function getUsernameForToken(string $token): ?string
+    {
+        return $this->tokenRepository->getUsernameForToken($token);
+    }
+
+    // 根据用户名加载用户
+    public function loadUserByIdentifier(string $identifier): UserInterface
+    {
+        $user = $this->userRepository->findOneBy(['email' => $identifier]);
+        // ...
+        return $user;
+    }
+
+    // 不支持刷新用户（无状态）
+    public function refreshUser(UserInterface $user): UserInterface
+    {
+        throw new UnsupportedUserException();
+    }
+}
+```
+
+#### 认证成功后的附加处理
+
+`onAuthenticationSuccess` 方法除了记录历史，还做了几件重要的事：
+
+1. **公司验证**：如果是自定义域名访问，验证 token 所属公司与域名公司一致
+2. **公司切换**：设置当前请求的公司上下文
+3. **权限检查**：调用 `authorizationChecker` 检查是否有权限访问
+
+### 5. X-API-TOKEN 与 Query Token 的差异
+
+API Token 认证支持两种传递方式：Header 方式和 Query 参数方式。
+
+#### 两种方式对比
+
+| 对比项 | X-API-TOKEN (Header) | token (Query 参数) |
+|--------|----------------------|---------------------|
+| 传递方式 | HTTP 请求头 | URL 查询参数 |
+| 示例 | `X-API-TOKEN: abc123` | `?token=abc123` |
+| 安全性 | 较高（不在 URL 中暴露） | 较低（会出现在日志、历史记录中） |
+| 代码优先级 | 高（先检查 header） | 低（作为 fallback） |
+| Swagger 文档 | ✅ 有描述 | ❌ 无描述 |
+
+**证据代码 12.8：两种 token 传递方式的优先级**
+> 文件：`src/ApiBundle/Security/ApiTokenAuthenticator.php`，第 50-53 行 和 第 127-135 行
+>
+> `supports()` 方法检查两种方式是否存在，`authenticate()` 方法优先使用 header，header 不存在时 fallback 到 query。
+
+```php
+// supports 方法：只要有一种方式存在就支持认证
+public function supports(Request $request): bool
+{
+    return $request->headers->has('X-API-TOKEN') || $request->query->has('token');
+}
+
+// authenticate 方法：优先 header，fallback 到 query
+public function authenticate(Request $request): Passport
+{
+    $apiToken = $request->headers->get('X-API-TOKEN', $request->query->get('token'));
+    // ...
+}
+```
+
+> 💡 **行为细节**：`$request->headers->get('X-API-TOKEN', $request->query->get('token'))`
+> 这是一个很巧妙的写法：如果 header 存在，返回 header 的值；如果 header 不存在，才会计算第二个参数（调用 query get）。
+> 也就是说：**header 和 query 同时存在时，只使用 header 的值，忽略 query 的值。**
+
+### 6. 与 OpenAPI/Swagger 描述的一致性核对
+
+#### Swagger 安全配置
+
+**证据代码 12.9：Swagger API Key 配置**
+> 文件：`config/packages/api_platform.php`，第 73-84 行
+>
+> Swagger UI 配置了 API Key 认证，名称为 `X-API-TOKEN`，类型为 header。
+
+```php
+$config->swagger()
+    ->versions([3])
+    // ...
+    ->apiKeys('bearer')
+    ->name('X-API-TOKEN')
+    ->type('header');
+```
+
+#### 一致性核对结果
+
+| 项目 | Swagger 文档描述 | 实际代码行为 | 是否一致 |
+|------|-----------------|-------------|---------|
+| 认证方式 | API Key (header) | Header + Query 两种 | ⚠️ **部分一致**：文档只提了 header，没提 query token |
+| Header 名称 | `X-API-TOKEN` | `X-API-TOKEN` | ✅ 一致 |
+| Token 位置 | header | header（优先） + query（fallback） | ⚠️ 文档缺失 query 方式 |
+| 登录端点 | 无文档 | `/api/login` 手工路由 | ❌ 文档缺失：登录端点不在 OpenAPI 中 |
+| 文档公开性 | 无描述 | `/api/docs` 完全公开 | ⚠️ 文档未说明自身是公开的 |
+| 金额单位 | "整数，最小货币单位" | 浮点数（元） | ❌ **不一致**：文档描述与 BigIntegerNormalizer 行为矛盾 |
+| Token 创建 | POST `/profile/api-tokens` | `/api/login` 也能创建 | ⚠️ 两种创建方式，文档只描述了一种 |
+
+#### 主要不一致点汇总
+
+1. **Query token 未在文档中说明**
+   - 实际代码支持 `?token=xxx` 方式传递 token
+   - Swagger 只配置了 header 方式
+   - 影响：用户可能不知道还有 query 方式可用
+
+2. **登录端点 `/api/login` 不在 OpenAPI 文档中**
+   - 手工注册的路由，不走 API Platform
+   - 没有对应的 `#[ApiResource]` 声明
+   - 影响：新用户不知道如何获取 token，需要看其他文档
+
+3. **金额单位描述矛盾**
+   - 文档描述："All monetary amounts are represented as integers in the smallest currency unit"
+   - 实际行为：BigIntegerNormalizer 输出浮点数（元）
+   - 影响：严重误导使用者（之前已在第 5 节中指出）
+
+4. **两种 Token 创建方式**
+   - 方式一：登录时通过 form_login 创建（`/api/login`）
+   - 方式二：通过 API 创建（`POST /profile/api-tokens`）
+   - 文档只描述了第二种，没提第一种
+
+---
+
 ## 对齐验证：如何确保一致性
 
 ### 1. 常见不一致风险与防范
