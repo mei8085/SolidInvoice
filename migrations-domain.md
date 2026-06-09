@@ -81,7 +81,7 @@
 **这是一次重大架构变更**，引入多租户（Company）隔离：
 
 1. 新建 `companies` 表和 `user_company` 关联表
-2. 为**所有业务表**增加 `company_id` 列
+2. 为**所有业务表**增加 `company_id` 列（此时仍为 integer 类型）
 3. 主键从单 `id` 改为复合主键 `(id, company_id)`
 4. 调整唯一约束以包含 `company_id`（如 `clients.name` → `(name, company_id)`）
 5. 新增 `user_invitations` 表
@@ -93,38 +93,109 @@
 - `postUp()` 将现有数据关联到默认公司（从 `app_config` 读取公司名）
 
 > 💡 **关键洞察**：这是一次破坏性变更。迁移后所有查询都必须带上 `company_id` 过滤条件，由运行时的 `CompanyFilter` 自动处理。
+>
+> **注意**：此时主键仍是 `integer` 类型，只是增加了 `company_id` 形成复合主键。真正的 ID 类型转换发生在 Version20201。
+
+#### 🔹 Version20201 — 主键从 Integer 迁移到 ULID（核心转换）
+[Version20201.php](migrations/Version20201.php)
+
+**这是 ID 类型转换的核心迁移**，也是整个迁移历史中最复杂的迁移之一。它将所有表的主键从自增整数切换为 ULID（Universally Unique Lexicographically Sortable Identifier）。
+
+**迁移算法采用「双写过渡 + 原子切换」策略**，核心步骤如下：
+
+```
+步骤 1: 检测需要迁移的表
+   ↓ 遍历所有表，找出既有 company_id 又有 integer 类型 id 的表
+   
+步骤 2: 添加临时 UUID 列
+   ↓ 为主表添加 __uuid__ 列 (UlidType)
+   ↓ 为所有引用该表的外键表添加临时列 (如 invoice_id_to_uuid)
+   
+步骤 3: 生成 ULID 并填充数据
+   ↓ 为主表每条记录生成新的 ULID，更新到 __uuid__ 列
+   ↓ 按 company_id 分组维护 id → ULID 的映射表
+   ↓ 遍历外键表，根据映射表填充临时 ULID 列
+   
+步骤 4: 删除旧的外键列
+   ↓ 删除旧的 integer 外键列和相关索引
+   
+步骤 5: 重命名临时列
+   ↓ 临时外键列重命名为原列名 (如 invoice_id_to_uuid → invoice_id)
+   
+步骤 6: 切换主键
+   ↓ 删除旧的 integer 主键列 id
+   ↓ 删除临时的 __uuid__ 列
+   ↓ 新增 id 列 (UlidType) 并设为主键
+   
+步骤 7: 重建约束
+   ↓ 重建外键约束、主键约束、索引
+```
+
+**特殊处理**：
+- `users` 表单独处理（`$linkCompany = false`），因为 user 是跨 company 的
+- `user_company` 关联表重建主键顺序为 `[company_id, user_id]`
+- 多对多关联表（`invoice_contact`、`quote_contact`、`recurringinvoice_contact`）添加 `company_id` 列（ULID 类型），但外键数据转换有遗留问题（TODO 注释）
+- 删除 `ext_log_entries` 表（Gedmo 日志不再使用）
+- `invoices` 表新增 `invoice_id` 字符串列，`quotes` 表新增 `quote_id` 字符串列，并用原 id 值填充（作为友好的可读编号）
+
+> 💡 **为什么这么复杂？**
+> 因为数据库有外键约束，不能直接改列类型。必须先加新列、迁移数据、删旧列、重命名新列，整个过程要维护数据一致性和引用完整性。
+>
+> 这也是为什么这个迁移有 500+ 行代码，是整个项目中最复杂的迁移。
 
 #### 🔹 Version20202 — 补充唯一约束
 [Version20202.php](migrations/Version20202.php)
 
 补充 `contact_types` 表的 `(name, company_id)` 唯一索引。
 
-#### 🔹 Version20300 — ID 类型与金额类型大升级
+#### 🔹 Version20300 — 金额大升级 + ULID 类型统一 + 结构调整
 [Version20300.php](migrations/Version20300.php)
 
-**另一次重大架构变更**：
+**注意**：这个版本的 ID 已经是 ULID 了。它主要做三件事：
 
-1. **主键从 Integer 改为 ULID**：
-   - 所有表的 ID 列类型从 `integer` 改为 `ulid` (UUID 二进制有序时间)
-   - 使用 `Symfony\Bridge\Doctrine\Types\UlidType`
+**一、金额类型升级为 BigInteger**：
+- 所有 `*_amount` 列类型从 `integer` 改为 `BigIntegerType`
+- 使用 `Brick\Math\BigInteger` 处理大整数
+- 删除所有 `*_currency` 列（如 `total_currency`、`price_currency` 等）
+- 货币信息统一由 Client 实体的 `currency` 字段决定
 
-2. **金额类型升级为 BigInteger**：
-   - 所有 `*_amount` 列类型改为 `BigIntegerType`
-   - 使用 `Brick\Math\BigInteger` 处理大整数
+**二、ULID 类型统一**：
+- 从 `Ramsey\Uuid\Doctrine\UuidBinaryOrderedTimeType` 迁移到 `Symfony\Bridge\Doctrine\Types\UlidType`
+- 遍历所有表，检查列类型，如果是 `UuidBinaryOrderedTimeType` 则统一转换为 `UlidType`
+- 这解释了为什么 Version20201 已经转了 ULID，Version20300 还要再转一次 —— 库换了
 
-3. **移除货币列**：
-   - 删除所有 `*_currency` 列（如 `total_currency`、`price_currency` 等）
-   - 货币信息统一由 Client 实体的 `currency` 字段决定
+**三、关联表遗留问题修复**：
+- 显式设置 `invoice_contact`、`quote_contact`、`recurringinvoice_contact` 等关联表的外键列类型为 `UlidType`
+- 为这些关联表的 `company_id` 添加指向 `companies` 表的外键约束
+- （Version20201 中这些关联表的外键转换因为缺少 company_id 被跳过了，见 TODO 注释）
 
-4. **新增 `invoice_date` 列**：独立的发票日期字段
+**四、其他结构调整**：
+- 新增 `invoice_date` 列（独立的发票日期字段）
+- 新增 `recurring_invoice_id` 外键列
+- 新增 `recurring_options` 表（循环发票选项独立为实体）
+- 用户表移除 `username` 列（邮箱作为唯一标识）
+- 新增通知系统相关表
+- 发票行增加 `type` 字段（区分 `invoice` 和 `recurring_invoice`）
+- `user_company` 主键顺序改为 `[user_id, company_id]`
 
-5. **新增 `recurring_options` 表**：循环发票选项独立为单独的实体
+#### 🔹 Version20305 — 关联表 company_id 清理
+[Version20305.php](migrations/Version20305.php)
 
-6. **用户表移除 `username` 列**：邮箱作为唯一标识
+- 删除 `invoice_contact`、`recurringinvoice_contact`、`quote_contact` 三个多对多关联表的 `company_id` 列
+- 这些列在 Version20201 中添加，但实际上是冗余的 —— 关联表的 company 可以通过主表（invoice/quote）间接确定
+- 同时将 `invoices.due`、`invoices.invoice_date`、`quotes.due` 的类型改为 `DATETIME_IMMUTABLE`
 
-7. **通知系统表**：新增 `notification_transport_setting`、`notification_user_setting` 等表
+> 💡 **架构洞察**：这是一个「先加上、后移除」的典型案例。
+> Version20201 加上 company_id 是为了 CompanyFilter 能直接过滤关联表；
+> 但后来发现 Doctrine 的 SQL 过滤器是作用在实体上的，关联表不是实体，所以不需要。
+> 而且多对多关联表的数据完整性由主实体的关联关系保证，冗余的 company_id 反而可能造成不一致。
+> 所以在 Version20305 中又移除了这些冗余列。
 
-8. **发票行增加 `type` 字段**：区分 `invoice` 和 `recurring_invoice`
+#### 🔹 Version20306 — 密码重置重构
+[Version20306.php](migrations/Version20306.php)
+
+- 新增 `reset_password_request` 表（Symfony 标准重置密码表结构）
+- 从 `users` 表移除 `confirmation_token` 和 `password_requested_at`
 
 #### 🔹 Version20306 — 密码重置重构
 [Version20306.php](migrations/Version20306.php)
