@@ -417,7 +417,8 @@ Doctrine 自动扫描 `src/` 目录下带有 `#[ORM\Entity]` 注解的类，无�
 | **迁移 (Version20000)** | integer 主键、deleted 软删除、amount+currency 双列 | `invoices` 表定义 |
 | **迁移 (Version20100)** | 移除 deleted、移除 is_recurring | 删除列操作 |
 | **迁移 (Version20200)** | 增加 company_id、复合主键 | `addCompanyToTable()` |
-| **迁移 (Version20300)** | ULID 主键、BigInteger 金额、移除 currency、增加 invoice_date | 类型转换 + 列增删 |
+| **迁移 (Version20201)** | 主键和外键从 integer 转 ULID（核心转换） | `migrate()` 七步算法 |
+| **迁移 (Version20300)** | BigInteger 金额、移除 currency、修复关联表外键遗留 | 金额升级 + 遗留修复 |
 | **实体定义** | PHP 属性 + ORM Attributes + Traits + Embeddable | [Invoice.php](src/InvoiceBundle/Entity/Invoice.php) |
 | **运行时映射** | CompanyFilter 自动加 company_id 条件、ArchivableFilter 过滤归档 | [CompanyFilter.php](src/CoreBundle/Doctrine/Filter/CompanyFilter.php) |
 
@@ -448,9 +449,10 @@ Doctrine 自动扫描 `src/` 目录下带有 `#[ORM\Entity]` 注解的类，无�
 
 5. **ID 类型和生成策略的变化**
    - 迁移 20000：自增整数 ID
-   - 迁移 20200：复合主键 (id, company_id)
-   - 迁移 20300：ULID 单主键
-   - 当前实体：ULID + 自定义生成器
+   - 迁移 20200：复合主键 (id integer + company_id ULID)
+   - 迁移 20201：ULID 单主键（核心转换，外键同步转换）
+   - 迁移 20300：修复关联表外键遗留（兜底）
+   - 当前实体：ULID + UlidGenerator 自定义生成器
 
 ### 5.3 关键架构决策的迁移轨迹
 
@@ -494,17 +496,33 @@ Version20300: 删除 *_currency 列，amount 升级为 BigInteger
 - 使用 BigInteger 避免浮点数精度问题
 - 减少冗余列
 
-#### 决策 4：主键从 Integer 到 ULID（测试）
+#### 决策 4：主键从 Integer 到 ULID
 ```
-Version20000-20200: 自增 integer 主键 (+ company_id 复合)
+Version20000: 自增 integer 单主键
         ↓
-Version20300: ULID 单主键 (二进制有序 UUID)
+Version20200: 复合主键 (id integer + company_id ULID)
+        ↓
+Version20201: 业务表主键转为 ULID (Symfony UlidType) + 外键自动转换
+        ↓  关联表外键有遗留
+Version20300: 修复关联表外键遗留 + Ramsey UUID 兜底转换
+        ↓
+Version20305: 关联表删除冗余 company_id
 ```
+
+**关键节点说明**：
+
+| 版本 | 变更内容 | 类型 |
+|------|---------|------|
+| 20200 | `companies.id` 首次用 ULID；所有表的 `company_id` 是 ULID | 部分 ULID 化 |
+| 20201 | 业务表主键和大部分外键从 integer → ULID（核心转换） | 基本完成 ULID 化 |
+| 20300 | 修复关联表外键遗留；Ramsey UUID → Symfony ULID 兜底 | 完全 ULID 化 |
+| 20305 | 清理关联表冗余 company_id | 优化清理 |
 
 **原因**：
 - ULID 可在客户端生成，无需数据库 round-trip
 - 按时间有序，索引性能好
 - 分布式系统友好
+- 与多租户架构配合，避免跨租户 ID 碰撞
 
 ---
 
