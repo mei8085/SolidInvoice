@@ -481,19 +481,19 @@ abstract class NotificationMessage extends Notification
 
 ### 6.2 仓库实际存在的配置器分类（`src/NotificationBundle/Configurator/` 目录共 42 个文件）
 
-经逐文件检查 `getType()` 返回值，排除接口 `ConfiguratorInterface.php` 后，共 **40 个真实配置器**，分为两类：
+经逐文件检查 `getType()` 返回值，排除接口 `ConfiguratorInterface.php` 后，共 **41 个真实配置器**，分为两类：
 
 #### 类别 1：`chatter` — 聊天通道（14 个）→ ✅ 代码可用
 
 | 配置器文件 | 配置器名称 | `getType()` 返回值 | 对应 Notifier 接口 | 通道字符串格式 |
 |---|---|---|---|---|
+| `AmazonSnsConfigurator.php` | AmazonSns | chatter | ChatNotificationInterface | `chat/{uuid}` |
 | `DiscordConfigurator.php` | Discord | chatter | ChatNotificationInterface | `chat/{uuid}` |
 | `FakeChatConfigurator.php` | FakeChat（测试用） | chatter | ChatNotificationInterface | `chat/{uuid}` |
 | `FirebaseConfigurator.php` | Firebase | chatter | ChatNotificationInterface | `chat/{uuid}` |
 | `GitterConfigurator.php` | Gitter | chatter | ChatNotificationInterface | `chat/{uuid}` |
 | `GoogleChatConfigurator.php` | GoogleChat | chatter | ChatNotificationInterface | `chat/{uuid}` |
 | `LinkedInConfigurator.php` | LinkedIn | chatter | ChatNotificationInterface | `chat/{uuid}` |
-| `MailjetConfigurator.php` | Mailjet | chatter | ChatNotificationInterface | `chat/{uuid}` |
 | `MattermostConfigurator.php` | Mattermost | chatter | ChatNotificationInterface | `chat/{uuid}` |
 | `MercureConfigurator.php` | Mercure | chatter | ChatNotificationInterface | `chat/{uuid}` |
 | `MicrosoftTeamsConfigurator.php` | MicrosoftTeams | chatter | ChatNotificationInterface | `chat/{uuid}` |
@@ -502,12 +502,11 @@ abstract class NotificationMessage extends Notification
 | `TelegramConfigurator.php` | Telegram | chatter | ChatNotificationInterface | `chat/{uuid}` |
 | `ZulipConfigurator.php` | Zulip | chatter | ChatNotificationInterface | `chat/{uuid}` |
 
-#### 类别 2：`texter` — 短信通道（26 个）→ ⚠️ UI 可配置，但发送代码残缺
+#### 类别 2：`texter` — 短信通道（27 个）→ ⚠️ UI 可配置，但发送代码残缺
 
 | 配置器文件 | 配置器名称 | `getType()` 返回值 | 对应 Notifier 接口 | 通道字符串格式 | 实际发送 |
 |---|---|---|---|---|---|
 | `AllMySmsConfigurator.php` | AllMySms | texter | **❌ 接口未实现** | `sms/{uuid}` | 失败 |
-| `AmazonSnsConfigurator.php` | AmazonSns | texter | ❌ 接口未实现 | `sms/{uuid}` | 失败 |
 | `BrevoConfigurator.php` | Brevo | texter | ❌ 接口未实现 | `sms/{uuid}` | 失败 |
 | `ClickatellConfigurator.php` | Clickatell | texter | ❌ 接口未实现 | `sms/{uuid}` | 失败 |
 | `EsendexConfigurator.php` | Esendex | texter | ❌ 接口未实现 | `sms/{uuid}` | 失败 |
@@ -517,6 +516,7 @@ abstract class NotificationMessage extends Notification
 | `InfobipConfigurator.php` | Infobip | texter | ❌ 接口未实现 | `sms/{uuid}` | 失败 |
 | `IqsmsConfigurator.php` | Iqsms | texter | ❌ 接口未实现 | `sms/{uuid}` | 失败 |
 | `LightSmsConfigurator.php` | LightSms | texter | ❌ 接口未实现 | `sms/{uuid}` | 失败 |
+| `MailjetConfigurator.php` | Mailjet | texter | ❌ 接口未实现 | `sms/{uuid}` | 失败 |
 | `MessageBirdConfigurator.php` | MessageBird | texter | ❌ 接口未实现 | `sms/{uuid}` | 失败 |
 | `MessageMediaConfigurator.php` | MessageMedia | texter | ❌ 接口未实现 | `sms/{uuid}` | 失败 |
 | `MobytConfigurator.php` | Mobyt | texter | ❌ 接口未实现 | `sms/{uuid}` | 失败 |
