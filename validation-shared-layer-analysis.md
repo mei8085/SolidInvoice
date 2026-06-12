@@ -1,476 +1,685 @@
-# SolidInvoice 接口文档字段约束与前端表单校验规则共享层分析报告
+# SolidInvoice 接口文档字段约束与前端表单校验规则 —— 共享层深度分析报告（修正版）
+
+> **修正说明**：本报告基于实际代码深度走查，纠正了首版分析中的三处关键偏差：
+> 1. 复杂表单（Invoice/Quote）与 API **并不共享同一层校验** —— 两者走的是「DTO 校验→手动映射→Entity 持久化」与「API Platform 直接校验 Entity」两条独立路径
+> 2. 浏览器原生必填校验 **并非主路径** —— 核心属性是 `data-required`（仅数据标记），绝大多数字段不触发浏览器原生弹窗
+> 3. 存在大量**仅表单/安装流程专用的校验组**，需逐类说明修改优先级
+
+---
 
 ## 一、核心结论（Executive Summary）
 
-| 问题 | 结论 |
-|------|------|
-| **共用定义层在哪？** | **Entity层（Doctrine实体）** 是两者的首要共享源；部分复杂表单场景使用 **DTO层**（如InvoiceFormDTO）作为第二共享层 |
-| **功能演进时谁先改？** | **始终以 Entity/DTO 为真理源（Source of Truth）** — 先改 Entity/DTO 上的 `#[Assert]` 约束和 `#[Groups]` 序列化组，API文档自动更新；FormType因绑定 data_class 自动继承校验，仅需做UI展示调整 |
-| **前端独立校验？** | 极少。前端只有极少数 Stimulus 控制器做增强型体验校验（VAT号远程校验、密码强度视觉反馈），核心规则完全依赖后端 |
+| 问题 | 最终结论 |
+|------|---------|
+| **接口文档 & 表单校验共用哪一层？** | **取决于字段的复杂程度**，分三类：<br>① 简单实体（Client/Tax/PaymentSettings）→ 共用 **Entity 层**<br>② 复杂业务表单（Invoice/Quote 新建/编辑）→ **不共用**，表单走 DTO 层，API 走 Entity 层，两者规则需分别维护<br>③ 安装/注册流程 → 只走**专用 DTO 层**，与 API 完全无关 |
+| **浏览器原生必填校验是主路径吗？** | **绝对不是。**<br>主路径是 **服务端 Symfony Validator**（$form→isValid() / API Validation Listener）<br>前端仅有：<br>① `data-required` 数据标记（用于 Label 星号，不触发浏览器校验）<br>② 少数 Live Component / Ajax 异步实时校验<br>③ 两个页面显式加了 `novalidate` 彻底关闭原生校验 |
+| **只在表单/安装流程生效的规则？** | 共 4 大类专用校验组：<br>① `form` 组（Client.contacts 集合最小数量）<br>② `existing_client` / `new_client`（Invoice/Quote 条件校验组）<br>③ 安装向导专用组：`database_config*`、`user_account`<br>④ Mailer/Notification 动态 provider 组 |
+| **字段规则变更时优先改哪一侧？** | **先判断字段属于上述哪一类，再决定改动点。**<br>总体原则：<br>❶ 找对应类的 `#[Assert]` 注解（真理源）<br>❷ 若两端都需要，改 Entity + 改 DTO（如有）+ 改映射 Manager（如有）<br>❸ API 侧还需检查 `#[Groups]` 序列化组<br>❹ 最后才考虑前端模板 |
 
 ---
 
-## 二、系统架构全景图
+## 二、系统架构全景图（修正版）
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              API 接口文档（自动生成）                              │
-│  ┌───────────────────────────────────────────────────────────────────────────┐  │
-│  │  API Platform Swagger/OpenAPI                                             │  │
-│  │  来源：                                                                    │  │
-│  │   1. Entity 属性上的 #[Assert\*] 约束（如 NotBlank、Length、Url）          │  │
-│  │   2. #[ApiProperty(openapiContext)] 手工补充                               │  │
-│  │   3. #[Groups(['xxx_api:read', 'xxx_api:write'])] 控制字段暴露             │  │
-│  │   4. validationContext: { groups: ['Default', 'api'] } 指定校验组          │  │
-│  └───────────────────────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────────────┘
-                                    ▲
-                                    │  读取
-                                    │
-                     ┌──────────────────────────────────────┐
-                     │     Entity / DTO（共享真理源）        │
-                     │  ┌────────────────────────────────┐  │
-                     │  │ #[Assert\NotBlank]              │  │
-                     │  │ #[Assert\Length(max: 125)]       │  │
-                     │  │ #[Assert\Url]                    │◄─┼── 第一层：核心约束
-                     │  │ #[Groups(['client_api:read'])]   │  │
-                     │  └────────────────────────────────┘  │
-                     └──────────────────────────────────────┘
-                                    ▲
-                                    │  data_class 绑定
-                                    │
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                            前端表单（Symfony Form + Twig）                         │
-│  ┌───────────────────────────────────────────────────────────────────────────┐  │
-│  │  FormType（如 ClientType、TaxType、InvoiceType）                            │  │
-│  │   - configureOptions: ['data_class' => Client::class]                      │  │
-│  │   - validation_groups: ['Default', 'form']  可扩展校验组                   │  │
-│  │   - buildForm: 只定义字段顺序/类型/UI选项，极少重复加约束                    │  │
-│  │                                                                             │  │
-│  │  Twig 模板渲染：form_widget(form.name) 自动输出：                           │  │
-│  │   - required="required"（来自 Assert\NotBlank）                             │  │
-│  │   - maxlength="125"（来自 Assert\Length）                                   │  │
-│  │   - data-required="required" 标记                                           │  │
-│  │                                                                             │  │
-│  │  Stimulus 控制器（极少，仅增强体验）：                                       │  │
-│  │   - vat-validator-controller.ts：远程调用VAT校验 API                        │  │
-│  │   - password-strength-controller.ts：密码强度视觉指示器                     │  │
-│  └───────────────────────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         API 接口文档（OpenAPI/Swagger）                               │
+│                                                                                       │
+│    字段来源：                                                                          │
+│    ① Entity 上的 #[Assert\*]                                                          │
+│    ② Entity 上的 #[ApiProperty(openapiContext)] 手工补充                               │
+│    ③ #[Groups(['xxx_api:read', 'xxx_api:write'])] 字段可见性控制                       │
+│    ④ validationContext: { groups: ['Default', 'api'] } 校验组                          │
+│                                                                                       │
+│    校验执行者：API Platform Validation Listener                                       │
+│         ↓ 校验 Entity 本身 ↓                                                           │
+└────────────────────────────────────┬──────────────────────────────────────────────────┘
+                                     │
+                                     │
+                    ┌────────────────┴────────────────┐
+                    │                                 │
+                    ▼                                 ▼
+        ┌─────────────────────┐            ┌──────────────────────────┐
+        │  Entity 层          │            │  DTO 层（表单专用）        │
+        │  ┌───────────────┐ │            │  ┌────────────────────┐  │
+        │  │ Client        │ │            │  │ InvoiceFormDTO     │  │
+        │  │ Contact       │ │            │  │ QuoteFormDTO       │  │
+        │  │ Tax           │ │            │  │ Registration       │  │
+        │  │ Invoice       │◄┼──API 共用──┤  │ ChangePassword     │  │
+        │  │ Quote         │ │            │  │ Installation       │  │
+        │  │ BaseInvoice   │ │            │  │ DatabaseConfig     │  │
+        │  └───────────────┘ │            │  │ UserAccount        │  │
+        │                    │            │  └────────────────────┘  │
+        │  真理源一：简单实体  │            │  真理源二：复杂表单专用   │
+        └────────────────────┘            └──────────────────────────┘
+                    ▲                                    ▲
+                    │ data_class 绑定                    │ data_class 绑定
+                    │                                    │
+        ┌────────────────────────────────────────────────────────────────────┐
+        │                        前端表单（Web）                                 │
+        │                                                                       │
+        │  FormType:                                                             │
+        │   ClientType      → data_class: Client::class                         │
+        │   TaxType         → data_class: Tax::class                            │
+        │   InvoiceType     → data_class: InvoiceFormDTO::class  ← 注意不是Invoice!│
+        │   QuoteType       → data_class: QuoteFormDTO::class                   │
+        │   RegistrationType→ data_class: Registration::class                   │
+        │   InstallationType→ data_class: Installation::class                   │
+        │                                                                       │
+        │  校验链路：                                                             │
+        │   $form→handleRequest()                                                │
+        │   $form→isValid()  ←  Symfony Validator 读取 data_class 上的 #[Assert] │
+        │       │                                                                 │
+        │       ├── 若绑定 Entity → 直接校验 Entity                              │
+        │       ├── 若绑定 DTO → 校验 DTO → 手动 → Manager→createXxxFromDTO()   │
+        │       │                      ↳映射到 Entity → persist(不二次校验!)     │
+        │       │                                                                 │
+        │       └── 前端 UI 展示：                                                │
+        │           form_widget() 输出 data-required="required"(非原生 required!)│
+        │           form_errors() 渲染服务端返回的错误                             │
+        │           Live Component / Ajax 异步错误提示                             │
+        │           Stimulus 控制器仅做体验增强（VAT校验、密码强度条）              │
+        └───────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 三、共用定义层详解
+## 三、三类字段的共享层深度解析
 
-### 3.1 第一层共享：Entity（Doctrine 实体）
+### 3.1 第一类：简单实体 —— Entity 是真正的共享真理源
 
-**这是最主要的共享层。** 绝大多数字段约束同时服务于 API 文档和前端表单。
+**典型代表**：Client、Contact、Tax、Payment Settings
 
-#### 示例：Client 实体的 name 字段
+这类字段的 API 文档约束与前端表单校验 **100% 共用 Entity 上的 `#[Assert]` 注解**。
+
+#### 示例 1：Client.name 字段
 
 文件：[Client.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/ClientBundle/Entity/Client.php#L93-L98)
 
 ```php
-#[ApiProperty(iris: ['https://schema.org/name'])]
 #[ORM\Column(name: 'name', type: Types::STRING, length: 125)]
-#[Assert\NotBlank]                          // ← 同时用于 API 校验 + 表单校验
-#[Assert\Length(max: 125)]                  // ← 同时用于 API 校验 + 表单 maxlength
+#[Assert\NotBlank]                          // ← 同时用于：API校验 + 表单校验
+#[Assert\Length(max: 125)]                  // ← 同时用于：API文档maxLength + 表单maxlength
 #[Serialize\Groups(['client_api:read', 'client_api:write', 'searchable'])]
 private ?string $name = null;
 ```
 
-| 约束注解 | API文档表现 | 前端表单表现 |
-|---------|------------|-------------|
-| `#[Assert\NotBlank]` | OpenAPI schema: `required: ["name"]` | `<input required="required">` + label加红色星号 |
-| `#[Assert\Length(max: 125)]` | OpenAPI schema: `maxLength: 125` | `<input maxlength="125">` |
-| `#[Assert\Url]` | OpenAPI schema: `format: "uri"` | HTML5 `<input type="url">`（配合 UrlType） |
+**两端如何消费同一约束：**
 
-#### API 资源配置
+| 消费方 | 机制 | 实际效果 |
+|-------|------|---------|
+| API 文档 | API Platform 解析 Entity 的 Assert → 生成 OpenAPI Schema | `required: ["name"]`, `maxLength: 125` |
+| API 校验 | Validation Listener 使用 `validationContext: {groups: ['Default','api']}` | 提交空值或超长时返回 422 错误 |
+| 表单校验 | ClientType 配置 `'data_class' => Client::class`，`validation_groups: ['Default', 'form']` | `$form→isValid()` 时执行相同的 NotBlank + Length |
+| 表单UI | `form_widget(form.name)` 渲染 widget_attributes block | `<input data-required="required" maxlength="125">` |
 
-同文件 [Client.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/ClientBundle/Entity/Client.php#L53-L73)：
-
-```php
-#[ApiResource(
-    operations: [new Get(), new Post(), new GetCollection(), new Patch(), new Delete()],
-    normalizationContext: [
-        'groups' => ['client_api:read'],          // API 输出字段组
-    ],
-    denormalizationContext: [
-        'groups' => ['client_api:write'],         // API 输入字段组
-    ],
-    validationContext: [
-        'groups' => ['Default', 'api'],           // API 校验组（不含 form 组）
-    ],
-)]
-```
-
-#### FormType 配置
-
-文件：[ClientType.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/ClientBundle/Form/Type/ClientType.php#L113-L119)：
-
-```php
-public function configureOptions(OptionsResolver $resolver): void
-{
-    $resolver->setDefaults([
-        'data_class' => Client::class,               // ← 绑定到同一 Entity
-        'validation_groups' => ['Default', 'form'],  // ← 表单校验组（多一个 form 组）
-    ]);
-}
-```
-
-**关键点**：`data_class => Client::class` 使 Symfony Form 自动读取该类上的所有 `#[Assert]` 注解。
-
----
-
-### 3.2 第二层共享：DTO（表单专用数据传输对象）
-
-**当表单逻辑比实体更复杂时（条件校验、多模式表单），使用 DTO 作为共享层。**
-
-#### 示例：InvoiceFormDTO（发票表单 DTO）
-
-文件：[InvoiceFormDTO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/InvoiceBundle/DTO/InvoiceFormDTO.php#L28-L96)
-
-```php
-final class InvoiceFormDTO
-{
-    public InvoiceClientMode $clientMode;
-
-    // 模式1：选择已有客户
-    #[Assert\NotBlank(groups: ['existing_client'])]   // 条件校验组
-    public ?Client $client = null;
-
-    // 模式2：新建客户（内联字段）
-    #[Assert\NotBlank(groups: ['new_client'])]
-    #[Assert\Length(max: 125, groups: ['new_client'])]
-    public ?string $newClientName = null;
-
-    #[Assert\NotBlank(groups: ['new_client'])]
-    #[Assert\Email(mode: Assert\Email::VALIDATION_MODE_STRICT, groups: ['new_client'])]
-    public ?string $newContactEmail = null;
-
-    // 通用字段（Default 组，两端共用）
-    #[Assert\NotBlank]
-    public string $invoiceId = '';
-
-    #[Assert\Count(min: 1)]
-    #[Assert\Valid]
-    public ArrayCollection $lines;
-}
-```
-
-InvoiceType 通过 data_class 绑定此 DTO：
-文件：[InvoiceType.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/InvoiceBundle/Form/Type/InvoiceType.php#L208-L210)
-
-```php
-'data_class' => InvoiceFormDTO::class,
-'validation_groups' => function (FormInterface $form) {
-    $data = $form->getData();
-    $groups = ['Default'];
-    // 根据 clientMode 动态追加 existing_client 或 new_client 组...
-    return $groups;
-}
-```
-
-> **注意**：DTO 模式下，API 层依然使用 **Entity**（Invoice）而非 InvoiceFormDTO，因此 DTO 只是**表单专用的共享层**，不直接参与 API 文档生成。
-
----
-
-### 3.3 共享机制下的差异点：Validation Groups
-
-Entity 上的 `#[Assert]` 约束可以通过 `groups` 参数实现 **API 和表单规则差异化**。
-
-#### 经典差异示例：Client.contacts 字段
+#### 示例 2：Client.contacts —— 仅表单专用的组
 
 文件：[Client.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/ClientBundle/Entity/Client.php#L146-L159)
 
 ```php
-#[ORM\OneToMany(mappedBy: 'client', targetEntity: Contact::class, ...)]
 #[Assert\Count(
     min: 1,
     minMessage: 'You need to add at least one contact to this client',
-    groups: ['form'],          // ← 仅表单校验生效，API 不生效！
+    groups: ['form'],          // ← 关键点：只在 form 组生效
 )]
 #[Assert\Valid(groups: ['form'])]
 #[Serialize\Groups(['client_api:read'])]   // ← API 只读，不可写
 private Collection $contacts;
 ```
 
-| 场景 | 校验规则 | 原因 |
-|-----|---------|------|
-| **前端表单**（groups: `['Default', 'form']`） | 必须至少1个联系人 | 表单是单页提交，联系人嵌套在同一页面 |
-| **REST API**（groups: `['Default', 'api']`） | 无此限制 | RESTful 设计：联系人是**独立资源**，通过 `/api/clients/{id}/contacts` 单独管理 |
+**效果对照表：**
 
-**同时注意序列化组的差异**：
-- `contacts` 在 `client_api:read` 组中 → API 返回时包含联系人列表
-- `contacts` **不在** `client_api:write` 组中 → API 创建/更新时忽略联系人字段
+| 场景 | validation_groups | Count 约束是否生效 | 原因 |
+|-----|-------------------|-------------------|------|
+| Web 表单创建 Client | `['Default', 'form']` | ✅ 生效，必须至少 1 个联系人 | form 组包含在内 |
+| `POST /api/clients` 创建 Client | `['Default', 'api']` | ❌ 不生效，允许空联系人 | RESTful 设计：联系人为独立资源，后续用 `/clients/{id}/contacts` 端点添加 |
+| `PATCH /api/clients/{id}` 更新 | `['Default', 'api']` | ❌ 不生效 | 同上 |
 
 ---
 
-### 3.4 API 文档的额外增强（不影响表单）
+### 3.2 第二类：复杂业务表单（Invoice/Quote）—— DTO 与 Entity 完全分离
 
-Entity 上可通过 `#[ApiProperty]` 手工补充 API 文档元信息，**不影响表单**。
+**⚠️ 首版报告的偏差点就在这里！** 复杂表单并不是「共用 Entity 层」，而是 **DTO 做表单校验 → 手动映射 Entity → Entity 不做二次校验**。
 
-文件：[Client.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/ClientBundle/Entity/Client.php#L114-L135)
+#### 完整链路走查：Invoice 创建流程
 
-```php
-#[ApiProperty(
-    openapiContext: [                    // ← 仅影响 OpenAPI 文档
-        'type' => ['oneOf' => [['type' => 'string'], ['type' => 'null']]],
-    ],
-    jsonSchemaContext: [                 // ← 仅影响 JSON Schema
-        'type' => ['oneOf' => [['type' => 'string'], ['type' => 'null']]],
-    ],
-)]
-#[Assert\Length(min: 3, max: 3, ...)]     // ← 影响 API + 表单
-private ?string $currencyCode = null;
+```
+用户在浏览器填写发票表单
+        ↓
+POST 表单数据到 /invoices/create
+        ↓
+InvoiceType→handleRequest() 填充 InvoiceFormDTO
+        ↓
+$form→isValid()
+  ↳ 校验对象是 InvoiceFormDTO 实例（不是 Invoice Entity!）
+  ↳ 使用的约束完全来自 InvoiceFormDTO 上的 #[Assert]
+  ↳ validation_groups 动态选 existing_client 或 new_client
+        ↓
+  校验通过？ ──否──→ 重新渲染表单+错误信息
+        │是
+        ▼
+InvoiceFormManager→createInvoiceFromDTO($dto)
+  ↳ 纯手动映射：$invoice→setInvoiceId($dto→invoiceId)
+  ↳ 纯手动映射：$invoice→setDue($dto→due)
+  ↳ 纯手动映射：foreach ($dto→lines as $line) { $invoice→addLine($line); }
+  ↳ 此处 **不调用 Validator→validate($invoice)**！！
+        ↓
+EntityPersister→persist($invoice) → EntityPersister→flush()
+  ↳ Doctrine 只做 ORM 级检查（外键、非空列、唯一索引）
+  ↳ **不执行 Entity 上的 #[Assert] 约束**
+        ↓
+完成
 ```
 
+#### 关键代码证据 1：InvoiceFormManager 没有二次校验
+
+文件：[InvoiceFormManager.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/InvoiceBundle/Manager/InvoiceFormManager.php#L40-L78)
+
+```php
+public function createInvoiceFromDTO(InvoiceFormDTO $dto): Invoice
+{
+    $invoice = new Invoice();
+    $client = $this->resolveClient($dto);
+    $invoice->setClient($client);
+    $invoice->setInvoiceId($dto->invoiceId);          // ← 纯 set，无校验
+    $invoice->setInvoiceDate($dto->invoiceDate ?? ...);
+    $invoice->setDue($dto->due);
+    $invoice->setDiscount($dto->discount);
+    $invoice->setTerms($dto->terms);
+    // ... 逐字段手动映射 ...
+    foreach ($dto->lines as $line) {
+        $invoice->addLine($line);                      // ← 集合直接赋值
+    }
+    return $invoice;                                    // ← 直接返回，没有 validate()
+}
+```
+
+#### 关键代码证据 2：Action 层 persist 前无校验
+
+文件：[Create.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/InvoiceBundle/Action/Create.php#L100-L119)
+
+```php
+if ($form->isSubmitted() && $form->isValid()) {   // ← 只校验 DTO
+    $invoice = $this->formManager->createInvoiceFromDTO($dto);
+    // ... 状态机 apply ...
+    $entityManager = $this->doctrine->getManager();
+    $entityManager->persist($invoice);             // ← 直接持久化，无第二次 validate()
+    $entityManager->flush();
+    // ...
+}
+```
+
+#### 关键代码证据 3：InvoiceFormDTO 与 Invoice Entity 上的规则是**两套独立代码**
+
+**InvoiceFormDTO 侧（仅表单用）**：[InvoiceFormDTO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/InvoiceBundle/DTO/InvoiceFormDTO.php#L32-L86)
+
+```php
+// 模式1：选择已有客户
+#[Assert\NotBlank(groups: ['existing_client'])]
+public ?Client $client = null;
+
+// 模式2：内联新建客户字段（Entity里根本没有这些字段！）
+#[Assert\NotBlank(groups: ['new_client'])]
+#[Assert\Length(max: 125, groups: ['new_client'])]
+public ?string $newClientName = null;              // ← Entity 没有！
+
+#[Assert\NotBlank(groups: ['new_client'])]
+#[Assert\Email(groups: ['new_client'])]
+public ?string $newContactEmail = null;             // ← Entity 没有！
+
+// 通用字段（与 Entity 字段名相同，但 Assert 是独立写的）
+#[Assert\NotBlank]
+public string $invoiceId = '';
+
+#[Assert\Count(min: 1)]
+#[Assert\Valid]
+public ArrayCollection $lines;
+
+// 模式1下至少选1个联系人（条件组）
+#[Assert\Count(min: 1, groups: ['existing_client'])]
+public ArrayCollection $users;
+```
+
+**Invoice Entity 侧（仅 API 用）**：[BaseInvoice.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/InvoiceBundle/Entity/BaseInvoice.php)  + Invoice.php
+
+```php
+// Entity 的校验是独立定义的（主要用于 API 校验）
+// 注意：Entity 完全不知道 newClientName / newContactEmail 这些 DTO 专用字段
+```
+
+**对照表：Invoice/Quote 两端规则来源完全不同**
+
+| 字段 | Web 表单规则来源 | API 规则来源 | 是否需要同步维护 |
+|-----|----------------|-------------|----------------|
+| `invoiceId` 必填 | `InvoiceFormDTO→invoiceId` 上的 `#[Assert\NotBlank]` | Invoice Entity 上对应字段的 Assert | **✅ 需要** |
+| `client` 必填（模式1） | `InvoiceFormDTO→client` 上的 `groups: ['existing_client']` | Invoice Entity→client 上的 `#[Assert\NotBlank]` | **✅ 需要**（规则不同：表单按条件，API始终要） |
+| `lines` 至少 1 条 | `InvoiceFormDTO→lines` 上的 `#[Assert\Count(min: 1)]` | Invoice Entity→lines 上的 Assert | **✅ 需要** |
+| `newClientName` 必填（模式2） | `InvoiceFormDTO→newClientName` 上的 `groups: ['new_client']` | ❌ 不存在（API走独立的 Client 创建端点） | 不需要同步 |
+| `users` 至少 1 个（模式1） | `InvoiceFormDTO→users` 上的 `groups: ['existing_client']` | Invoice Entity→users 上的规则 | **✅ 需要** |
+
 ---
 
-## 四、前端校验规则来源详解
+### 3.3 第三类：安装/注册/找回密码流程 —— 专用 DTO，与 API 完全无关
 
-### 4.1 主要来源：Symfony Form 自动继承 Entity/DTO 约束
+这些流程没有对应的 REST API，字段和规则只存在于前端表单→专用 DTO 的链路中。
 
-Symfony Form 组件的 `FormValidatorExtension` 会自动读取 `data_class` 上的约束。
+#### 安装向导：Installation DTO 体系
 
-渲染时，[fields.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/CoreBundle/Resources/views/Form/fields.html.twig#L23-L26) 的 `widget_attributes` block 自动输出 HTML5 属性：
+文件：[Installation.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/InstallBundle/DTO/Installation.php#L16-L27)
+
+```php
+final class Installation
+{
+    public function __construct(
+        #[Valid(groups: ['database_config', 'database_config_mysql', ...])]
+        public DatabaseConfig $databaseConfig = new DatabaseConfig(),
+        #[Valid(groups: ['user_account'])]
+        public UserAccount $userAccount = new UserAccount(),
+        public string $currentStep = 'start',
+    ) { }
+}
+```
+
+子 DTO：[DatabaseConfig.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/InstallBundle/DTO/DatabaseConfig.php#L24-L43)
+
+```php
+#[Callback(callback: 'validate', groups: ['database_config'])]   // ← 实际尝试连接数据库
+final class DatabaseConfig
+{
+    public function __construct(
+        #[NotBlank(groups: ['database_config'])]
+        public ?string $driver = null,
+
+        // MySQL/MariaDB/PostgreSQL 才需要 host 和 name
+        #[NotBlank(groups: ['database_config_mysql', 'database_config_mariadb', 'database_config_pgsql'])]
+        public ?string $host = null,
+
+        #[NotBlank(groups: ['database_config_mysql', 'database_config_mariadb', 'database_config_pgsql'])]
+        public ?string $name = SolidInvoiceCoreBundle::APP_NAME,
+        // SQLite 不需要 host/port/user/password/name...
+    ) { }
+}
+```
+
+子 DTO：[UserAccount.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/InstallBundle/DTO/UserAccount.php#L20-L36)
+
+```php
+public function __construct(
+    #[NotBlank(groups: ['user_account'])]
+    public ?string $firstName = null,
+
+    #[NotBlank(groups: ['user_account']), Email(groups: ['user_account'])]
+    public ?string $emailAddress = null,
+
+    #[NotBlank(groups: ['user_account']), Length(min: 6, groups: ['user_account'])]
+    public ?string $password = null,
+) { }
+```
+
+**专用组清单（安装流程）：**
+
+| 校验组 | 触发条件 | 校验内容 |
+|-------|---------|---------|
+| `database_config` | 步骤：数据库配置页 | driver 必填 + Callback 实际连库测试 |
+| `database_config_mysql` | 选择 MySQL | host/name 必填 |
+| `database_config_mariadb` | 选择 MariaDB | host/name 必填 |
+| `database_config_pgsql` | 选择 PostgreSQL | host/name 必填 + port 整数 |
+| `user_account` | 步骤：管理员账号页 | 姓名/邮箱/密码必填，邮箱格式，密码≥6位 |
+
+这些组在整个 API 体系中**完全不会被调用到**。
+
+---
+
+## 四、浏览器原生校验——彻底澄清：它不是主路径
+
+### 4.1 最关键证据：字段模板用的是 `data-required`，不是原生 `required`
+
+文件：[fields.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/CoreBundle/Resources/views/Form/fields.html.twig#L23-L26)
 
 ```twig
 {% block widget_attributes -%}
     id="{{ id }}" name="{{ full_name }}"
     {% if disabled %} disabled="disabled"{% endif %}
-    {% if required %} data-required="required"{% endif %}  {# ← 来自 Assert\NotBlank #}
-    ...
-{%- endblock %}
+    {% if required %} data-required="required"{% endif %}
+    {#                ↑↑↑↑↑↑↑↑↑↑↑↑↑                    #}
+    {#     这里是 data-required，不是 required="required" #}
+    {#     data-* 前缀只是自定义数据属性，浏览器会忽略它    #}
+    {#     不会触发浏览器原生的"请填写此字段"弹窗         #}
+    {% for attrname, attrvalue in attr %} ... {% endfor %}
+{%- endblock widget_attributes %}
 ```
 
-具体映射关系：
+### 4.2 `data-required` 实际用途
 
-| Symfony Assert 约束 | 生成的 HTML 属性 |
-|---------------------|-----------------|
-| `#[Assert\NotBlank]` | `required="required"` + `data-required="required"` |
-| `#[Assert\Length(max: N)]` | `maxlength="N"` |
-| `#[Assert\Url]` + `UrlType` | `<input type="url">` |
-| `#[Assert\Email]` + `EmailType` | `<input type="email">` |
-| `#[Assert\Range(min, max)]` | `min="..."` `max="..."` |
+它只用于：
+- 触发 CSS：`[data-required] + label::before` 在 label 前加红色 `*` 号
+- 少数自定义 JS 读取这个属性做标记
 
-### 4.2 次要来源：Stimulus 控制器增强（不改变规则，增强体验）
+**不会触发浏览器的 HTML5 Form Validation API。**
 
-前端只做**视觉增强型校验**，核心有效性判断仍由后端掌控。
+### 4.3 novalidate 使用情况
 
-#### 示例1：VAT号远程校验
-文件：[vat-validator-controller.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/assets/controllers/vat-validator-controller.ts#L1-L50)
+| 模板 | 是否显式 novalidate |
+|------|-------------------|
+| [register.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/UserBundle/Resources/views/Security/register.html.twig#L42) | ✅ `novalidate: 'novalidate'` |
+| 安装向导 `SystemInstallation.html.twig` | ✅（通过 FormFlow 自动配置） |
+| Client 创建/编辑 `ClientForm.html.twig` | ❌ 未设置（但因为 data-required，依然不触发原生校验） |
+| Tax 创建/编辑 `form.html.twig` | ❌ 未设置 |
+| Invoice 创建/编辑 `CreateInvoice.html.twig` | ❌ 未设置 |
+| 其他数十个业务表单 | ❌ 绝大多数未设置 |
 
-- 行为：用户点击"Validate"按钮 → 发送 AJAX 到后端 `_tax_number_validate` 路由
-- 后端执行真实的 VAT 格式+存在性校验 → 返回 JSON
-- 前端仅添加 `is-valid` / `is-invalid` CSS class 做视觉反馈
-- **注意**：最终提交时后端仍会再次校验，前端只是体验优化
+### 4.4 真正的校验主路径——三层服务端校验
 
-#### 示例2：密码强度指示器
-文件：[password-strength-controller.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/assets/controllers/password-strength-controller.ts#L1-L90)
+```
+第 1 层：Symfony Form Validator（所有表单通用）
+    $form→isValid() 读取 data_class 上的 #[Assert]
+    ↓ 通过 → 继续
+    ↓ 失败 → form_errors() / form_row() 中渲染字段级错误信息
 
-- 行为：实时计算密码强度 → 显示强度条和标签
-- 核心约束（最少8字符）在 [Registration.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/UserBundle/DTO/Registration.php#L31-L40) DTO 中定义：
-  ```php
-  #[NotBlank(message: 'Please enter a password')]
-  #[Length(min: 8, max: 4096, ...)]
-  #[PasswordStrength(minScore: PasswordStrength::STRENGTH_WEAK)]
-  public ?string $plainPassword = null;
-  ```
-- 前端的强度算法仅作视觉参考，**最终以 Symfony 的 `#[PasswordStrength]` 校验结果为准**
+第 2 层：Callback / 自定义断言（复杂业务校验）
+    - DatabaseConfig→validate() 真正尝试连接数据库
+    - UserPassword 断言检查当前密码是否正确
+    - UniqueEntity 断言检查唯一性
 
-### 4.3 novalidate 属性：关闭浏览器原生校验
-
-部分表单显式关闭 HTML5 原生校验，完全依赖后端错误消息：
-
-文件：[register.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/UserBundle/Resources/views/Security/register.html.twig#L42)
-```twig
-{{ form_start(form, {'attr': {'novalidate': 'novalidate'}}) }}
+第 3 层：Doctrine / DB 层检查（最后一道防线）
+    - 非空列 NOT NULL 约束
+    - 外键约束
+    - 唯一索引
+    - 失败抛异常 → 转为 500 或 4xx
 ```
 
-原因：统一使用 Symfony Form 渲染的服务端校验错误消息，保持视觉风格一致。
+### 4.5 前端异步体验增强（非主校验路径）
+
+| 控制器 | 用途 | 是否改变校验结果 |
+|-------|------|----------------|
+| [vat-validator-controller.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/assets/controllers/vat-validator-controller.ts) | 点击 Validate 按钮异步调 Tax Validate 接口检查 VAT | 否，只显示对/错图标，提交时服务端会再次校验 |
+| [password-strength-controller.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/assets/controllers/password-strength-controller.ts) | 实时显示密码强度条和文字描述 | 否，强度算法与服务端的 `#[PasswordStrength]` 独立，最终以服务端结果为准 |
+| Live Components（Invoice/Quote 表单） | 切换 Client 模式、新增行等操作时局部重新渲染，提前把当前输入的错误显示出来 | 是**预演**服务端校验，不是独立规则 |
 
 ---
 
-## 五、功能演进时的修改顺序
+## 五、仅表单/安装流程生效的规则完整索引
 
-### 5.1 标准修改流程（以「Client.name 最大长度从 125 改为 150」为例）
+### 5.1 `form` 组：Client + Contact 专用
 
-```
-步骤1: 修改 Entity/DTO（真理源）
-  │
-  ├── 文件: Client.php
-  │   #[ORM\Column(length: 150)]           ← DB 层
-  │   #[Assert\Length(max: 150)]            ← 校验层（共享）
-  │
-  ▼
-步骤2: 生成数据库迁移
-  │   bin/console doctrine:migrations:diff
-  │
-  ▼
-步骤3: 自动生效（无需额外改动）
-  │
-  ├── API 文档: 自动更新（API Platform 读取 Assert → OpenAPI maxLength: 150）
-  ├── API 校验: 自动生效（Validation Listener 读取 Assert）
-  ├── 前端表单: 自动生效（maxlength="150" 属性）
-  └── 服务端表单校验: 自动生效
-  │
-  ▼
-步骤4: （可选）人工检查
-  ├── 如前端模板有硬编码 maxlength，需手动同步
-  └── 运行相关单元/功能测试
-```
+**Entity：Client** —— [Client.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/ClientBundle/Entity/Client.php#L146-L159)
 
-**关键观察**：改一次 Entity，**至少4个地方自动同步更新**，无需修改前端。
+| 字段 | 约束 | form 组效果 | API 效果 |
+|-----|------|------------|---------|
+| `contacts` 集合 | `Count(min: 1)` | 至少添加 1 个联系人 | ❌ 不生效 |
+| `contacts` 嵌套 | `Valid` | 校验每个 Contact 子对象 | ❌ 不生效 |
 
-### 5.2 新增字段的完整流程（以「Client 新增 phoneNumber 字段」为例）
+**Entity：Contact** —— [Contact.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/ClientBundle/Entity/Contact.php#L160-L188)
 
-#### Step 1: 修改 Entity（唯一真理源）
+| 字段 | 约束 | 组 | 说明 |
+|-----|------|----|------|
+| `firstName` | `NotBlank` + `Length(max:125)` | `['Default', 'form']` | 显式双组，两端都校验 |
+| `lastName` | `Length(max:125)` | `['Default', 'form']` | 显式双组 |
+| `email` | `NotBlank` + `Email` | `['Default', 'form']` | 显式双组 |
+
+> **设计意图推测**：Contact 写上双组而非省略 groups（默认 Default），是为了如果将来在「批量导入 CSV」这类新场景中用独立的 import 组校验，这些规则就不会被误触发，体现了防御式设计。
+
+### 5.2 `existing_client` / `new_client`：Invoice/Quote 条件组
+
+**DTO：InvoiceFormDTO / QuoteFormDTO** —— [InvoiceFormDTO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/InvoiceBundle/DTO/InvoiceFormDTO.php#L33-L86)
+
+| 组 | 触发条件 | 生效字段 |
+|----|---------|---------|
+| `existing_client` | 用户选择「选择已有客户」radio | `client` 必填，`users` 至少 1 个联系人 |
+| `new_client` | 用户选择「新建客户」radio | `newClientName` 必填+≤125，`newContactFirstName` 必填+≤125，`newContactEmail` 必填+邮箱格式 |
+
+动态切换逻辑在 [InvoiceType.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/InvoiceBundle/Form/Type/InvoiceType.php#L210-L221) 的闭包中：
 
 ```php
-// Client.php
-#[ORM\Column(name: 'phone_number', type: Types::STRING, length: 30, nullable: true)]
-#[Assert\Length(max: 30)]
-#[Serialize\Groups(['client_api:read', 'client_api:write', 'searchable'])]
-private ?string $phoneNumber = null;
-
-// getter & setter
+'validation_groups' => function (FormInterface $form) {
+    $data = $form->getData();
+    $groups = ['Default'];
+    if ($data instanceof InvoiceFormDTO) {
+        if ($data->clientMode === InvoiceClientMode::NewClient) {
+            $groups[] = 'new_client';
+        } else {
+            $groups[] = 'existing_client';
+        }
+    }
+    return $groups;
+},
 ```
 
-#### Step 2: 修改 FormType（仅添加字段定义，不加约束）
+### 5.3 安装向导专用组
 
-```php
-// ClientType.php -> buildForm()
-$builder->add('phoneNumber', null, [
-    'required' => false,
-    // 不需要写 Assert\Length，会自动继承
-]);
-```
+文件：[Installation.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/InstallBundle/DTO/) + 子 DTO
 
-#### Step 3: 修改 Twig 模板（仅添加 UI 展示）
+| 组 | 所属类 | 内容摘要 |
+|----|-------|---------|
+| `database_config` | DatabaseConfig | driver 必填 + Callback 试连数据库 |
+| `database_config_mysql` | DatabaseConfig | host/name 必填 |
+| `database_config_mariadb` | DatabaseConfig | host/name 必填 |
+| `database_config_pgsql` | DatabaseConfig | host/name 必填 + port 是整数 |
+| `user_account` | UserAccount | firstName/emailAddress/password 必填 |
 
-```twig
-{# ClientForm.html.twig #}
-<div class="form-field">
-    {{ form_row(form.phoneNumber, {
-        attr: { placeholder: '+1-555-123-4567' }
-    }) }}
-</div>
-```
+### 5.4 Mailer / Notification 动态 Provider 组
 
-#### Step 4: 生成迁移 + 测试
-
-```bash
-bin/console doctrine:migrations:diff
-bin/console doctrine:migrations:migrate
-bin/phpunit src/ClientBundle/Tests
-```
-
-#### Step 5: 自动获得的能力（无需额外代码）
-
-| 能力 | 来源 |
-|-----|------|
-| `/api/clients` GET 返回 phoneNumber | `Groups(['client_api:read'])` |
-| `/api/clients` POST/PATCH 接受 phoneNumber | `Groups(['client_api:write'])` |
-| API 文档显示 phoneNumber 字段，maxLength=30 | 自动读取 Assert + Groups |
-| API 提交校验 phoneNumber 长度 | 自动执行 Assert\Length |
-| 前端表单 `<input maxlength="30">` | Symfony Form 自动读取 |
-| 前端提交后端校验长度 | FormType data_class 绑定 |
-
-### 5.3 特殊场景：表单规则与 API 规则不一致
-
-**需求**：表单提交时 Client 必须有联系人（已存在），但 API 允许创建空 Client。
-
-#### 修改方式：仅调整 Assert 约束的 groups
-
-```php
-// Client.php
-#[Assert\Count(
-    min: 1,
-    groups: ['form'],          // ← 只加 form 组，不加 api 组
-)]
-#[Assert\Valid(groups: ['form'])]
-private Collection $contacts;
-```
-
-然后确保：
-- FormType 配置 `validation_groups: ['Default', 'form']`
-- ApiResource 配置 `validationContext: { groups: ['Default', 'api'] }`
-
-**无需修改任何前端代码、无需修改 API 配置文件**，差异自然生效。
+在 MailerBundle / NotificationBundle 的 FormType 中，根据用户选择的 SMTP / Postmark / Slack 等 provider，动态生成并追加对应名称的 validation_groups。
 
 ---
 
-## 六、共享层文件索引
+## 六、字段规则变更时的修改决策流程
 
-### 6.1 Entity 层（主要共享源）
+### 6.1 总体原则：先「归类」再「动手」
 
-| 文件 | 核心约束示例 |
-|------|------------|
-| [Client.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/ClientBundle/Entity/Client.php) | NotBlank + Length(125) on name, Url on website, Length(3,3) on currencyCode |
-| [Tax.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/TaxBundle/Entity/Tax.php) | NotBlank on name/rate/type, Type(float) on rate |
-| [Invoice.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/InvoiceBundle/Entity/Invoice.php) | NotBlank on client, Type(DateTime) on invoiceDate/due/paidDate |
-| [Contact.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/ClientBundle/Entity/Contact.php) | NotBlank + Email on email |
+```
+收到需求：某字段规则要改（例如：Client.name 从 125 改为 150 字符）
+        │
+        ▼
+┌─判断：这个字段属于哪一类？───────────────────────────────┐
+│                                                          │
+│  A. 简单实体（Client/Tax/Contact/普通设置项）              │
+│      → Entity 有 #[Assert]，FormType 的 data_class 是它     │
+│                                                          │
+│  B. 复杂业务表单字段（Invoice/Quote）                      │
+│      → 字段在 InvoiceFormDTO / QuoteFormDTO 中？          │
+│      → 字段也在 Invoice / Quote Entity 中？                 │
+│                                                          │
+│  C. 安装/注册/找回密码流程                                │
+│      → 字段在 InstallBundle / UserBundle 的专用 DTO 中    │
+└──────────────────────────────────────────────────────────┘
+        │
+        ▼
+分别按 A / B / C 路径修改（见下方）
+        │
+        ▼
+改完后执行：bin/ecs check --fix → bin/phpstan analyse → bin/phpunit
+```
 
-### 6.2 DTO 层（表单专用共享源）
+### 6.2 路径 A：简单实体字段修改
 
-| 文件 | 用途 | 关键约束 |
-|------|------|---------|
-| [InvoiceFormDTO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/InvoiceBundle/DTO/InvoiceFormDTO.php) | 发票创建/编辑表单 | 条件校验组 existing_client / new_client |
-| [QuoteFormDTO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/QuoteBundle/DTO/QuoteFormDTO.php) | 报价单创建/编辑表单 | 类似 InvoiceFormDTO |
-| [Registration.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/UserBundle/DTO/Registration.php) | 用户注册表单 | NotBlank + Email, PasswordStrength |
-| [ChangePassword.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/UserBundle/DTO/ChangePassword.php) | 修改密码表单 | UserPassword + NotBlank + Length |
+**示例：Client.name 最大长度 125 → 150**
 
-### 6.3 FormType 层（绑定共享源）
+```
+Step 1（真理源，必须改）：修改 Entity 上的两处注解
+    [Client.php]
+    - #[ORM\Column(length: 125)]  →  length: 150
+    - #[Assert\Length(max: 125)]  →  max: 150
+
+Step 2（DB 变更需要）：生成迁移
+    bin/console doctrine:migrations:diff
+    → 生成 ALTER TABLE clients MODIFY name VARCHAR(150)
+
+Step 3（API 侧检查）：Groups 是否需要调整
+    → 本例无需，name 本来就在 client_api:read / write 中
+
+Step 4（表单侧检查）：ClientType / ClientForm 模板
+    → 无需改！ maxlength="150" 会自动输出
+
+Step 5（自动生效的，不用改）：
+    ✅ API 文档 OpenAPI maxLength 自动更新
+    ✅ API 请求校验 Length(max:150) 自动生效
+    ✅ Web 表单 maxlength 属性自动更新
+    ✅ Web 表单服务端校验自动生效
+```
+
+### 6.3 路径 B：复杂业务表单（Invoice/Quote）字段修改
+
+**⚠️ 最容易出错的场景！必须同时检查 DTO 和 Entity 两边。**
+
+**示例：invoiceId（发票号）最大长度从 255 改为 100，并且允许为空**
+
+```
+Step 1：列清单——这个字段在哪几层都有？
+    ① InvoiceFormDTO→invoiceId（表单校验）
+    ② Invoice Entity→invoiceId（API 校验 + DB 列）
+    ③ InvoiceFormManager（字段映射，本例可能不需要改）
+
+Step 2：修改 InvoiceFormDTO（表单真理源）
+    [InvoiceFormDTO.php]
+    - #[Assert\NotBlank]  →  删掉（允许为空）
+    - 新增 #[Assert\Length(max: 100)]
+
+Step 3：修改 Invoice Entity（API 真理源 + DB）
+    [Invoice.php 或 BaseInvoice.php 对应字段处]
+    - #[ORM\Column(length: 255)] →  length: 100, nullable: true
+    - 去掉对应 #[Assert\NotBlank]
+    - 加上 #[Assert\Length(max: 100)]
+    - 检查 Groups：确保 invoice_api:write 组包含该字段
+
+Step 4：生成迁移
+    bin/console doctrine:migrations:diff
+
+Step 5：检查 InvoiceType / CreateInvoice 模板
+    → 一般无需改，除非前端有特殊逻辑
+
+Step 6：检查 InvoiceFormManager→createInvoiceFromDTO()
+    → 本例只是 setInvoiceId($dto→invoiceId)，无需改
+
+Step 7：可选的人工检查
+    ① Web 表单：空值能否成功保存？
+    ② Web 表单：输入 101 个字符是否报错？
+    ③ POST /api/invoices 空值能否成功？
+    ④ POST /api/invoices 超长是否 422？
+    ⑤ OpenAPI /api/docs 中 invoiceId 是否 required=false / maxLength=100
+```
+
+### 6.4 路径 C：安装/注册流程专用字段修改
+
+**示例：安装流程的管理员密码从最少 6 位改为最少 10 位**
+
+```
+Step 1（唯一真理源）：修改专用 DTO
+    [UserAccount.php]
+    - #[Length(min: 6, groups: ['user_account'])]
+                      ↑
+               改为 min: 10
+
+Step 2：检查对应 FormType
+    → 一般不需要，data_class 绑定 DTO
+
+Step 3：检查前端模板
+    → 如密码提示框里写了"至少 6 位"，需要手动改文字（这是文案，不是校验规则）
+
+Step 4：不需要做的事（这些完全不相关）
+    ❌ 不用改 User Entity（除非登录用户改密码的规则也要同步改，那是另一个 DTO ChangePassword）
+    ❌ 不用生成迁移（password 字段在 DB 中总是固定长度 hash，minLength 只在 DTO 层校验）
+    ❌ 不用改 API 配置（安装流程没有 API）
+```
+
+### 6.5 修改优先级速查表
+
+按**「真理源从高到低」**排列，优先改上面的，再看下层是否需要同步：
+
+| 层级 | 改动频率 | 改动后同步面 | 典型场景 |
+|------|---------|------------|---------|
+| 1️⃣ Entity `#[Assert]` + `#[ORM]` | 高 | API文档 + API校验 + 表单校验 + DB 全部自动同步 | 简单实体的字段规则变化 |
+| 2️⃣ Entity `#[Groups]` | 中 | API 字段可见性 | 让字段在 API 中新增/隐藏 |
+| 3️⃣ 表单专用 DTO `#[Assert]` | 中 | 仅 Web 表单 | Invoice/Quote 条件校验、安装流程字段 |
+| 4️⃣ FormType 的 validation_groups 闭包 | 低 | 仅 Web 表单的组切换 | 新增一种表单模式 |
+| 5️⃣ FormType 的 buildForm 字段配置 | 中 | 仅 UI 表现 | 调整字段顺序、控件类型、帮助文案 |
+| 6️⃣ Twig 模板 | 低 | 仅 UI | 新增字段、改变排版 |
+| 7️⃣ 前端 Stimulus 控制器 | 极低 | 仅体验 | 新增视觉增强指示器 |
+| 8️⃣ API 文档手工 openapiContext | 极低 | 仅文档补充 | 补充枚举值说明、复杂类型 |
+
+---
+
+## 七、代码证据索引
+
+### 7.1 Entity 层（真理源一）
+
+| 文件 | 关键内容 |
+|------|---------|
+| [Client.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/ClientBundle/Entity/Client.php) | ApiResource + validationContext `['Default','api']`；name/website/currencyCode 上的 Assert；contacts 的 `groups: ['form']` |
+| [Contact.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/ClientBundle/Entity/Contact.php) | firstName/email 上的 `groups: ['Default', 'form']` |
+| [Tax.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/TaxBundle/Entity/Tax.php) | name/rate/type 上的 Assert 规则 |
+| [BaseInvoice.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/InvoiceBundle/Entity/BaseInvoice.php) | Invoice Entity 的字段、Groups、ApiProperty |
+
+### 7.2 表单 DTO 层（真理源二）
+
+| 文件 | 关键内容 |
+|------|---------|
+| [InvoiceFormDTO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/InvoiceBundle/DTO/InvoiceFormDTO.php) | `existing_client` / `new_client` 条件组、lines/users 集合约束 |
+| [QuoteFormDTO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/QuoteBundle/DTO/QuoteFormDTO.php) | 同 InvoiceFormDTO，用于报价单 |
+| [Registration.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/UserBundle/DTO/Registration.php) | 用户注册 DTO，Email / PasswordStrength 约束 |
+| [ChangePassword.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/UserBundle/DTO/ChangePassword.php) | 修改密码 DTO，UserPassword + Length |
+| [Installation.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/InstallBundle/DTO/Installation.php) | 安装向导主 DTO，Valid + groups 配置 |
+| [DatabaseConfig.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/InstallBundle/DTO/DatabaseConfig.php) | 数据库配置 DTO，Callback 真连库校验 |
+| [UserAccount.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/InstallBundle/DTO/UserAccount.php) | 安装向导管理员账号 DTO |
+
+### 7.3 FormType 绑定层
 
 | 文件 | data_class 绑定 | validation_groups |
 |------|----------------|-------------------|
-| [ClientType.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/ClientBundle/Form/Type/ClientType.php) | Client::class | ['Default', 'form'] |
-| [TaxType.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/TaxBundle/Form/Type/TaxType.php) | Tax::class | ['Default'] |
-| [InvoiceType.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/InvoiceBundle/Form/Type/InvoiceType.php) | InvoiceFormDTO::class | 动态 groups |
+| [ClientType.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/ClientBundle/Form/Type/ClientType.php) | `Client::class` | `['Default', 'form']` |
+| [TaxType.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/TaxBundle/Form/Type/TaxType.php) | `Tax::class` | `['Default']` |
+| [InvoiceType.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/InvoiceBundle/Form/Type/InvoiceType.php) | `InvoiceFormDTO::class` | **闭包动态切换** existing_client / new_client |
 
-### 6.4 前端增强校验层（独立，非共享）
+### 7.4 表单提交 + DTO→Entity 映射层
 
-| 文件 | 功能 | 是否影响规则 |
-|------|------|------------|
-| [vat-validator-controller.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/assets/controllers/vat-validator-controller.ts) | 远程 VAT 校验 | 否，仅视觉反馈 |
-| [password-strength-controller.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/assets/controllers/password-strength-controller.ts) | 密码强度指示 | 否，仅视觉 |
+| 文件 | 关键逻辑 |
+|------|---------|
+| [Create.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/InvoiceBundle/Action/Create.php#L100-L119) | Invoice 表单的 isValid() 只校验 DTO，不二次校验 Entity |
+| [InvoiceFormManager.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/InvoiceBundle/Manager/InvoiceFormManager.php#L40-L78) | createInvoiceFromDTO() 纯手动 set，**无二次 validate()** |
+
+### 7.5 前端模板与校验属性层
+
+| 文件 | 关键内容 |
+|------|---------|
+| [fields.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/CoreBundle/Resources/views/Form/fields.html.twig#L23-L26) | widget_attributes block：输出 **`data-required`** 而非原生 `required` |
+| [CreateInvoice.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/InvoiceBundle/Resources/views/Components/CreateInvoice.html.twig#L13) | 复杂表单使用 Live Component，无 novalidate 但也无原生 required |
+| [register.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/src/UserBundle/Resources/views/Security/register.html.twig#L42) | 注册页显式 `novalidate`，完全关闭原生校验 |
+| [vat-validator-controller.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/assets/controllers/vat-validator-controller.ts) | VAT 校验：只做体验增强，不改变结果 |
+| [password-strength-controller.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/assets/controllers/password-strength-controller.ts) | 密码强度条：只做体验增强，不改变结果 |
+
+### 7.6 API Platform 配置层
+
+| 文件 | 关键内容 |
+|------|---------|
+| [api_platform.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-SolidInvoice/config/packages/api_platform.php) | 全局 API 格式、分页、OpenAPI 配置 |
 
 ---
 
-## 七、总结与最佳实践建议
+## 八、常见陷阱与反模式
 
-### 7.1 设计模式评价
+| 陷阱/反模式 | 实际后果 | 正确做法 |
+|------------|---------|---------|
+| **「改了 Entity 为什么 Invoice 表单没生效？」** | Invoice 表单用的是 InvoiceFormDTO，不是 Invoice Entity | 复杂表单要同步改 Entity + DTO |
+| **「DTO 改了为啥 API 文档还是旧值？」** | API Platform 读的是 Entity，不读 DTO | 复杂表单两端都要改 |
+| **在 Twig 模板硬编码 `maxlength="125"`** | Entity 改了模板没同步，前后端规则不一致 | 删掉硬编码，让 `form_widget()` 自动输出 maxlength |
+| **在 FormType 中重复写 `constraints: [new Assert\NotBlank()]`** | 和 Entity 上的规则重复，修改时容易忘改其中一处 | 删掉，依赖 data_class 自动继承 |
+| **在前端 JS 里写自己的必填校验逻辑** | 改规则要改两处，容易和服务端脱节 | 只用 JS 做视觉增强，核心规则全靠服务端 |
+| **新建字段忘了加 `#[Groups(['xxx_api:write'])]`** | API 提交时字段被静默忽略，报 422 说字段缺失但根本不知道原因 | 字段规则改完后，一定顺便检查 Groups |
+| **InvoiceFormDTO 新增字段忘了在 InvoiceFormManager→createInvoiceFromDTO() 里加映射** | 表单填了值，DB 里是空的，且没有任何错误提示 | 改完 DTO 字段，**必须**打开 Manager 检查映射逻辑 |
 
-SolidInvoice 采用的是经典的 **「Declarative Constraints on Domain Model」** 模式，配合 Symfony 生态实现了极高的一致性：
+---
 
-| 评价维度 | 得分 | 说明 |
-|---------|------|------|
-| 一致性保障 | ⭐⭐⭐⭐⭐ | 单一真理源（Entity/DTO），自动传播到 API 和 表单 |
-| 修改成本 | ⭐⭐⭐⭐⭐ | 改一处自动生效多处，低风险 |
-| 差异化能力 | ⭐⭐⭐⭐ | 通过 Validation Groups 和 Serialization Groups 灵活区分 |
-| 前端自主性 | ⭐⭐ | 前端规则完全受后端支配，极少独立发挥空间（但这是设计选择，不是缺陷） |
+## 九、最终结论
 
-### 7.2 开发者修改 Checklist
+### 9.1 共享层总结（一句话版）
 
-**任何涉及字段规则的修改：**
+> **简单实体共用 Entity 层，复杂表单 DTO/Entity 两套独立维护，安装流程完全走专用 DTO。**
 
-- [ ] **优先修改 Entity/DTO**（而非 FormType、而非前端模板）
-- [ ] 如果是 DB 字段变化，同步修改 `#[ORM\Column]` + 生成迁移
-- [ ] 如果字段要暴露给 API，**检查 `#[Groups]` 配置**
-- [ ] 如果 API 和表单规则不同，**使用 validation groups** 区分
-- [ ] **FormType 中避免重复添加 Assert 约束**，让其自动继承
-- [ ] 前端模板中**避免硬编码 maxlength/required**，用 `form_widget()` 自动渲染
-- [ ] 运行 `bin/phpstan analyse` 和 `bin/phpunit` 验证
+### 9.2 修改优先级总结（一句话版）
 
-### 7.3 反模式警告
+> **先判断字段属于 A/B/C 哪一类，真理源永远是带 `#[Assert]` 的 PHP 类（Entity 或 DTO），前端模板和 FormType 永远排在最后改。复杂表单（Invoice/Quote）是最容易漏改的场景，必须同时检查 DTO 断言 + Entity 断言 + Manager 映射三处代码。**
 
-以下做法在代码库中**不推荐**，会破坏一致性：
+---
 
-| 反模式 | 正确做法 |
-|-------|---------|
-| 在 Twig 中硬编码 `<input maxlength="125">` | 使用 `form_widget(form.field)` 自动输出 |
-| 在 FormType 中重复 `'constraints' => [new Assert\NotBlank()]` | 删除，让 data_class 自动继承 Entity 的 Assert |
-| 在前端 JS 中写自定义规则校验必填/长度 | 用 Stimulus 仅做体验增强，核心规则依赖后端 |
-| 修改 API 文档 yaml/json 文件 | 修改 Entity 上的 Assert/ApiProperty 注解 |
+_报告生成时间：2026-06-12_  
+_分析代码版本：SolidInvoice 3.0.0-dev_
