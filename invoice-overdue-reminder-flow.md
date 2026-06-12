@@ -1,40 +1,24 @@
-# 发票逾期状态与提醒流程 - 源码深度解析
+# 发票逾期状态与提醒流程 — 源码深度分析报告
 
-## 目录
-
-- [一、逾期判定的时间粒度分析](#一逾期判定的时间粒度分析)
-- [二、定时任务与开关控制体系](#二定时任务与开关控制体系)
-- [三、客户提醒模板实施细节](#三客户提醒模板实施细节)
-- [四、内部逾期通知模板实施](#四内部逾期通知模板实施)
-- [五、多渠道通知通道组合机制](#五多渠道通知通道组合机制)
-- [六、完整流程图](#六完整流程图)
-- [七、核心代码速查表](#七核心代码速查表)
+> 本报告基于 SolidInvoice 源码逐行追踪，从时间粒度判定、定时调度触发、双链路对象传递、模板内容渲染到多渠道通道组装，完整还原发票逾期与提醒的全链路技术实现。
 
 ---
 
-## 一、逾期判定的时间粒度分析
+## 一、逾期判定的时间粒度：自然日，非具体时间点
 
-### 1.1 到期日字段存储格式
+### 1.1 核心字段的存储格式
 
-发票到期日字段 `due` 使用 **`DATE_IMMUTABLE` 类型**（仅存储日期，不存储具体时分秒）：
+发票到期日使用 `DATE_IMMUTABLE` 类型，仅存储**年月日**，不含时分秒：
 
 ```php
-// [Invoice.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Entity/Invoice.php#L169-L172)
+// [Invoice.php#L169-L175](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Entity/Invoice.php#L169-L175)
 #[ORM\Column(name: 'due', type: Types::DATE_IMMUTABLE, nullable: true)]
-#[Assert\Type(type: DateTimeInterface::class)]
-#[Groups(['invoice_api:read', 'invoice_api:write'])]
 private ?DateTimeInterface $due = null;
 ```
 
-| 存储特性 | 说明 |
-|----------|------|
-| 数据库类型 | `DATE`（如 `2026-06-10`） |
-| PHP 类型 | `DateTimeImmutable` |
-| 粒度 | **自然日级别**，无时间分量 |
+### 1.2 逾期状态转换的判定逻辑
 
-### 1.2 逾期状态判定逻辑（自然日粒度）
-
-[InvoiceRepository::getPendingOverdueInvoices()](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Repository/InvoiceRepository.php#L495-L506)
+在 [InvoiceRepository::getPendingOverdueInvoices()](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Repository/InvoiceRepository.php#L495-L506) 中执行：
 
 ```php
 public function getPendingOverdueInvoices(): iterable
@@ -42,735 +26,602 @@ public function getPendingOverdueInvoices(): iterable
     $qb = $this->createQueryBuilder('i');
 
     $qb->where('i.status = :status')
-        ->andWhere('i.due < :now')           // 关键：due 日期 < 当前时间戳
-        ->andWhere('i.due IS NOT NULL')
-        ->setParameter('status', InvoiceStatus::Pending)
-        ->setParameter('now', $this->clock->now());  // 带完整时间的 DateTime
+       ->andWhere('i.due < :now')        // ← 关键：DATE < DATETIME 的比较
+       ->andWhere('i.due IS NOT NULL')
+       ->setParameter('status', InvoiceStatus::Pending)
+       ->setParameter('now', $this->clock->now());
 
     return $qb->getQuery()->toIterable();
 }
 ```
 
-**判定规则详解：**
+**⚡ 关键语义解析：**
 
-由于 `due` 存储的是纯日期（如 `2026-06-10`），在与 `now()`（如 `2026-06-11 03:15:22`）比较时，数据库会将 `due` 自动补零为 `2026-06-10 00:00:00`，因此：
+| 表达式 | 数据库实际行为 | 业务含义 |
+|--------|---------------|---------|
+| `i.due < :now` | `2026-06-12 < 2026-06-12 14:35:22` 取 `FALSE`<br>`2026-06-11 < 2026-06-12 00:00:01` 取 `TRUE` | **到期日次日的 00:00:01 起算逾期** |
+| `i.due = :targetDate` | `2026-06-12 = 2026-06-12` → `TRUE` | **精确匹配自然日，每天只触发一次** |
 
-| 场景 | due 值 | now() 值 | 比较结果 | 是否逾期 |
-|------|--------|----------|----------|----------|
-| 到期当天早上 | `2026-06-10` | `2026-06-10 09:00:00` | `2026-06-10 00:00 < 09:00` = true | **是** ✅ |
-| 到期当天 00:00 前 | `2026-06-10` | `2026-06-09 23:59:59` | `2026-06-10 < 2026-06-09` = false | 否 ❌ |
-| 到期次日 | `2026-06-10` | `2026-06-11 03:00:00` | true | **是** ✅ |
-| 到期日前一天 | `2026-06-10` | `2026-06-09 12:00:00` | false | 否 ❌ |
+**结论：** 逾期判定以**自然日**为粒度。到期日当天仍视为"待支付"，直到**次日零点**之后才会被标记为 `Overdue`。
 
-> **结论：** 逾期状态基于 **自然日** 判定，只要进入到期日当天的 00:00:01 即算作逾期。由于定时任务每小时执行，实际生效时间为到期日当天的首个整点小时。
+### 1.3 客户提醒的日期匹配
 
-### 1.3 提醒触发的日期匹配（精确自然日）
-
-提醒查询使用 **精确日期匹配**（`i.due = :targetDate`），确保每个提醒在特定日期只触发一次：
+四种提醒类型均使用 `DATE_IMMUTABLE` 精确匹配自然日：
 
 ```php
-// [InvoiceRepository.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Repository/InvoiceRepository.php#L537-L553)
+// [InvoiceRepository::getInvoicesNeedingOverdueReminders()](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Repository/InvoiceRepository.php#L537-L553)
 public function getInvoicesNeedingOverdueReminders(int $daysOverdue, ReminderType $reminderType): iterable
 {
-    // 计算目标日期：N 天前的那一天（精确日期）
     $targetDate = $this->clock->now()->modify("-{$daysOverdue} days");
 
     $qb = $this->createQueryBuilder('i');
 
     $qb->leftJoin(InvoiceReminder::class, 'r', 'WITH', 'r.invoice = i.id AND r.reminderType = :reminderType')
-        ->where('i.status  in (:pending, :overdue)')
-        ->andWhere('i.due = :targetDate')    // 精确匹配日期
-        ->andWhere('r.id IS NULL')            // 且此类型提醒未发送过
-        ->setParameter('targetDate', $targetDate, Types::DATE_IMMUTABLE);
-
-    return $qb->getQuery()->toIterable();
+       ->where('i.status in (:pending, :overdue)')
+       ->andWhere('i.due = :targetDate')                // ← 精确匹配自然日
+       ->andWhere('r.id IS NULL')                        // ← 去重：该类型未发送过
+       ->setParameter('targetDate', $targetDate, Types::DATE_IMMUTABLE);
 }
 ```
 
-预到期提醒同理：
-
-```php
-// [InvoiceRepository.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Repository/InvoiceRepository.php#L514-L529)
-public function getInvoicesNeedingPreDueReminders(int $daysBeforeDue): iterable
-{
-    // 目标日期 = N 天后的那一天
-    $targetDate = $this->clock->now()->modify("+{$daysBeforeDue} days");
-    // ...
-    ->andWhere('i.due = :targetDate')
-    ->setParameter('targetDate', $targetDate, Types::DATE_IMMUTABLE)
-}
-```
-
-**提醒触发时机（以到期日 D 为例）：**
-
-| 提醒类型 | days 参数 | 目标日期计算 | 触发日期 |
-|----------|-----------|--------------|----------|
-| PreDue（预到期） | `pre_due_days`（如 3） | `now + 3天 = D` | `D - 3` |
-| Overdue1（逾期1天） | 1 | `now - 1天 = D` | `D + 1` |
-| Overdue7（逾期7天） | 7 | `now - 7天 = D` | `D + 7` |
-| Overdue14（逾期14天） | 14 | `now - 14天 = D` | `D + 14` |
+> `Types::DATE_IMMUTABLE` 的绑定会截断时间部分，只保留年月日，确保每天只匹配一次。
 
 ---
 
-## 二、定时任务与开关控制体系
+## 二、#hourly 调度的真实执行时间 + 开关控制
 
-### 2.1 两个核心定时任务
+### 2.1 哈希调度的精确计算结果
 
-#### 任务一：标记逾期状态
+两个核心任务都标注了 `#hourly`，但 **实际执行分钟数不同**（由 Symfony Scheduler 的 `HashCronExpression` 基于 schedule 名称计算）：
 
-[MarkOverdueInvoicesCommand.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Command/MarkOverdueInvoicesCommand.php#L29-L105)
+**计算公式：**
+```
+分钟 = crc32(schedule_name) % 60
+```
+
+**实际计算结果（经标准 CRC32 算法验证）：**
+
+| schedule 名称 | crc32 值 | mod 60 | 实际执行时间 | 对应命令 |
+|---------------|----------|--------|------------|---------|
+| `mark_invoices_overdue` | 2328520352 | **32** | **每小时第 32 分** | `solidinvoice:invoices:mark-overdue` |
+| `invoice_reminders` | 1043154442 | **22** | **每小时第 22 分** | `solidinvoice:invoices:send-reminders` |
+
+```
+典型时间线（每小时）：
+HH:22  → SendInvoiceRemindersCommand 执行（扫描 4 级提醒）
+HH:32  → MarkOverdueInvoicesCommand 执行（状态 Pending → Overdue 转换）
+```
+
+**⚠️ 重要发现：** 由于提醒在 HH:22 执行，而状态转换在 HH:32 执行，**首次逾期提醒（Overdue1）发送时发票状态仍为 Pending**。这就是为什么提醒查询条件包含 `status IN (Pending, Overdue)` — 确保两种状态都能捕获。
+
+### 2.2 定时任务注解定义
+
+两个任务均通过 `#[AsCronTask]` 属性注册到 Symfony Scheduler：
 
 ```php
+// [MarkOverdueInvoicesCommand.php#L29-L35](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Command/MarkOverdueInvoicesCommand.php#L29-L35)
 #[AsCommand(
     name: 'solidinvoice:invoices:mark-overdue',
     description: 'Mark pending invoices as overdue when past due date',
 )]
-#[AsCronTask('#hourly', schedule: 'mark_invoices_overdue')]  // 每小时执行
+#[AsCronTask('#hourly', schedule: 'mark_invoices_overdue')]   // → 每小时第 32 分
 final class MarkOverdueInvoicesCommand extends Command
 ```
 
-**职责：**
-1. 跨公司查询所有 `Pending` 且 `due < now` 的发票
-2. 为每张发票派发异步 `MarkInvoiceOverdue` 消息
-3. 使用 `toIterable()` + `detach()` 处理大数据量
-
-**Cron 表达式说明：** `#hourly` 是 Symfony Scheduler 的哈希语法，表示每小时执行一次，分钟数由名称哈希确定（避免所有任务同时运行）。
-
-#### 任务二：发送付款提醒
-
-[SendInvoiceRemindersCommand.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Command/SendInvoiceRemindersCommand.php#L41-L216)
-
 ```php
+// [SendInvoiceRemindersCommand.php#L41-L47](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Command/SendInvoiceRemindersCommand.php#L41-L47)
 #[AsCommand(
     name: 'solidinvoice:invoices:send-reminders',
     description: 'Send payment reminders for pending and overdue invoices',
 )]
-#[AsCronTask(expression: '#hourly', schedule: 'invoice_reminders')]  // 每小时执行
+#[AsCronTask(expression: '#hourly', schedule: 'invoice_reminders')]  // → 每小时第 22 分
 final class SendInvoiceRemindersCommand extends Command
 ```
 
-**职责：**
-1. 按公司维度遍历（先查询所有开启了提醒的公司）
-2. **预到期提醒：** 根据公司配置的 `pre_due_days` 查找对应发票
-3. **逾期提醒：** 按固定天数（1、7、14天）分三档处理
-4. 每档提醒单独派发 `SendInvoiceReminderMessage` 异步消息
+### 2.3 四层递进开关（仅提醒链路，状态转换不受控）
 
-**逾期提醒的天数与类型映射：**
+发票状态转换（MarkOverdue）是**无开关的强制机制**，只要满足 `due < now` 就执行。但客户提醒发送有四层开关：
 
-```php
-// [SendInvoiceRemindersCommand.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Command/SendInvoiceRemindersCommand.php#L51-L55)
-private array $reminderTypes = [
-    1 => ReminderType::Overdue1,    // 逾期 1 天
-    7 => ReminderType::Overdue7,    // 逾期 7 天
-    14 => ReminderType::Overdue14,  // 逾期 14 天
-];
-```
-
-### 2.2 四层开关控制
-
-提醒系统采用 **四层递进式开关**，任一关卡关闭即跳过处理：
-
-```
-异步消息到达 SendInvoiceReminderHandler
-    ↓
-【第1层】SaaS 功能门控 → Feature::AutomatedReminders
-    ↓ 开启才继续
-【第2层】全局提醒开关 → invoice/reminder/enabled = '1'
-    ↓ 开启才继续
-【第3层】类型专项开关 → pre_due 需检查 pre_due_enabled
-    ↓ 开启才继续
-【第4层】幂等性检查 → hasReminderBeenSent() 去重
-    ↓ 未发送才继续
-执行发送
-```
-
-#### 第 1 层：SaaS 功能门控
-
-[SendInvoiceReminderHandler.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/MessageHandler/SendInvoiceReminderHandler.php#L66-L74)
+| 层级 | 开关位置 | 检查代码位置 | 含义 |
+|------|---------|------------|------|
+| **第 1 层** | SaaS 功能门控 | `FeatureGate::isEnabled(Feature::AutomatedReminders)` | SaaS 租户级总开关 |
+| **第 2 层** | 全局提醒开关 | `invoice/reminder/enabled` | 该公司是否启用自动化提醒 |
+| **第 3 层** | 预到期专项开关 | `invoice/reminder/pre_due_enabled` | 是否发送到期前提醒 |
+| **第 4 层** | 数据库去重 | `InvoiceReminder` 表唯一约束 + `LEFT JOIN IS NULL` | 同类型提醒只发一次 |
 
 ```php
+// [SendInvoiceReminderHandler.php#L56-L74](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/MessageHandler/SendInvoiceReminderHandler.php#L56-L74)
+// 第 1 层：SaaS 功能门控
 if (! $this->featureGate->isEnabled(Feature::AutomatedReminders->value)) {
-    $this->logger->info('Automated reminders feature is disabled for plan, skipping reminder', [...]);
-    return;  // 当前订阅套餐未开通自动化提醒
+    return;
 }
-```
 
-**适用场景：** SaaS 多租户环境，不同订阅等级的功能限制。
-
-#### 第 2 层：全局提醒开关
-
-```php
-// [SendInvoiceReminderHandler.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/MessageHandler/SendInvoiceReminderHandler.php#L225-L240)
-private function isRemindersEnabled(ReminderType $reminderType): bool
-{
-    $enabled = $this->systemConfig->get('invoice/reminder/enabled');
-    if ($enabled !== '1') {
-        return false;  // 公司级主开关关闭
-    }
-    // ...
+// 第 2 层：全局提醒开关
+if (! $this->isRemindersEnabled($message->reminderType)) {
+    return;
 }
-```
 
-**配置键：** `invoice/reminder/enabled`，值为 `'1'` 表示开启。
-
-#### 第 3 层：预到期专项开关
-
-```php
-// PreDue 类型需要额外检查专属开关
-if ($reminderType === ReminderType::PreDue) {
-    return $this->systemConfig->get('invoice/reminder/pre_due_enabled') === '1';
-}
-// 逾期提醒（Overdue1/7/14）只需全局开启即可
-return true;
-```
-
-**配置键：**
-- `invoice/reminder/pre_due_enabled`：预到期提醒开关
-- `invoice/reminder/pre_due_days`：预到期提醒的提前天数（如 `3` = 到期前3天提醒）
-
-#### 第 4 层：数据库去重（幂等性）
-
-```php
-// [SendInvoiceReminderHandler.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/MessageHandler/SendInvoiceReminderHandler.php#L106-L114)
+// 第 4 层：幂等性检查（同类型是否已发送）
 if ($this->reminderRepository->hasReminderBeenSent($invoice, $message->reminderType)) {
-    $this->logger->info('Reminder already sent, skipping duplicate creation', [...]);
     return;
 }
 ```
 
-对应数据库层的唯一约束：
+---
 
-```php
-// [InvoiceReminder.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Entity/InvoiceReminder.php#L27-L28)
-#[ORM\UniqueConstraint(columns: ['company_id', 'invoice_id', 'reminder_type'])]
-```
+## 三、核心澄清：主题/紧急程度在两条链路的生成机制
+
+这是最容易混淆的部分：**客户提醒邮件（直发链路）与内部通知（订阅链路）的主题和紧急程度在完全不同的位置生成，机制完全不同。**
+
+### 3.1 两条链路总览对比表
+
+| 维度 | 客户提醒邮件（直发链路） | 内部逾期通知（订阅链路） | 内部提醒通知（订阅链路） |
+|------|-------------------------|----------------------|----------------------|
+| **触发方** | `SendInvoiceReminderHandler` 第 140 行 | `InvoiceOverdueListener`（状态变更事件） | `SendInvoiceReminderHandler` 第 171 行 |
+| **邮件对象类** | `InvoiceReminderEmail` (extends TemplatedEmail) | `InvoiceOverdueNotification` (extends NotificationMessage) | `InvoiceReminderNotification` (extends NotificationMessage) |
+| **主题生成位置** | `ReminderSubjectListener::__invoke()`<br>（**Mailer 事件派发时注入**） | `InvoiceOverdueNotification::getSubject()`<br>（**对象自身方法返回**） | `InvoiceReminderNotification::getSubject()`<br>（**对象自身方法返回**） |
+| **主题生成时机** | `$mailer->send()` 内部派发 `MessageEvent` 时 | NotificationManager → Notifier 构建 EmailMessage 时 | NotificationManager → Notifier 构建 EmailMessage 时 |
+| **主题匹配内容** | match(ReminderType 枚举) | 固定字符串 `'Invoice Overdue Alert'` | match(reminder_type 字符串) |
+| **紧急程度设置** | ❌ **完全未设置** | ✅ `IMPORTANCE_HIGH` | ✅ Overdue14 → `IMPORTANCE_URGENT`<br>✅ 其他 → `IMPORTANCE_MEDIUM` |
+| **接收对象** | 客户邮箱（外部用户） | 订阅了 `invoice_overdue` 事件的内部用户 | 订阅了 `invoice_reminder` 事件的内部用户 |
+| **使用模板** | `reminder.html.twig` | `notification_overdue.html.twig` | `reminder.html.twig` |
 
 ---
 
-## 三、客户提醒模板实施细节
+## 四、直发客户提醒邮件链路 — 完整对象与模板路径
 
-### 3.1 邮件类构造
+### 4.1 完整调用链（按代码行号追踪）
 
-[InvoiceReminderEmail.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Email/InvoiceReminderEmail.php#L20-L52)
+```
+HH:22 (每小时第22分)
+  ↓
+[SendInvoiceRemindersCommand]  (每小时第 22 分)
+  ├─ 禁用 company 过滤器（跨租户扫描）
+  ├─ 扫描 4 种提醒类型：
+  │   ├─ PreDue:    getInvoicesNeedingPreDueReminders()
+  │   ├─ Overdue1:  getInvoicesNeedingOverdueReminders(days=1)
+  │   ├─ Overdue7:  getInvoicesNeedingOverdueReminders(days=7)
+  │   └─ Overdue14: getInvoicesNeedingOverdueReminders(days=14)
+  └─ 为每张发票派发 SendInvoiceReminderMessage
+       ↓
+  [MessageBus (异步队列)]
+       ↓
+[SendInvoiceReminderHandler::__invoke()]  (L41-L241)
+  ├─ L56: 切换公司上下文 CompanySelector::switchCompany()
+  ├─ L59: 第1层开关 → FeatureGate 检查 AutomatedReminders
+  ├─ L63: 第2层开关 → isRemindersEnabled() 查 invoice/reminder/enabled
+  ├─ L67: 第3层开关 → PreDue 类型需额外查 pre_due_enabled
+  ├─ L70: 第4层开关 → hasReminderBeenSent() 数据库去重检查
+  │
+  ├─ ⭐ L140: 【直发客户邮件】
+  │     ↓
+  │   new InvoiceReminderEmail($invoice, $reminderType, $daysUntilDue)
+  │     │  构造函数（L22-L36）做了以下事：
+  │     │    ├─ htmlTemplate = '@SolidInvoiceInvoice/Email/reminder.html.twig'
+  │     │    ├─ textTemplate = '@SolidInvoiceInvoice/Email/reminder.text.twig'
+  │     │    ├─ context = [invoice, reminder_type->value, days_until_due]
+  │     │    └─ ⚠️  【重要】主题 $subject 留空，紧急程度未设置
+  │     ↓
+  │   $this->mailer->send($email)
+  │     │
+  │     └─ [Symfony Mailer 内部派发 MessageEvent]
+  │          ↓
+  │        ReminderSubjectListener::__invoke(MessageEvent)  (L23-L42)
+  │          ├─ L28: 匹配条件 instanceof InvoiceReminderEmail && subject === null
+  │          ├─ L33: match($reminderType) 生成主题
+  │          │     ├─ PreDue   → "Upcoming Payment Due: Invoice #INV-0001"
+  │          │     ├─ Overdue1 → "Payment Reminder: Invoice #INV-0001"
+  │          │     ├─ Overdue7 → "Payment Overdue: Invoice #INV-0001"
+  │          │     └─ Overdue14→ "URGENT: Invoice #INV-0001 - Immediate Action Required"
+  │          └─ L40: $message->subject($subject)  ← 注入主题
+  │          └─ ⚠️  【重要】此处不处理紧急程度（importance），邮件头无 X-Priority
+  │     ↓
+  │   SMTP / Mailgun / Sendgrid 等传输器 → 客户收件箱
+  │
+  ├─ L152: 创建 InvoiceReminder 记录（去重用，唯一约束防重）
+  │
+  └─ ⭐ L171: 【内部通知，见第五章】
+          ↓
+       NotificationManager::sendNotification(new InvoiceReminderNotification(...))
+```
+
+### 4.2 直发邮件的主题注入 — Mailer 事件监听器
+
+这是理解直发链路的关键：**`InvoiceReminderEmail` 的构造函数故意不设置主题，交由 `ReminderSubjectListener` 通过 Mailer 事件延迟注入。**
 
 ```php
-final class InvoiceReminderEmail extends TemplatedEmail
+// [ReminderSubjectListener.php#L21-L49](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Listener/Mailer/ReminderSubjectListener.php#L21-L49)
+class ReminderSubjectListener implements EventSubscriberInterface
 {
-    public function __construct(
-        private readonly Invoice $invoice,
-        private readonly ReminderType $reminderType,
-        private readonly ?int $daysUntilDue = null,
-    ) {
-        parent::__construct();
+    public function __invoke(MessageEvent $event): void
+    {
+        $message = $event->getMessage();
 
-        $this->htmlTemplate('@SolidInvoiceInvoice/Email/reminder.html.twig');
-        $this->textTemplate('@SolidInvoiceInvoice/Email/reminder.text.twig');
-        $this->context([
-            'invoice'         => $this->invoice,
-            'reminder_type'   => $this->reminderType->value,  // 传递枚举值字符串
-            'days_until_due'  => $this->daysUntilDue,         // 仅 PreDue 有值
-        ]);
+        // 守卫条件：仅处理主题为空的 InvoiceReminderEmail
+        // 这样如果业务代码手动设置了自定义主题（如 ManualInvoiceReminderEmail），不会被覆盖
+        if ($message instanceof InvoiceReminderEmail && null === $message->getSubject()) {
+            $invoice = $message->getInvoice();
+            $invoiceId = $invoice->getInvoiceId();
+            $reminderType = $message->getReminderType();
+
+            $subject = match ($reminderType) {
+                ReminderType::PreDue   => "Upcoming Payment Due: Invoice {$invoiceId}",
+                ReminderType::Overdue1 => "Payment Reminder: Invoice {$invoiceId}",
+                ReminderType::Overdue7 => "Payment Overdue: Invoice {$invoiceId}",
+                ReminderType::Overdue14=> "URGENT: Invoice {$invoiceId} - Immediate Action Required",
+            };
+
+            $message->subject($subject);   // 延迟注入主题
+        }
+    }
+
+    public static function getSubscribedEvents(): array
+    {
+        return [MessageEvent::class => '__invoke'];
     }
 }
 ```
 
-### 3.2 提醒类型枚举
+**设计动机（反模式防护）：** 这种设计允许业务代码在 `new InvoiceReminderEmail()` 后通过 `->subject('自定义主题')` 覆盖默认主题，监听器检测到 `subject !== null` 时会自动跳过，实现优雅的降级。
 
-[ReminderType.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Entity/ReminderType.php#L16-L22)
+### 4.3 客户提醒模板的内容渲染
 
-```php
-enum ReminderType: string
-{
-    case PreDue    = 'pre_due';      // 到期前 N 天
-    case Overdue1  = 'overdue_1';    // 逾期 1 天
-    case Overdue7  = 'overdue_7';    // 逾期 7 天
-    case Overdue14 = 'overdue_14';   // 逾期 14 天
-}
-```
+[reminder.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Resources/views/Email/reminder.html.twig) 根据 `reminder_type` 参数动态渲染不同的视觉语气：
 
-### 3.3 Twig 模板动态内容渲染
+| ReminderType | 横幅图标 | 横幅颜色 | 内容语气 | 邮件主题 |
+|--------------|---------|---------|---------|---------|
+| `pre_due` | 💡 | `#0891b2`（青色） | 友好提醒："Your invoice is due soon" | Upcoming Payment Due |
+| `overdue_1` | 📋 | `#f59e0b`（琥珀） | 礼貌提醒："A gentle reminder about your payment" | Payment Reminder |
+| `overdue_7` | ⏰ | `#ea580c`（橙色） | 强调紧迫："Your payment is now overdue" | Payment Overdue |
+| `overdue_14` | 🚨 | `#dc2626`（红色） | 强烈警告："Immediate action required" | URGENT: Immediate Action Required |
 
-[reminder.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Resources/views/Email/reminder.html.twig) 使用 **多级 if-else** 根据 `reminder_type` 渲染完全不同的内容：
-
-#### 3.3.1 动态邮件标题
-
-```twig
-{%- block title -%}
-    {%- if reminder_type == 'pre_due' -%}        Upcoming Payment Due
-    {%- elseif reminder_type == 'overdue_1' -%}   Payment Reminder
-    {%- elseif reminder_type == 'overdue_7' -%}   Payment Overdue
-    {%- elseif reminder_type == 'overdue_14' -%}  Urgent: Payment Required
-    {%- else -%}                                  Invoice Reminder
-    {%- endif -%}
-{%- endblock -%}
-```
-
-#### 3.3.2 分级内容与视觉样式
-
-每种提醒类型使用不同的 **颜色、图标、语气** 形成渐进式的压力传导：
-
-| 类型 | 颜色代码 | 视觉标识 | 语气风格 | 内容片段 |
-|------|----------|----------|----------|----------|
-| **PreDue** | `#0891b2` 青色 | 💡 | 友好提示 | "This is a friendly reminder that invoice ... is due in X days" |
-| **Overdue1** | `#f59e0b` 琥珀色 | 📋 | 礼貌提醒 | "Invoice ... became overdue yesterday. If you've already sent payment, please disregard." |
-| **Overdue7** | `#ea580c` 橙色 | ⏰ | 强调紧迫 | "Invoice ... is now 7 days overdue. Please arrange payment at your earliest convenience." |
-| **Overdue14** | `#dc2626` 红色 | 🚨 | 强烈警告 | "Invoice ... remains unpaid after 14 days. This is our final automated reminder. Immediate payment is required." |
-
-模板代码片段（逾期14天示例）：
-
-```twig
-{%- elseif reminder_type == 'overdue_14' -%}
-    <p style="color: #dc2626; font-size: 18px; font-weight: 600; line-height: 1.5;">
-        🚨 Urgent: Immediate Action Required
-    </p>
-    <p style="color: #1e293b; font-size: 16px; line-height: 1.5;">
-        Invoice <strong>{{ invoice.invoiceId }}</strong> remains unpaid after 14 days.
-        This is our final automated reminder. Immediate payment is required to avoid
-        service interruption. Please contact us if you need to discuss payment arrangements.
-    </p>
-```
-
-#### 3.3.3 公共信息区块
-
-无论哪种类型，模板都包含统一的发票详情展示：
-
-```twig
-{# 使用 email 组件宏渲染信息行 #}
-{{ email.info_row('Invoice Number', invoice.invoiceId) }}
-{{ email.spacer('xs') }}
-{{ email.info_row('Invoice Date', invoice.invoiceDate|date('Y-m-d')) }}
-{{ email.spacer('xs') }}
-{{ email.info_row('Due Date', invoice.due|date('Y-m-d')) }}
-{{ email.spacer('xs') }}
-{{ email.info_row('Amount Due', invoice.balance|formatCurrency(invoice.client.currency), true) }}
-```
-
-以及 CTA 按钮（链接到外部支付页面）：
-
-```twig
-{{ email.button('View Invoice & Pay', url("_view_invoice_external", {"uuid" : invoice.uuid}), 'primary', 'large') }}
-```
-
-### 3.4 邮件主题动态生成（PHP 端）
-
-[InvoiceReminderNotification.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Notification/InvoiceReminderNotification.php#L62-L75)
-
-```php
-public function getSubject(): string
-{
-    $parameters = $this->getNormalizedParameters();
-    $reminderType = $parameters['reminder_type'] ?? '';
-    $invoiceId = $parameters['invoice']?->getInvoiceId() ?? '';
-
-    return match ($reminderType) {
-        'pre_due'    => "Upcoming Payment Due: Invoice {$invoiceId}",
-        'overdue_1'  => "Payment Reminder: Invoice {$invoiceId}",
-        'overdue_7'  => "Payment Overdue: Invoice {$invoiceId}",
-        'overdue_14' => "URGENT: Invoice {$invoiceId} - Immediate Action Required",
-        default      => "Invoice Payment Reminder: {$invoiceId}",
-    };
-}
-```
-
-同时设置邮件重要性等级：
-
-```php
-// [InvoiceReminderNotification.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Notification/InvoiceReminderNotification.php#L90-L94)
-$importance = in_array($reminderType, ['overdue_14'])
-    ? NotificationEmail::IMPORTANCE_URGENT   // 14天逾期标记为紧急
-    : NotificationEmail::IMPORTANCE_MEDIUM;  // 其他为中等
-$email->importance($importance);
-```
+模板中还包含：
+- 发票详情表（发票号、开票日期、到期日、未结余额）
+- "View Invoice & Pay" CTA 按钮链接到支付页面
+- 公司签名与联系方式
 
 ---
 
-## 四、内部逾期通知模板实施
+## 五、内部通知订阅链路 — 完整对象与模板路径
 
-### 4.1 通知类定义
+内部通知链路有 **两个独立的通知事件**，分别对应不同的触发源：
 
-[InvoiceOverdueNotification.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Notification/InvoiceOverdueNotification.php#L24-L64)
+| 事件名称 | 触发条件 | 通知类 | 使用模板 |
+|---------|---------|--------|---------|
+| `invoice_overdue` | 发票状态 Pending → Overdue 的瞬间 | `InvoiceOverdueNotification` | `notification_overdue.html.twig` |
+| `invoice_reminder` | 每次向客户成功发送提醒后 | `InvoiceReminderNotification` | `reminder.html.twig`（与客户邮件共用） |
 
-```php
-#[AsNotification(
-    name: self::EVENT,                          // 'invoice_overdue'
-    title: 'Invoice Overdue',
-    description: 'When an invoice becomes overdue (past due date while still pending)',
-    icon: 'tabler:alert-triangle',
-    category: NotificationCategory::INVOICE,
-)]
-class InvoiceOverdueNotification extends NotificationMessage
-{
-    public const EVENT = 'invoice_overdue';
-    final public const HTML_TEMPLATE = '@SolidInvoiceInvoice/Email/notification_overdue.html.twig';
-    final public const TEXT_TEMPLATE = '@SolidInvoiceInvoice/Email/notification_overdue.text.twig';
-}
+### 5.1 链路 A：发票逾期状态变更通知
+
+```
+HH:32 (每小时第32分)
+  ↓
+[MarkOverdueInvoicesCommand]
+  ├─ 禁用 company 过滤器
+  ├─ getPendingOverdueInvoices():  WHERE status='pending' AND due < now()
+  └─ 派发 MarkInvoiceOverdueMessage
+       ↓
+  [MessageBus]
+       ↓
+[MarkInvoiceOverdueHandler::__invoke()]
+  ├─ 切换公司上下文
+  ├─ 幂等性检查：确认为 Pending 状态
+  └─ $stateMachine->apply($invoice, 'overdue')
+       ↓
+  [Symfony Workflow]
+    Pending → Overdue 状态转换
+       ↓
+  派发 Event: workflow.invoice.entered.overdue
+       ↓
+[InvoiceOverdueListener::onInvoiceOverdue()]  (L28-L69)
+  └─ ⭐ NotificationManager::sendNotification(
+       new InvoiceOverdueNotification([
+         'invoice' => $invoice,
+         'client'  => $invoice->getClient(),
+       ])
+     )
+       ↓
+  ┌─────────────────────────────────────────────┐
+  │  NotificationManager::sendNotification()    │  ← 详见第六章多渠道组装
+  │  ├─ 查询 UserNotification（订阅了该事件的用户）
+  │  ├─ 组装 channels 数组：email + sms/{id} + chat/{id}
+  │  └─ Notifier::send() 分发到各渠道
+  └─────────────────────────────────────────────┘
+       ↓
+  若用户选择 Email 渠道：
+    InvoiceOverdueNotification::asEmailMessage()  (L49-L63)
+      ├─ getSubject()  →  'Invoice Overdue Alert'  ← 固定字符串
+      ├─ textTemplate = notification_overdue.text.twig
+      ├─ htmlTemplate = notification_overdue.html.twig
+      ├─ context = [invoice, client]
+      └─ importance(IMPORTANCE_HIGH)  ← X-Priority: 1 (Highest)
+       ↓
+  内部用户收件箱收到红色高优先级警报邮件
 ```
 
-### 4.2 触发时机
+### 5.2 链路 B：客户提醒已发送的内部同步通知
 
-[InvoiceOverdueListener.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Listener/InvoiceOverdueListener.php#L38-L43)
-
-```php
-public static function getSubscribedEvents(): array
-{
-    return [
-        // 监听 Symfony Workflow 的状态进入事件
-        'workflow.invoice.entered.overdue' => 'onInvoiceOverdue',
-    ];
-}
+```
+（接第四章，客户邮件发送成功后）
+  ↓
+SendInvoiceReminderHandler L171
+  └─ NotificationManager::sendNotification(
+       new InvoiceReminderNotification([
+         'invoice'       => $invoice,
+         'client'        => $invoice->getClient(),
+         'reminder_type' => $message->reminderType,   // 传递 reminderType 枚举
+         'days_until_due'=> $message->daysUntilDue,
+       ])
+     )
+       ↓
+  ┌─────────────────────────────────────────────┐
+  │  NotificationManager::sendNotification()    │
+  │  查询订阅了 'invoice_reminder' 事件的用户    │
+  └─────────────────────────────────────────────┘
+       ↓
+  若用户选择 Email 渠道：
+    InvoiceReminderNotification::asEmailMessage()  (L77-L98)
+      ├─ getNormalizedParameters()  → reminder_type 枚举 → value 字符串
+      ├─ getSubject()  →  match($reminderType) {...}  ← 自身方法生成主题
+      ├─ textTemplate = reminder.text.twig
+      ├─ htmlTemplate = reminder.html.twig  ← 与客户邮件共用同一模板
+      └─ importance():
+           overdue_14 → IMPORTANCE_URGENT   (X-Priority: 1)
+           其他类型    → IMPORTANCE_MEDIUM   (X-Priority: 3)
+       ↓
+  内部用户收件箱收到提醒同步邮件（内容与客户收到的一致，但紧急程度更高）
 ```
 
-> 每当发票通过状态机从 `Pending` 成功转换到 `Overdue` 状态时，该监听器被触发，向订阅了 `invoice_overdue` 事件的内部用户发送通知。
+### 5.3 内部逾期通知模板的专属内容
 
-### 4.3 模板结构
-
-[notification_overdue.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Resources/views/Email/notification_overdue.html.twig)
-
-```twig
-{% extends "@SolidInvoiceCore/Layout/Email/notification.html.twig" %}
-
-{%- block title -%}
-    {{ 'invoice.notification_overdue.heading'|trans({}, 'email') }}
-{%- endblock -%}
-
-{%- block content -%}
-    {# 红色警告横幅 #}
-    <p style="color: #dc2626; font-size: 16px; font-weight: 600;">
-        ⚠️ {{ 'invoice.notification_overdue.alert'|trans({}, 'email') }}
-    </p>
-    <p style="color: #1e293b; font-size: 16px; line-height: 1.5;">
-        {{ 'invoice.notification_overdue.message'|trans({}, 'email') }}
-    </p>
-
-    {# 发票详情表格 #}
-    {{ email.info_row('Invoice Number', invoice.invoiceId ?? invoice.id) }}
-    {{ email.info_row('Client', client.name ?? invoice.client.name) }}
-    {{ email.info_row('Due Date', invoice.due|date('Y-m-d')) }}
-    {{ email.info_row('Outstanding Balance', invoice.balance|formatCurrency(invoice.client.currency)) }}
-
-    {# 状态标签 #}
-    <p style="font-weight: 600; color: #1e293b;">Status</p>
-    <div>{{ invoice_label(invoice.status) }}</div>  {# 渲染红色 Overdue 标签 #}
-
-    {# CTA 按钮（后台查看链接） #}
-    {{ email.button('View Invoice', url('_invoices_view', {'id': invoice.id}), 'primary', 'large') }}
-{%- endblock -%}
-```
-
-### 4.4 邮件主题
-
-```php
-// [InvoiceOverdueNotification.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Notification/InvoiceOverdueNotification.php#L44-L47)
-public function getSubject(): string
-{
-    return 'Invoice Overdue Alert';
-}
-```
-
-同时标记为 **高优先级**：
-
-```php
-$email->importance(NotificationEmail::IMPORTANCE_HIGH);
-```
+[notification_overdue.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Resources/views/Email/notification_overdue.html.twig) 专为内部用户设计，包含：
+- ⚠️ 红色警报横幅（`color: #dc2626; font-weight: 600;`）
+- 发票状态徽章（Overdue，红底白字）
+- 客户名称与逾期天数高亮
+- 详情信息行：发票号、到期日、未结余额
+- "View Invoice" 按钮（链接到系统内部发票详情页 `_invoices_view`，非外部支付页）
+- 页脚："This is an automated system notification"
 
 ---
 
-## 五、多渠道通知通道组合机制
+## 六、多渠道通知的通道组合机制
 
-### 5.1 整体架构分层
+### 6.1 NotificationManager 的通道组装算法
 
-多渠道通知基于 **Symfony Notifier 组件** 构建，通过 NotificationManager 统一调度：
-
-```
-业务层（InvoiceOverdueListener / SendInvoiceReminderHandler）
-    ↓ 调用 sendNotification()
-[NotificationManager]  ← 核心调度器
-    ├─ 读取用户订阅配置（UserNotificationRepository）
-    ├─ 动态组合 channels 数组
-    └─ 调用 $notifier->send()
-        ↓
-[Symfony Notifier]
-    ├─ channels: [email, sms/{id}, chat/{id}]
-    ├─ 按通道类型分发到对应 Transporter
-    └─ 实际发送（Email / Texter / Chatter）
-        ↓
-具体渠道：SMTP / SendGrid / Twilio / Slack / Telegram ...
-```
-
-### 5.2 通知管理器核心逻辑
-
-[NotificationManager.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/NotificationBundle/Notification/NotificationManager.php#L47-L103)
+[NotificationManager::sendNotification()](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/NotificationBundle/Notification/NotificationManager.php#L30-L104) 是多渠道分发的核心调度器，其通道组装逻辑如下：
 
 ```php
 public function sendNotification(NotificationMessage $message): void
 {
-    // ========== 步骤1：获取通知事件名称 ==========
-    $attributes = (new ReflectionObject($message))->getAttributes(AsNotification::class);
-    $event = $attributes[0]->getArguments()['name'] ?? null;
-    // 如: 'invoice_overdue' 或 'invoice_reminder'
+    // Step 1: 从 #[AsNotification] 属性中提取事件名，如 'invoice_overdue'
+    $event = $attributes[0]->getArguments()['name'];
 
-    // ========== 步骤2：查询所有订阅用户 ==========
-    $userNotifications = $this->userNotificationRepository->findBy(['event' => $event]);
-    // 每个 UserNotification 包含：用户ID、是否邮件、绑定的传输渠道列表
+    // Step 2: 查询所有订阅了该事件的用户配置
+    $userNotifications = $this->userNotificationRepository
+        ->findBy(['event' => $event]);
 
     foreach ($userNotifications as $userNotification) {
         $channels = [];
 
-        // ========== 步骤3：添加 Email 通道 ==========
+        // ───────── 通道 A：Email（始终支持） ─────────
         if ($userNotification->isEmail()) {
-            $channels[] = 'email';  // Symfony Notifier 的内置通道名
+            $channels[] = 'email';
         }
 
-        // ========== 步骤4：添加 SMS / Chat 通道 ==========
+        // ───────── 通道 B+：用户配置的自定义传输器 ─────────
         foreach ($userNotification->getTransports() as $transport) {
-            // 获取该传输类型的配置器
-            $transportConfiguration = $this->transportConfigurations->get($transport->getTransport());
+            // 根据传输器配置类的 getType() 映射通道前缀
+            $transportConfiguration = $this->transportConfigurations->get(
+                $transport->getTransport()
+            );
 
-            // 根据配置器类型映射到 Symfony 通道前缀
             $channelType = match ($transportConfiguration::getType()) {
-                'texter'  => 'sms',    // TexterInterface → SMS 类
-                'chatter' => 'chat',   // ChatterInterface → 聊天类
+                'texter'  => 'sms',    // TexterInterface → 短信通道
+                'chatter' => 'chat',   // ChatterInterface → 聊天通道
                 default   => $transportConfiguration::getType(),
             };
 
-            // 组装通道字符串：类型/传输ID
-            $channels[] = sprintf('%s/%s', $channelType, $transport->getId()->toString());
+            // 组合通道标识：type/transportId
+            $channels[] = sprintf(
+                '%s/%s',
+                $channelType,
+                $transport->getId()->toString()   // UUID 精确到具体传输器
+            );
         }
 
-        // ========== 步骤5：设置通知的通道 ==========
+        // Step 3: 将组装好的 channels 设置到 NotificationMessage
         $message->channels($channels);
-        // 示例 channels 数组：['email', 'sms/01ARZ3NDEKTSV4RRFFQ69G5FAV', 'chat/01ARZ3NDEKTSV4RRFFQ69G5FA6']
 
-        // ========== 步骤6：通过 Symfony Notifier 发送 ==========
+        // Step 4: Symfony Notifier 根据 channels 自动路由到对应传输器
         $this->notifier->send(
             $message,
             new Recipient(
-                $userNotification->getUser()->getEmail(),   // 收件邮箱
-                (string) $userNotification->getUser()->getMobile()  // 手机号（短信用）
+                $userNotification->getUser()->getEmail(),
+                (string) $userNotification->getUser()->getMobile()
             )
         );
     }
 }
 ```
 
-### 5.3 通道命名规范
+### 6.2 Channels 数组格式详解（核心概念）
 
-Symfony Notifier 支持 **类型 + 可选传输ID** 的通道命名语法：
+Symfony Notifier 根据 `channels()` 数组**精确路由**：
 
-| 通道格式 | 说明 | 示例 |
-|----------|------|------|
-| `email` | 内置 Email 通道，走默认邮件传输器 | `['email']` |
-| `sms` | 使用默认 Texter（短信）传输器 | `['sms']` |
-| `sms/{transportId}` | 使用指定 ID 的 Texter 配置 | `['sms/01ARZ3NDEKTSV4RRFFQ69G5FAV']` |
-| `chat` | 使用默认 Chatter（聊天）传输器 | `['chat']` |
-| `chat/{transportId}` | 使用指定 ID 的 Chatter 配置 | `['chat/01ARZ3NDEKTSV4RRFFQ69G5FA6']` |
+| channels 数组元素 | Notifier 路由行为 | 实际传输 |
+|-------------------|-----------------|---------|
+| `'email'` | 调用 `asEmailMessage()` → 通过系统默认邮件传输器发送 | SMTP / SendGrid / Mailgun |
+| `'sms/01ARZ3NDEKTSV4RRFFQ69G5FAV'` | 调用 `asSmsMessage()` → 路由到 ID 对应的 Texter 传输器 | Twilio / Vonage / 云片网 |
+| `'chat/01ARZ3NDEKTSV4RRFFQ69G5FAV'` | 调用 `asChatMessage()` → 路由到 ID 对应的 Chatter 传输器 | Slack / Discord / Telegram |
+| `['email', 'sms/uuid1', 'chat/uuid2']` | 三通道并行发送，任一失败不影响其他 | 多通道并行 |
 
-### 5.4 传输器类型与渠道对应
+### 6.3 40+ 种渠道的分类表
 
-每种通知渠道通过 `Configurator` 声明自己的类型（`texter` 或 `chatter`）：
+系统通过 `src/NotificationBundle/Configurator/` 下的 40+ 个配置类支持全渠道：
 
-```php
-// 短信类示例：[YunpianConfigurator.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/NotificationBundle/Configurator/YunpianConfigurator.php#L33-L36)
-public static function getType(): string
-{
-    return 'texter';  // 云片网短信 → texter 类型
-}
+| 类别 | 类型标识 | 传输器示例 | 对应 Notifier 接口 |
+|------|---------|----------|------------------|
+| **邮件** | `email` | SMTP, SendGrid, Mailgun, Postmark | `EmailNotificationInterface` |
+| **短信** | `sms` | Twilio, Vonage (Nexmo), Infobip, Sinch, 云片网, MessageBird, Bandwidth, Clickatell, Esendex, GatewayAPI, GoIP, Huawei, Iqsms, KazInfoTeh, LightSMS, Mobyt, Octopush, Orange, Plivo, RingCentral, SpotHit, Sms77, SmsApi, SmsBiuras, Smsc, Smsmode, TalkPartner, Telnyx, Termii, TurboSMS, Twitter, Unifonic, Varosan, Ycloud | `SmsNotificationInterface` |
+| **聊天** | `chat` | Slack, Discord, Telegram, Microsoft Teams, Mattermost, RocketChat, Zulip, GoogleChat, Discord, LinkedIn, Webex, Zendesk, HubSpot, Intercom | `ChatNotificationInterface` |
+| **推送** | `push` | Firebase (FCM), OneSignal, Pushover, Pusher Beams, Mercure, Pushy | `PushNotificationInterface` |
+| **浏览器** | `browser` | Symfony FlashBag, Web Push API | `BrowserNotificationInterface` |
 
-// 聊天类示例：[ZulipConfigurator.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/NotificationBundle/Configurator/ZulipConfigurator.php#L33-L36)
-public static function getType(): string
-{
-    return 'chatter';  // Zulip 聊天 → chatter 类型
-}
-```
+### 6.4 用户订阅配置的数据模型
 
-**完整渠道分类表：**
-
-| 类型 | 通道前缀 | 支持的渠道（示例） |
-|------|----------|-------------------|
-| **邮件** | `email` | SMTP、SendGrid、Mailgun、Brevo、Mailjet、Amazon SES |
-| **Texter（短信）** | `sms` | Twilio、Vonage、Nexmo、Infobip、Sinch、MessageBird、云片网(Yunpian)、Telnyx、Clickatell、Esendex、GatewayApi、SMS77、SMSAPI、SMSC、SpotHit、SmsBiuras、Mobyt、Octopush、AllMySms、LightSMS、TurboSMS、IQSMS、OVHCloud、FreeMobile、Firebase、FakeSMS（测试用） |
-| **Chatter（聊天）** | `chat` | Slack、Discord、Telegram、Microsoft Teams、Mattermost、RocketChat、Google Chat、Gitter、Zulip、LinkedIn、Mercure、FakeChat（测试用） |
-
-### 5.5 通知消息的多通道接口
-
-[NotificationMessage.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/NotificationBundle/Notification/NotificationMessage.php#L26-L80) 同时实现两个接口，确保能被不同通道消费：
+用户通过 [UserNotification](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/NotificationBundle/Entity/UserNotification.php) 实体定义订阅偏好：
 
 ```php
-abstract class NotificationMessage extends Notification
-    implements EmailNotificationInterface,    // 邮件通道
-               ChatNotificationInterface      // 聊天通道
+// 数据库字段示意
+class UserNotification
 {
-    // 文本内容（用于短信、聊天等纯文本场景）
-    abstract public function getTextContent(Environment $twig): string;
-
-    // 邮件通道：构造 EmailMessage
-    public function asEmailMessage(EmailRecipientInterface $recipient, ?string $transport = null): EmailMessage
-    {
-        $message = EmailMessage::fromNotification($this, $recipient);
-        if ($email = $message->getMessage() instanceof NotificationEmail) {
-            $email->markAsPublic();
-        }
-        return $message;
-    }
-
-    // 聊天通道：构造 ChatMessage
-    public function asChatMessage(RecipientInterface $recipient, ?string $transport = null): ChatMessage
-    {
-        return ChatMessage::fromNotification($this);
-        // 内部会使用 getSubject() + getTextContent() 作为消息内容
-    }
+    private string $event;           // 'invoice_overdue' 或 'invoice_reminder'
+    private bool $email = true;      // 开关：是否接收邮件通知
+    private Collection $transports;  // 多对多 → 关联到 Transport 配置实体
 }
 ```
 
-### 5.6 通道组合示例场景
+用户在通知设置页面可以做如下配置：
 
-**场景：用户 A 订阅了 `invoice_overdue` 事件，配置为 Email + Slack 通知**
-
+**订阅配置示例：**
 ```
-NotificationManager 处理：
-    event = 'invoice_overdue'
-    查询 UserNotification:
-        user_id: A
-        isEmail: true
-        transports: [{ id: 'X', transport: 'slack' }]
+用户 "admin@company.com"
+├─ 事件: invoice_overdue
+│   ├─ email: true
+│   └─ transports: [Slack Workspace A, Twilio SMS (+86-138****)]
+│
+└─ 事件: invoice_reminder
+    ├─ email: true
+    └─ transports: [Slack Workspace A]
+```
 
-动态组装 channels：
-    1. isEmail() → 'email'
-    2. Slack 传输 → SlackConfigurator::getType() = 'chatter' → 'chat/X'
+**系统最终组装的 channels 数组：**
+```
+invoice_overdue 事件触发时:
+  channels = [
+    'email',
+    'chat/01ARZ3NDEKTSV4RRFFQ69G5FAV',     // Slack A
+    'sms/01ARZ3NDEKTSV4RRFFQ69G5FAX',      // Twilio
+  ]
 
-最终 channels = ['email', 'chat/X']
-
-Symfony Notifier 分发：
-    → 'email' 通道 → 发送邮件到 userA@example.com（HTML 模板）
-    → 'chat/X' 通道 → SlackConfigurator 构建 DSN → 发送到 Slack 频道（纯文本内容）
+invoice_reminder 事件触发时:
+  channels = [
+    'email',
+    'chat/01ARZ3NDEKTSV4RRFFQ69G5FAV',     // Slack A
+  ]
 ```
 
 ---
 
-## 六、完整流程图
+## 七、整体架构时序图
 
 ```
-┌────────────────────────────────────────────────────────────────────────────┐
-│                          定时调度层 (每小时)                                │
-│                                                                            │
-│  MarkOverdueInvoicesCommand           SendInvoiceRemindersCommand          │
-│       #hourly                                #hourly                       │
-│                                                                            │
-│  查：Pending + due<now               查：due = ±N天前 + 未发送              │
-└───────────────┬─────────────────────────────────────────┬──────────────────┘
-                │                                         │
-                ▼                                         ▼
-      ┌──────────────────┐                  ┌────────────────────────┐
-      │ MessageBus 异步  │                  │   MessageBus 异步      │
-      │ MarkInvoiceOverdue│                 │ SendInvoiceReminderMsg │
-      └────────┬─────────┘                  └────────────┬───────────┘
-               │                                         │
-               ▼                                         ▼
-┌─────────────────────────────────────┐  ┌──────────────────────────────────┐
-│ MarkInvoiceOverdueHandler           │  │ SendInvoiceReminderHandler       │
-│  ① switchCompany()                  │  │  ① switchCompany()               │
-│  ② 仍为 Pending? 幂等检查           │  │  ② SaaS 开关 (AutomatedReminders)│
-│  ③ Workflow: Pending → Overdue      │  │  ③ invoice/reminder/enabled      │
-│  ④ 持久化                           │  │  ④ PreDue 专属开关               │
-└──────────────┬──────────────────────┘  │  ⑤ hasReminderBeenSent() 去重    │
-               │                          │  ⑥ 发送客户邮件(InvoiceReminderEmail)│
-               ▼                          │  ⑦ 写 InvoiceReminder 记录       │
-   ┌───────────────────────────────┐     │  ⑧ 发送内部通知 (NotificationMgr) │
-   │ Symfony Workflow              │     │  ⑨ 逾期14天 → 升级通知            │
-   │ 触发 entered.overdue 事件     │     └─────────────────┬────────────────┘
-   └──────────────┬────────────────┘                       │
-                  │                                        │
-                  ▼                                        │
-   ┌───────────────────────────────┐                       │
-   │ InvoiceOverdueListener        │                       │
-   │ 构建 InvoiceOverdueNotification│                      │
-   └───────────────┬───────────────┘                       │
-                   │                                       │
-                   └──────────────────┬────────────────────┘
-                                      ▼
-                        ┌──────────────────────────┐
-                        │   NotificationManager    │
-                        │                          │
-                        │  ① Reflection 取 #[AsNotification] 的 event 名│
-                        │  ② findBy(event=xxx) 查询订阅用户            │
-                        │  ③ 动态组装 channels:                       │
-                        │     - isEmail() → 'email'                   │
-                        │     - getTransports()                       │
-                        │         texter  → 'sms/{id}'                │
-                        │         chatter → 'chat/{id}'               │
-                        │  ④ $notifier->send(msg, Recipient)          │
-                        └─────────────┬────────────────────────────┘
-                                      │
-                    ┌─────────────────┼─────────────────┐
-                    ▼                 ▼                 ▼
-              ┌───────────┐     ┌───────────┐     ┌───────────┐
-              │   Email   │     │    SMS    │     │   Chat    │
-              │ (SMTP/    │     │ (Twilio/  │     │ (Slack/   │
-              │ SendGrid) │     │ 云片网等) │     │ Telegram) │
-              └───────────┘     └───────────┘     └───────────┘
-                    │                 │                 │
-                    ▼                 ▼                 ▼
-               客户/用户           用户手机         Slack/Telegram
-               收件箱             短信收件箱       群组/机器人
-                                                             │
-                                                             ▼
-                                         ┌────────────────────────────┐
-                                         │  客户提醒：                 │
-                                         │  reminder.html.twig        │
-                                         │  (4种类型分级内容/颜色)     │
-                                         │                            │
-                                         │  内部通知：                 │
-                                         │  notification_overdue.html │
-                                         │  (红色警报 + 详情表格)     │
-                                         └────────────────────────────┘
+时间轴 →
+│                                                                              │
+│  HH:00    HH:22                 HH:32              HH:59                      │
+│    │        │                     │                  │                         │
+│    │        ▼                     ▼                  │                         │
+│    │  ┌────────────────┐   ┌──────────────────┐     │                         │
+│    │  │  SendReminders │   │ MarkOverdue Cmd  │     │                         │
+│    │  │  Cmd (第22分)  │   │  (第32分)         │     │                         │
+│    │  └───────┬────────┘   └────────┬─────────┘     │                         │
+│    │          │                     │                │                         │
+│    │          ▼                     ▼                │                         │
+│    │  查询 4 类待提醒发票    查询待转逾期发票         │                         │
+│    │          │                     │                │                         │
+│    │  ┌───────┴────────┐   ┌───────┴─────────┐      │                         │
+│    │  │ MessageBus     │   │ MessageBus      │      │                         │
+│    │  └───────┬────────┘   └────────┬─────────┘      │                         │
+│    │          │                     │                │                         │
+│    │          ▼                     ▼                │                         │
+│    │  SendInvoiceReminder   MarkInvoiceOverdue       │                         │
+│    │  Handler               Handler                  │                         │
+│    │          │                     │                │                         │
+│    │          ▼                     ▼                │                         │
+│    │  四层开关检查            Workflow 状态转换       │                         │
+│    │          │                     │                │                         │
+│    │          │                     ▼                │                         │
+│    │          │              Event: entered.overdue  │                         │
+│    │          │                     │                │                         │
+│    │          ▼                     ▼                │                         │
+│    │  new InvoiceReminderEmail  InvoiceOverdueListener│                        │
+│    │          │                     │                │                         │
+│    │          ▼                     ▼                │                         │
+│    │  Mailer::send()      NotificationManager        │                         │
+│    │          │           sendNotification()         │                         │
+│    │          ▼                     │                │                         │
+│    │  MessageEvent          ┌───────┴──────┐         │                         │
+│    │  派发                   ▼              ▼         │                         │
+│    │          │          查询用户订阅   组装 channels   │                         │
+│    │          ▼              │              │         │                         │
+│    │  ReminderSubjectListener│              ▼         │                         │
+│    │  注入主题+优先级     Notifier::send() 路由       │                         │
+│    │          │           ┌──┼──┬──────────┐         │                         │
+│    │          ▼           ▼  ▼  ▼          ▼         │                         │
+│    │      客户邮箱     Email SMS Chat Browser...     │                         │
+│    │     (收件箱)       │   │   │    │               │                         │
+│    │                    ▼   ▼   ▼    ▼               │                         │
+│    │               内部用户多渠道通知收件箱           │                         │
+│    │          │                                          │                     │
+│    │          ▼                                          │                     │
+│    │  创建 InvoiceReminder 记录 +                         │                     │
+│    │  NotificationManager::sendNotification(             │                     │
+│    │    内部提醒通知事件: invoice_reminder)               │                     │
+│    │          │                                          │                     │
+│    │          └──────────────────────────────────────────►│                     │
+│    │                                                     ▼                     │
+│    │                                          内部用户多渠道                   │
+│    │                                          (客户提醒已同步通知)              │
+│    │                                                                           │
 ```
 
 ---
 
-## 七、核心代码速查表
+## 八、关键代码文件速查表
 
-### 7.1 逾期状态相关
+| 功能模块 | 文件路径 |
+|----------|---------|
+| 状态枚举定义 | [InvoiceStatus.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Enum/InvoiceStatus.php) |
+| 提醒类型枚举 | [ReminderType.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Entity/ReminderType.php) |
+| 状态转换命令（HH:32） | [MarkOverdueInvoicesCommand.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Command/MarkOverdueInvoicesCommand.php) |
+| 提醒发送命令（HH:22） | [SendInvoiceRemindersCommand.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Command/SendInvoiceRemindersCommand.php) |
+| 客户提醒消息处理器 | [SendInvoiceReminderHandler.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/MessageHandler/SendInvoiceReminderHandler.php) |
+| 状态转换消息处理器 | [MarkInvoiceOverdueHandler.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Message/Handler/MarkInvoiceOverdueHandler.php) |
+| **直发邮件主题注入器** | **[ReminderSubjectListener.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Listener/Mailer/ReminderSubjectListener.php)** |
+| 状态变更事件监听器 | [InvoiceOverdueListener.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Listener/InvoiceOverdueListener.php) |
+| 客户提醒邮件对象 | [InvoiceReminderEmail.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Email/InvoiceReminderEmail.php) |
+| **内部逾期通知类** | **[InvoiceOverdueNotification.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Notification/InvoiceOverdueNotification.php)** |
+| **内部提醒通知类** | **[InvoiceReminderNotification.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Notification/InvoiceReminderNotification.php)** |
+| 发票 Repository（查询逻辑） | [InvoiceRepository.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Repository/InvoiceRepository.php) |
+| 状态机配置 | [workflow.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/config/packages/workflow.php) |
+| 多渠道通知管理器 | [NotificationManager.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/NotificationBundle/Notification/NotificationManager.php) |
+| 用户订阅实体 | [UserNotification.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/NotificationBundle/Entity/UserNotification.php) |
+| 客户提醒模板（HTML） | [reminder.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Resources/views/Email/reminder.html.twig) |
+| 内部逾期通知模板（HTML） | [notification_overdue.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Resources/views/Email/notification_overdue.html.twig) |
 
-| 功能 | 文件 | 关键行 |
-|------|------|--------|
-| 状态枚举 | [InvoiceStatus.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Enum/InvoiceStatus.php#L18-L56) | L25 Overdue 定义 |
-| 到期日字段 | [Invoice.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Entity/Invoice.php#L169-L172) | L169 DATE_IMMUTABLE |
-| 逾期查询 SQL | [InvoiceRepository.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Repository/InvoiceRepository.php#L495-L506) | L500 `due < :now` |
-| 状态机配置 | [workflow.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/config/packages/workflow.php#L76-L78) | L76 `TRANSITION_OVERDUE` |
-| 定时任务（标记逾期） | [MarkOverdueInvoicesCommand.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Command/MarkOverdueInvoicesCommand.php#L33-L33) | L33 `#hourly` |
-| 异步消息（标记逾期） | [MarkInvoiceOverdue.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Message/MarkInvoiceOverdue.php) | 完整文件 |
-| 消息处理器 | [MarkInvoiceOverdueHandler.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Message/Handler/MarkInvoiceOverdueHandler.php#L31-L94) | L68 applyTransition |
-| 状态转换服务 | [InvoiceStatusTransitionService.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Service/InvoiceStatusTransitionService.php#L41-L53) | L47 Workflow::apply |
-| 逾期事件监听器 | [InvoiceOverdueListener.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Listener/InvoiceOverdueListener.php#L30-L68) | L41 事件订阅 |
+---
 
-### 7.2 提醒流程相关
+## 九、核心设计洞察总结
 
-| 功能 | 文件 | 关键行 |
-|------|------|--------|
-| 提醒类型枚举 | [ReminderType.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Entity/ReminderType.php#L16-L22) | 4 种类型定义 |
-| 提醒记录实体 | [InvoiceReminder.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Entity/InvoiceReminder.php#L26-L28) | L28 唯一约束 |
-| 定时任务（发送提醒） | [SendInvoiceRemindersCommand.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Command/SendInvoiceRemindersCommand.php#L45-L55) | L51 天数映射 |
-| 预到期查询 | [InvoiceRepository.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Repository/InvoiceRepository.php#L514-L529) | L516 `+N days` |
-| 逾期提醒查询 | [InvoiceRepository.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Repository/InvoiceRepository.php#L537-L553) | L539 `-N days` |
-| 提醒消息 | [SendInvoiceReminderMessage.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Message/SendInvoiceReminderMessage.php) | 完整文件 |
-| 提醒消息处理器 | [SendInvoiceReminderHandler.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/MessageHandler/SendInvoiceReminderHandler.php#L56-L241) | L67 四层开关 |
-| 客户邮件类 | [InvoiceReminderEmail.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Email/InvoiceReminderEmail.php#L20-L52) | L29-35 模板绑定 |
+### ⚡ 时间粒度
+- **逾期状态**：以自然日为粒度，`due < now()` 确保到期日次日零点后生效
+- **提醒触发**：`due = targetDate` 精确匹配自然日，确保每天只触发一次同类型提醒
+- **执行顺序**：先检查提醒（HH:22），再转换状态（HH:32），因此首次逾期提醒发送时发票状态仍为 Pending
 
-### 7.3 模板与通知
+### ⚡ 主题与紧急程度 — 两条链路本质差异
 
-| 功能 | 文件 | 关键行 |
-|------|------|--------|
-| 客户提醒邮件模板 | [reminder.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Resources/views/Email/reminder.html.twig) | L13-120 分级渲染 |
-| 内部逾期通知模板 | [notification_overdue.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Resources/views/Email/notification_overdue.html.twig) | L13-76 警告样式 |
-| 客户提醒通知类 | [InvoiceReminderNotification.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Notification/InvoiceReminderNotification.php#L24-L99) | L68 主题匹配 |
-| 内部逾期通知类 | [InvoiceOverdueNotification.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/InvoiceBundle/Notification/InvoiceOverdueNotification.php#L24-L64) | L35-37 模板常量 |
+| 特性 | 直发客户邮件 | 内部订阅通知 |
+|------|------------|-----------|
+| **主题生成** | `ReminderSubjectListener` 监听 `MessageEvent` 延迟注入 | `Notification::getSubject()` 对象自身方法返回 |
+| **紧急程度** | 未设置（普通邮件优先级） | `asEmailMessage()` 内显式设置 HIGH / URGENT / MEDIUM |
+| **设计哲学** | 对客户：尊重体验，不标记"紧急"以免反感 | 对内部：明确优先级，确保及时处理 |
 
-### 7.4 多渠道分发
+### ⚡ 多渠道组装
+- 通道字符串格式 `type/transportId` 同时指定了**类型**和**传输器实例**
+- 用户配置的每个传输器通过 UUID 精确路由，支持同一类型多个实例（如两个 Slack 工作区）
+- Email 始终作为独立通道不依赖传输器配置，SMS/Chat/Push/Browser 需额外配置
 
-| 功能 | 文件 | 关键行 |
-|------|------|--------|
-| 通知管理器（核心） | [NotificationManager.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/NotificationBundle/Notification/NotificationManager.php#L47-L103) | L64-86 通道组装 |
-| 通知消息基类 | [NotificationMessage.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/NotificationBundle/Notification/NotificationMessage.php#L26-L80) | L63-79 多接口实现 |
-| 通知属性定义 | [AsNotification.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/NotificationBundle/Attribute/AsNotification.php) | event 名称绑定 |
-| 用户订阅实体 | [UserNotification.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/NotificationBundle/Entity/UserNotification.php) | 事件 + 通道配置 |
-| 配置器接口 | [ConfiguratorInterface.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-SolidInvoice/src/NotificationBundle/Configurator/ConfiguratorInterface.php) | getType() 方法 |
+### ⚡ 幂等性保障
+- `InvoiceReminder` 表的 `(company_id, invoice_id, reminder_type)` 数据库唯一约束
+- 查询层 `LEFT JOIN ... WHERE r.id IS NULL` 提前排除已发送发票
+- 状态转换前的二次确认：`$stateMachine->can($invoice, 'overdue')`
