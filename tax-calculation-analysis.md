@@ -97,9 +97,9 @@ public function calculateTotals(BaseInvoice|Quote $entity): void
 ```php
 private function updateTotal(BaseInvoice|Quote $entity): void
 {
-    $total = BigDecimal::zero();
-    $subTotal = BigDecimal::zero();
-    $tax = BigDecimal::zero();
+    $total = BigDecimal::zero();     // ← 局部变量，从零开始
+    $subTotal = BigDecimal::zero();  // ← 局部变量，从零开始
+    $tax = BigDecimal::zero();       // ← 局部变量，从零开始
 
     foreach ($entity->getLines() as $line) {
         $line->updateTotal();                    // (1) 计算行合计: price × qty
@@ -111,35 +111,19 @@ private function updateTotal(BaseInvoice|Quote $entity): void
         if (($rowTax = $line->getTax()) instanceof Tax) {
             switch ($rowTax->getType()) {
                 case Tax::TYPE_INCLUSIVE:
-                    // (4a) 含税逻辑
-                    $rate = BigDecimal::of((string) $rowTax->getRate());
-                    $divisor = $rate->dividedBy(100, 10, RoundingMode::HalfEven)->plus(1);
-                    $taxAmount = $rowTotal->toBigDecimal()
-                        ->dividedBy($divisor, 2, RoundingMode::HalfEven)
-                        ->minus($rowTotal)
-                        ->negated();
+                    // ...
                     $subTotal = $subTotal->minus($taxAmount);
                     break;
                 case Tax::TYPE_EXCLUSIVE:
-                    // (4b) 不含税逻辑
-                    $rate = BigDecimal::of((string) $rowTax->getRate());
-                    $taxAmount = $rowTotal->toBigDecimal()
-                        ->multipliedBy($rate->dividedBy(100, 10, RoundingMode::HalfEven))
-                        ->toScale(0, RoundingMode::HalfEven);
+                    // ...
                     $total = $total->plus($taxAmount);
                     break;
                 case Tax::TYPE_FLAT_RATE:
-                    // (4c) 固定税率逻辑
-                    $taxAmount = BigDecimal::of((string) $rowTax->getRate())
-                        ->multipliedBy(100)
-                        ->toScale(0, RoundingMode::HalfEven);
+                    // ...
                     $total = $total->plus($taxAmount);
                     break;
-                default:
-                    $taxAmount = BigDecimal::zero();
-                    break;
             }
-            $tax = $tax->plus($taxAmount);       // (5) 累加税额
+            $tax = $tax->plus($taxAmount);
         }
     }
 
@@ -245,7 +229,7 @@ total += taxAmount
 
 ---
 
-## 5. 折扣计算
+## 5. 折扣计算 — 三个核心问题
 
 ### 5.1 折扣模型
 
@@ -255,16 +239,37 @@ total += taxAmount
 - `TYPE_PERCENTAGE` — 百分比折扣
 - `TYPE_MONEY` — 固定金额折扣
 
-### 5.2 折扣计算逻辑
+### 5.2 百分比折扣的基数到底是什么？
 
-**文件**: [Calculator.php](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/MoneyBundle/Calculator.php#L28-L57)
+这是最容易困惑的地方。答案藏在两段代码的**执行时序**中。
 
-折扣在税额计算**之后**应用，且基于 `baseTotal + tax`（即含税小计）：
+**第一步**：[TotalCalculator.updateTotal](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/CoreBundle/Billing/TotalCalculator.php#L99-L106) 循环结束后：
+
+```php
+$entity->setBaseTotal($subTotal);           // 第99行 — 先把 baseTotal 写到实体上
+
+if ($entity->getDiscount()->getValue()) {
+    $total = $this->setDiscount($entity, $total);  // 第102行 — 再算折扣
+}
+
+$entity->setTotal($total);                  // 第105行 — 最后写 total
+$entity->setTax($tax);                      // 第106行 — 最后写 tax
+```
+
+**第二步**：折扣方法 [setDiscount](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/CoreBundle/Billing/TotalCalculator.php#L112-L115) 调用 [Calculator.calculateDiscount](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/MoneyBundle/Calculator.php#L33-L44)：
+
+```php
+private function setDiscount(BaseInvoice|Quote $entity, BigDecimal|BigInteger $total): BigNumber
+{
+    return $total->minus($this->calculator->calculateDiscount($entity));
+}
+```
 
 ```php
 public function calculateDiscount(Quote|BaseInvoice $entity): BigNumber
 {
     $discount = $entity->getDiscount();
+
     $invoiceTotal = $entity->getBaseTotal()->toBigDecimal()->plus($entity->getTax());
 
     if (Discount::TYPE_PERCENTAGE === $discount->getType()) {
@@ -275,9 +280,25 @@ public function calculateDiscount(Quote|BaseInvoice $entity): BigNumber
 }
 ```
 
-（[第 33-44 行](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/MoneyBundle/Calculator.php#L33-L44)）
+**时序真相**：
 
-百分比折扣的计算（[第 49-56 行](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/MoneyBundle/Calculator.php#L49-L56)）：
+| 执行顺序 | 代码 | 实体上的 baseTotal | 实体上的 tax | 实体上的 total |
+|----------|------|--------------------|--------------|----------------|
+| 1 | `$entity->setBaseTotal($subTotal)` | ✅ 新值 | ❌ 旧值（初始 0） | ❌ 旧值 |
+| 2 | `$this->setDiscount($entity, $total)` | ✅ 新值 | ❌ 旧值（初始 0） | ❌ 旧值 |
+| 3 | `$entity->setTax($tax)` | ✅ 新值 | ✅ 新值 | ❌ 旧值 |
+| 4 | `$entity->setTotal($total)` | ✅ 新值 | ✅ 新值 | ✅ 新值 |
+
+**结论**：当 `Calculator.calculateDiscount()` 读取 `$entity->getTax()` 时，第106行的 `setTax()` **尚未执行**，因此 `$entity->getTax()` 返回的还是旧值。
+
+- **首次创建发票**时，[BaseInvoice 构造函数](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/InvoiceBundle/Entity/BaseInvoice.php#L125-L131)将 `tax` 初始化为 `BigDecimal::zero()`，所以 `$entity->getTax()` 返回 **0**。百分比折扣的基数 = `baseTotal + 0` = **baseTotal**。
+- **更新已有发票**时，`$entity->getTax()` 返回的是上一次持久化的旧税额，百分比折扣的基数 = `baseTotal + 旧税额`。
+
+这是一个重要的时序细节——折扣计算时读取的 `tax` 不是本次循环算出的新税额，而是实体上尚未被覆盖的旧值。
+
+### 5.3 百分比折扣的数值处理
+
+**文件**: [Calculator.calculatePercentage](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/MoneyBundle/Calculator.php#L49-L56)
 
 ```php
 public function calculatePercentage(BigNumber|int|string $amount, float $percentage = 0.0): float
@@ -285,6 +306,7 @@ public function calculatePercentage(BigNumber|int|string $amount, float $percent
     if ($percentage > 100) {
         $percentage /= 100;   // 处理用户输入 1500 表示 15% 的情况
     }
+
     return MoneyFormatter::toFloat(
         BigNumber::of($amount)->toBigDecimal()
             ->multipliedBy(BigDecimal::of((string) $percentage)->dividedBy(100, 10, RoundingMode::HalfEven))
@@ -292,83 +314,258 @@ public function calculatePercentage(BigNumber|int|string $amount, float $percent
 }
 ```
 
-### 5.3 折扣应用顺序
+这段代码有一个**隐含约定**：
+- 如果 `percentage > 100`，系统认为用户输入的是"千分位"表示（如输入 1500 意为 15%），会自动除以 100
+- 如果 `percentage <= 100`，系统认为就是百分比值（如输入 15 就是 15%）
 
-在 [TotalCalculator.updateTotal](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/CoreBundle/Billing/TotalCalculator.php#L99-L106) 中：
+最终计算：`discount = amount × (percentage / 100)`
 
-```php
-$entity->setBaseTotal($subTotal);              // 先设置 baseTotal
+### 5.4 含税税率配折扣时，总额为什么会得到现在这个值？
 
-if ($entity->getDiscount()->getValue()) {
-    $total = $this->setDiscount($entity, $total);  // 再从 total 中扣除折扣
-}
+这是最容易困惑的组合场景。我们用测试用例 [testUpdateWithTaxInclAndPercentageDiscount](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/CoreBundle/Tests/Billing/TotalCalculatorTest.php#L199-L225) 逐行推演。
 
-$entity->setTotal($total);                     // 最后设置 total
-$entity->setTax($tax);                         // tax 已在循环中累加完成
+**输入**：
+- price = 15000 (美分), qty = 2
+- tax = Inclusive 20%
+- discount = percentage, value = 1500
+
+**第一步 — 遍历行项目**：
+
+```
+line.updateTotal() → rowTotal = 15000 × 2 = 30000
+
+total   += 30000  → total = 30000
+subTotal += 30000 → subTotal = 30000
 ```
 
-> **关键**: 折扣从 `total`（含税总额）中扣除，但 `baseTotal` 和 `tax` **不受折扣影响** — 它们在折扣之前就已设定。
+**第二步 — 处理 Inclusive 税**：
 
-### 5.4 折扣与税的组合示例
+```
+rate = 20
+divisor = 20/100 + 1 = 1.2
+taxAmount = |30000 / 1.2 - 30000| = |25000 - 30000| = 5000
 
-**Inclusive 税 + 百分比折扣**（来自 [testUpdateWithTaxInclAndPercentageDiscount](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/CoreBundle/Tests/Billing/TotalCalculatorTest.php#L199-L225)）:
-- price=15000, qty=2, rate=20% (Inclusive), discount=1500 (百分比，即 15%)
-- rowTotal = 30000, taxAmount = 5000
-- total = 30000, subTotal = 25000, tax = 5000
-- discount = (baseTotal + tax) × 15% = (25000 + 5000) × 0.15 = 4500 → 但测试断言 total=26250
-- 实际: 30000 × 0.15 = 4500 → total = 30000 - 3750 = 26250 ✓
-  - 注：百分比折扣传入 1500，`> 100` 所以 `percentage /= 100` → 15%
+subTotal -= 5000  → subTotal = 25000   ← 从 subTotal 剥离税额
+tax += 5000       → tax = 5000
+total 不变         → total = 30000       ← Inclusive 税不改 total
+```
 
-**Exclusive 税 + 固定金额折扣**（来自 [testUpdateWithTaxExclAndMonetaryDiscount](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/CoreBundle/Tests/Billing/TotalCalculatorTest.php#L227-L253)）:
-- price=15000, qty=2, rate=20% (Exclusive), discount=80 (固定金额，80 美分)
-- rowTotal = 30000, taxAmount = 6000
-- total = 36000, subTotal = 30000, tax = 6000
-- discount = 80 (美分)
-- total = 36000 - 80 = 35920
+循环结束后局部变量：
+- `total = 30000`
+- `subTotal = 25000`
+- `tax = 5000`
+
+**第三步 — 写入 baseTotal**：
+
+```php
+$entity->setBaseTotal($subTotal);  // entity.baseTotal = 25000
+```
+
+此时实体上的状态：
+- `entity.baseTotal = 25000`（刚写入）
+- `entity.tax = 0`（旧值，因为 setTax 还没执行！）
+
+**第四步 — 计算折扣**：
+
+```php
+$total = $this->setDiscount($entity, $total);
+// 内部调用 Calculator.calculateDiscount($entity)
+```
+
+进入 [Calculator.calculateDiscount](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/MoneyBundle/Calculator.php#L33-L44)：
+
+```php
+$invoiceTotal = $entity->getBaseTotal()->toBigDecimal()->plus($entity->getTax());
+//             = 25000 + 0 = 25000      ← 旧税额是0！
+```
+
+然后因为 `percentage = 1500 > 100`，自动除以 100 → `15`：
+
+```
+discount = 25000 × (15 / 100) = 25000 × 0.15 = 3750
+```
+
+**第五步 — 扣除折扣**：
+
+```
+total = 30000 - 3750 = 26250
+```
+
+**第六步 — 写入剩余字段**：
+
+```php
+$entity->setTotal($total);  // entity.total = 26250
+$entity->setTax($tax);      // entity.tax = 5000
+```
+
+**最终结果**：total = 26250, baseTotal = 25000, tax = 5000 — 与测试断言完全吻合。
+
+**关键理解**：为什么折扣基数是 25000 而不是 30000？因为在折扣计算时 `entity.getTax()` 还没被更新（还是旧值 0），所以 `baseTotal + tax = 25000 + 0 = 25000`。如果 `setTax` 在折扣之前执行，基数就会变成 `25000 + 5000 = 30000`，折扣额 = 4500，total = 25500——但这**不是**当前代码的行为。
+
+### 5.5 Exclusive 税 + 固定金额折扣的推演
+
+测试用例 [testUpdateWithTaxExclAndMonetaryDiscount](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/CoreBundle/Tests/Billing/TotalCalculatorTest.php#L227-L253)
+
+**输入**：
+- price = 15000, qty = 2
+- tax = Exclusive 20%
+- discount = money, value = 80 (80 美分)
+
+**第一步 — 遍历行项目**：
+
+```
+rowTotal = 30000
+total = 30000, subTotal = 30000
+```
+
+**第二步 — Exclusive 税**：
+
+```
+taxAmount = 30000 × 0.20 = 6000
+total += 6000 → total = 36000
+tax += 6000   → tax = 6000
+subTotal 不变  → subTotal = 30000
+```
+
+**第三步 — 写入 baseTotal**：
+
+```
+entity.baseTotal = 30000
+entity.tax 仍是旧值 0
+```
+
+**第四步 — 计算折扣**：
+
+固定金额折扣直接返回 `discount.getValueMoney()` = 80，不走 `baseTotal + tax` 的路径。
+
+**第五步**：
+
+```
+total = 36000 - 80 = 35920
+```
+
+最终：total = 35920, baseTotal = 30000, tax = 6000 ✓
+
+### 5.6 无税 + 百分比折扣的推演
+
+测试用例 [testUpdateWithPercentageDiscount](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/CoreBundle/Tests/Billing/TotalCalculatorTest.php#L80-L100)
+
+**输入**：
+- price = 15000, qty = 2
+- 无税
+- discount = percentage, value = 15
+
+**第一步**：
+
+```
+rowTotal = 30000
+total = 30000, subTotal = 30000, tax = 0
+```
+
+**第二步 — 无税，跳过**
+
+**第三步 — 写入 baseTotal**：
+
+```
+entity.baseTotal = 30000
+entity.tax 旧值 = 0
+```
+
+**第四步 — 折扣**：
+
+```
+invoiceTotal = 30000 + 0 = 30000
+percentage = 15 (不大于100，不除)
+discount = 30000 × (15 / 100) = 4500
+total = 30000 - 4500 = 25500
+```
+
+最终：total = 25500, baseTotal = 30000, tax = 0 ✓
 
 ---
 
-## 6. 完整计算流程图
+## 6. 重新汇总时旧税额会不会被带进去？
+
+### 6.1 答案：不会
+
+[TotalCalculator.updateTotal](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/CoreBundle/Billing/TotalCalculator.php#L60-L63) 在方法开头用**局部变量**从零开始：
+
+```php
+$total = BigDecimal::zero();
+$subTotal = BigDecimal::zero();
+$tax = BigDecimal::zero();
+```
+
+这三个局部变量和实体上已有的 `entity.total`、`entity.baseTotal`、`entity.tax` **完全没有关系**。循环中所有累加都基于局部变量，循环结束后才通过 setter 覆盖实体上的值。
+
+**所以旧税额不可能被带进新计算中**——每次都是从头算。
+
+### 6.2 但有一个微妙之处：折扣计算时读取的旧 tax
+
+如上文 5.2 节分析，虽然循环中算出的新 `tax` 不会混入累加过程，但由于 `setTax()` 在 `setDiscount()` **之后**执行，折扣计算时从实体读取的 `$entity->getTax()` 是旧值。
+
+- **首次创建**：旧值 = 0（构造函数初始化），不影响结果
+- **更新已有发票**（preUpdate 触发）：旧值 = 上次持久化的税额
+
+这意味着在更新场景下，百分比折扣的基数 = `新baseTotal + 旧tax`，而不是 `新baseTotal + 新tax`。这在绝大多数情况下不构成问题（因为发票一旦创建税额很少变化），但严格来说是一个**时序依赖**：如果行项目的税率被修改后更新发票，折扣基数中的 tax 部分仍使用旧值。
+
+---
+
+## 7. 完整计算流程图
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                    遍历每个 Line                              │
-│                                                              │
-│  line.updateTotal()  →  line.total = price × qty            │
-│                                                              │
-│  total   += line.total                                      │
-│  subTotal += line.total                                     │
-│                                                              │
-│  ┌─ line.tax == null ──→ 不做额外操作                        │
-│  │                                                           │
-│  ├─ Inclusive:                                              │
-│  │   divisor = rate/100 + 1                                 │
-│  │   taxAmount = |rowTotal/divisor - rowTotal|              │
-│  │   subTotal -= taxAmount    ← 从小计中剥离税              │
-│  │   tax += taxAmount                                        │
-│  │                                                           │
-│  ├─ Exclusive:                                              │
-│  │   taxAmount = rowTotal × (rate/100)  (四舍五入到整数)     │
-│  │   total += taxAmount       ← 总额加上税                  │
-│  │   tax += taxAmount                                        │
-│  │                                                           │
-│  └─ Flat Rate:                                              │
-│      taxAmount = rate × 100  (主货币→最小单位)               │
-│      total += taxAmount       ← 总额加上税                  │
-│      tax += taxAmount                                        │
-└──────────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌──────────────────────────────────────────────────────────────┐
-│              baseTotal = subTotal  (不含税净额)              │
-│                                                              │
-│              有折扣?  → total -= discount                    │
-│                       折扣基数 = baseTotal + tax             │
-│                                                              │
-│              invoice.total = total                           │
-│              invoice.tax    = tax                            │
-│              invoice.baseTotal = subTotal                    │
-└──────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────┐
+│  updateTotal() 入口                                              │
+│                                                                   │
+│  局部变量 total=0, subTotal=0, tax=0  （与实体旧值无关）          │
+│                                                                   │
+│  ┌─ 遍历每个 Line ──────────────────────────────────────────────┐ │
+│  │                                                               │ │
+│  │  line.updateTotal()  →  line.total = price × qty             │ │
+│  │                                                               │ │
+│  │  total   += line.total                                       │ │
+│  │  subTotal += line.total                                      │ │
+│  │                                                               │ │
+│  │  ┌─ line.tax == null ──→ 不做额外操作                        │ │
+│  │  │                                                            │ │
+│  │  ├─ Inclusive:                                               │ │
+│  │  │   divisor = rate/100 + 1                                  │ │
+│  │  │   taxAmount = |rowTotal/divisor - rowTotal|               │ │
+│  │  │   subTotal -= taxAmount    ← 从小计中剥离税               │ │
+│  │  │   tax += taxAmount                                         │ │
+│  │  │                                                            │ │
+│  │  ├─ Exclusive:                                               │ │
+│  │  │   taxAmount = rowTotal × (rate/100)  (四舍五入到整数)      │ │
+│  │  │   total += taxAmount       ← 总额加上税                   │ │
+│  │  │   tax += taxAmount                                         │ │
+│  │  │                                                            │ │
+│  │  └─ Flat Rate:                                               │ │
+│  │      taxAmount = rate × 100  (主货币→最小单位)                │ │
+│  │      total += taxAmount       ← 总额加上税                   │ │
+│  │      tax += taxAmount                                         │ │
+│  └───────────────────────────────────────────────────────────────┘ │
+│                            │                                      │
+│                            ▼                                      │
+│  entity.setBaseTotal(subTotal)   →  实体 baseTotal = 新值        │
+│  (此时 entity.tax 仍是旧值)                                       │
+│                            │                                      │
+│                            ▼                                      │
+│  ┌─ 有折扣? ───────────────────────────────────────────────────┐  │
+│  │                                                              │  │
+│  │  百分比折扣:                                                 │  │
+│  │    base = entity.baseTotal + entity.tax  ← tax 是旧值!      │  │
+│  │    discount = base × (percentage/100)                        │  │
+│  │                                                              │  │
+│  │  固定金额折扣:                                               │  │
+│  │    discount = discount.valueMoney                            │  │
+│  │                                                              │  │
+│  │  total = total - discount                                    │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│                            │                                      │
+│                            ▼                                      │
+│  entity.setTotal(total)          →  实体 total = 新值            │
+│  entity.setTax(tax)              →  实体 tax = 新值（最后写入）  │
+└───────────────────────────────────────────────────────────────────┘
                            │
                            ▼
 ┌──────────────────────────────────────────────────────────────┐
@@ -379,9 +576,99 @@ $entity->setTax($tax);                         // tax 已在循环中累加完�
 
 ---
 
-## 7. 触发时机
+## 8. 所有测试用例逐步验证
 
-### 7.1 Doctrine 生命周期监听
+以下用表格形式逐一验证 [TotalCalculatorTest](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/CoreBundle/Tests/Billing/TotalCalculatorTest.php#L34-L334) 中的每个场景，所有金额单位为最小货币单位（美分）。
+
+### 8.1 testUpdateWithSingleItem (第44行)
+
+| 步骤 | 计算 | total | subTotal | tax |
+|------|------|-------|----------|-----|
+| 行循环 | price=15000, qty=1, 无税 | 15000 | 15000 | 0 |
+| setBaseTotal | | | 15000→entity | |
+| 折扣 | 无 | | | |
+| 结果 | | **15000** | **15000** | **0** |
+
+断言: total=15000 ✓, balance=15000 ✓, baseTotal=15000 ✓
+
+### 8.2 testUpdateWithSingleItemAndMultipleQtys (第62行)
+
+| 步骤 | 计算 | total | subTotal | tax |
+|------|------|-------|----------|-----|
+| 行循环 | price=15000, qty=2, 无税 | 30000 | 30000 | 0 |
+| 结果 | | **30000** | **30000** | **0** |
+
+### 8.3 testUpdateWithPercentageDiscount (第80行)
+
+| 步骤 | 计算 | total | subTotal | tax |
+|------|------|-------|----------|-----|
+| 行循环 | price=15000, qty=2, 无税 | 30000 | 30000 | 0 |
+| setBaseTotal | entity.baseTotal=30000 | | | |
+| 折扣 | base=30000+0=30000, 15%→4500 | 30000-4500=25500 | | |
+| 结果 | | **25500** | **30000** | **0** |
+
+### 8.4 testUpdateWithMonetaryDiscount (第102行)
+
+| 步骤 | 计算 | total | subTotal | tax |
+|------|------|-------|----------|-----|
+| 行循环 | price=15000, qty=2, 无税 | 30000 | 30000 | 0 |
+| 折扣 | 固定金额=80 | 30000-80=29920 | | |
+| 结果 | | **29920** | **30000** | **0** |
+
+### 8.5 testUpdateWithTaxIncl (第124行)
+
+| 步骤 | 计算 | total | subTotal | tax |
+|------|------|-------|----------|-----|
+| 行循环 | price=15000, qty=2, Inclusive 20% | 30000 | 30000 | 0 |
+| 税处理 | divisor=1.2, taxAmount=5000 | 30000 | 25000 | 5000 |
+| 无折扣 | | | | |
+| 结果 | | **30000** | **25000** | **5000** |
+
+### 8.6 testUpdateWithTaxFlat (第149行)
+
+| 步骤 | 计算 | total | subTotal | tax |
+|------|------|-------|----------|-----|
+| 行循环 | price=15000, qty=2, Flat Rate 2 | 30000 | 30000 | 0 |
+| 税处理 | taxAmount=2×100=200 | 30200 | 30000 | 200 |
+| 结果 | | **30200** | **30000** | **200** |
+
+### 8.7 testUpdateWithTaxExcl (第174行)
+
+| 步骤 | 计算 | total | subTotal | tax |
+|------|------|-------|----------|-----|
+| 行循环 | price=15000, qty=2, Exclusive 20% | 30000 | 30000 | 0 |
+| 税处理 | taxAmount=30000×0.20=6000 | 36000 | 30000 | 6000 |
+| 结果 | | **36000** | **30000** | **6000** |
+
+### 8.8 testUpdateWithTaxInclAndPercentageDiscount (第199行) ⭐ 重点
+
+| 步骤 | 计算 | total(局部) | subTotal(局部) | tax(局部) | entity.baseTotal | entity.tax |
+|------|------|------------|---------------|-----------|-----------------|------------|
+| 初始 | | 0 | 0 | 0 | 0 | 0 |
+| 行循环 | rowTotal=30000 | 30000 | 30000 | 0 | | |
+| Inclusive | taxAmount=5000 | 30000 | 25000 | 5000 | | |
+| setBaseTotal | | | | | **25000** | 0(旧) |
+| 折扣 | base=25000+0=25000, 1500→15%→3750 | **26250** | | | | |
+| setTotal | | | | | | |
+| setTax | | | | | | **5000** |
+| **最终** | | **26250** | **25000** | **5000** | | |
+
+断言: total=26250 ✓, balance=26250 ✓, baseTotal=25000 ✓, tax=5000 ✓
+
+### 8.9 testUpdateWithTaxExclAndMonetaryDiscount (第227行)
+
+| 步骤 | 计算 | total | subTotal | tax |
+|------|------|-------|----------|-----|
+| 行循环 | rowTotal=30000, Exclusive 20% | 36000 | 30000 | 6000 |
+| setBaseTotal | entity.baseTotal=30000 | | | |
+| 折扣 | 固定金额=80 | 36000-80=35920 | | |
+| 结果 | | **35920** | **30000** | **6000** |
+
+---
+
+## 9. 触发时机
+
+### 9.1 Doctrine 生命周期监听
 
 **文件**: [InvoiceSaveListener.php](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/InvoiceBundle/Listener/Doctrine/InvoiceSaveListener.php#L29-L76)
 
@@ -406,7 +693,7 @@ final class InvoiceSaveListener
 
 每当 `BaseInvoice`（包括 `Invoice` 和 `RecurringInvoice`）被持久化或更新时，自动重新计算所有金额。
 
-### 7.2 MCP 工具调用
+### 9.2 MCP 工具调用
 
 **文件**: [InvoiceWriteTools.php](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/InvoiceBundle/Mcp/InvoiceWriteTools.php#L88-L159)
 
@@ -417,7 +704,7 @@ $this->totalCalculator->calculateTotals($invoice);
 $invoice = $this->invoiceManager->create($invoice);
 ```
 
-### 7.3 行项目构建
+### 9.3 行项目构建
 
 **文件**: [LineItemBuilder.php](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/McpBundle/Mcp/Tool/LineItemBuilder.php#L117-L175)
 
@@ -434,9 +721,9 @@ if (\is_string($taxId) && $taxId !== '') {
 
 ---
 
-## 8. 数值精度与舍入策略
+## 10. 数值精度与舍入策略
 
-### 8.1 金额存储
+### 10.1 金额存储
 
 所有金额以**最小货币单位**（如美分）存储为整数，使用 `Brick\Math\BigNumber` 确保无浮点精度损失。
 
@@ -444,7 +731,7 @@ if (\is_string($taxId) && $taxId !== '') {
 - `Line.total`: BigInteger（price × qty 的结果）
 - `BaseInvoice.total/baseTotal/tax`: BigInteger
 
-### 8.2 舍入模式
+### 10.2 舍入模式
 
 全局使用 `RoundingMode::HalfEven`（银行家舍入），即"四舍六入五成双"：
 - 0.5 → 向最近的偶数舍入
@@ -459,7 +746,7 @@ if (\is_string($taxId) && $taxId !== '') {
 | Flat Rate 税额 | `toScale(0, HalfEven)` → 舍入到整数美分 |
 | 折扣百分比中间计算 | `dividedBy(100, 10, HalfEven)` → 保留 10 位小数 |
 
-### 8.3 舍入问题修复
+### 10.3 舍入问题修复
 
 测试文件 [testUpdateWithTaxExclRoundingIssue](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/CoreBundle/Tests/Billing/TotalCalculatorTest.php#L292-L333) 记录了 issue #1824 的修复：
 - 3.32 EUR × 21% = 0.6972 → 舍入为 0.70 EUR (70 美分)
@@ -467,7 +754,7 @@ if (\is_string($taxId) && $taxId !== '') {
 
 ---
 
-## 9. Quote 的税务计算
+## 11. Quote 的税务计算
 
 **文件**: [QuoteBundle/Line.php](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/QuoteBundle/Entity/Line.php#L86-L255)
 
@@ -477,7 +764,7 @@ if (\is_string($taxId) && $taxId !== '') {
 
 ---
 
-## 10. 从 Quote/RecurringInvoice 创建 Invoice 时的税务传递
+## 12. 从 Quote/RecurringInvoice 创建 Invoice 时的税务传递
 
 **文件**: [InvoiceManager.php](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/InvoiceBundle/Manager/InvoiceManager.php#L105-L149)
 
@@ -507,7 +794,7 @@ if (null !== $object->getTax()) {
 
 ---
 
-## 11. 最终金额关系总结
+## 13. 最终金额关系总结
 
 ### 无折扣时
 
@@ -522,9 +809,15 @@ if (null !== $object->getTax()) {
 
 ```
 total = total_含税 - discount
-baseTotal 和 tax 不受折扣影响
-discount = (baseTotal + tax) × percentage%   (百分比折扣)
-discount = 固定金额                            (金额折扣)
+
+百分比折扣:
+  首次创建时: discount = baseTotal × (percentage/100)
+  更新时:     discount = (baseTotal + 旧tax) × (percentage/100)
+
+固定金额折扣:
+  discount = 固定金额值
+
+baseTotal 和 新tax 不受折扣影响
 ```
 
 ### 余额计算（仅 Invoice）
@@ -535,7 +828,7 @@ balance = total - totalPaid
 
 ---
 
-## 12. 关键设计洞察
+## 14. 关键设计洞察
 
 1. **税在行级别配置，在发票级别汇总**: 每个 Line 关联一个 Tax 对象，但税额在 TotalCalculator 中统一计算和累加，不存在"行级税额"的持久化字段。
 
@@ -543,8 +836,10 @@ balance = total - totalPaid
 
 3. **Inclusive 税的特殊处理**: 含税价模式下，`total`（应付总额）不变，而是从 `baseTotal`（净额）中反推剥离税额。这保证了消费者看到的总价不变，同时在财务报表中能正确显示税额和税前净额。
 
-4. **折扣基于含税金额**: 折扣的计算基数是 `baseTotal + tax`，即含税总额。折扣只影响 `total`，不影响 `baseTotal` 和 `tax`。
+4. **折扣基数的时序依赖**: 百分比折扣的基数是 `entity.baseTotal + entity.tax`，但由于 `setTax()` 在折扣计算之后才执行，折扣读取的 `tax` 是旧值。首次创建时旧值为 0，更新时为上次持久化的值。这是一个隐含的设计决策。
 
-5. **精度保障**: 使用 `Brick\Math` 库的任意精度运算，避免浮点误差。所有中间计算保留充足精度（10 位小数），仅在最终结果时按银行家舍入法舍入。
+5. **重新计算不会残留旧值**: `updateTotal()` 用局部变量从零累加，完全覆盖实体上的旧值，不存在旧税额混入新计算的风险。唯一需要注意的是上条提到的折扣基数时序问题。
 
-6. **自动化触发**: 通过 Doctrine 生命周期监听器，在 `prePersist` 和 `preUpdate` 时自动重新计算，确保数据一致性。
+6. **精度保障**: 使用 `Brick\Math` 库的任意精度运算，避免浮点误差。所有中间计算保留充足精度（10 位小数），仅在最终结果时按银行家舍入法舍入。
+
+7. **自动化触发**: 通过 Doctrine 生命周期监听器，在 `prePersist` 和 `preUpdate` 时自动重新计算，确保数据一致性。
