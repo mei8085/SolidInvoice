@@ -138,8 +138,8 @@ return (string) ($lastId + 1);
 ```
 
 **关键细节**：
-- 执行查询前**临时禁用 `archivable` 过滤器**（软删除过滤器），确保已归档的发票也被计入最大值
-- 若配置了前缀/后缀，使用 `SUBSTRING()` SQL 函数截取中间的纯数字部分再做 MAX 计算（[第 76-79 行](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/CoreBundle/Generator/BillingIdGenerator/AutoIncrementIdGenerator.php#L76-L79)）
+- **归档过滤器开关方式**：查询前通过 `$filters->disable('archivable')` 禁用（[第 51 行](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/CoreBundle/Generator/BillingIdGenerator/AutoIncrementIdGenerator.php#L51)），查询后在 `finally` 块中通过 `$filters->enable('archivable')` 恢复（[第 79 行](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/CoreBundle/Generator/BillingIdGenerator/AutoIncrementIdGenerator.php#L79)）。**注意**：此处使用的是 `disable/enable` 而非 `suspend/restore`（后者仅在 [ArchivableFilter::disableForGrid()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/CoreBundle/Doctrine/Filter/ArchivableFilter.php#L28-L37) DataGrid 查询场景中使用）
+- 若配置了前缀/后缀，使用 `SUBSTRING()` SQL 函数截取中间的纯数字部分再做 MAX 计算（[第 60-68 行](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/CoreBundle/Generator/BillingIdGenerator/AutoIncrementIdGenerator.php#L60-L68)）
 - 捕获 `NonUniqueResultException|NoResultException`，异常时降级为 0
 - **无任何锁机制**，纯 SELECT MAX + 自增，存在 TOCTOU 竞态
 
