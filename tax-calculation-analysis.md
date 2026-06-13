@@ -333,11 +333,125 @@ public function calculatePercentage(BigNumber|int|string $amount, float $percent
 
 **关键理解**：折扣基数是 `baseTotal + entity.tax`，但 `entity.tax` 在折扣计算时还是旧值（新建时为 0），所以基数 = 25000 + 0 = 25000。
 
+### 4.5 百分比折扣完整生命周期 — 从算出数值到落库取整（⭐ 新增）
+
+百分比折扣对总额的影响经历 **4 个阶段**。每个阶段的数值变化如下：
+
+```
+算出折扣数值  →  从总额中扣除  →  挂回实体对象  →  落库取整
+   (Calculator)   (setDiscount)    (setter)       (BigIntegerType)
+```
+
+#### 阶段 1：算出折扣数值
+
+**文件**: [Calculator.calculateDiscount](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/MoneyBundle/Calculator.php#L33-L44) + [Calculator.calculatePercentage](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/MoneyBundle/Calculator.php#L49-L56)
+
+```php
+// 第37行: 计算基数 = 新baseTotal + entity.tax(旧值!)
+$invoiceTotal = $entity->getBaseTotal()->toBigDecimal()->plus($entity->getTax());
+
+// 第40行: 调用 calculatePercentage 算出折扣额
+return BigDecimal::of((string) $this->calculatePercentage($invoiceTotal, $discount->getValue()));
+```
+
+`calculatePercentage` 内部：
+- 若 `percentage > 100`，自动除以 100（千分位约定：输入 1500 表示 15%）
+- `折扣率 = percentage / 100`，除法保留 10 位小数精度
+- `折扣额 = 基数 × 折扣率`
+- 结果先转 float，再转 string，最后转 BigDecimal 返回
+
+> **注意 float 中转**：`calculatePercentage` 返回 `float`，然后 `BigDecimal::of((string) $floatValue)` 转回 BigDecimal。由于中间有一次 float 转换，极端精度场景下可能有微小误差，但在实际金额（整数美分）场景中可以忽略。
+
+#### 阶段 2：从总额中扣除
+
+**文件**: [TotalCalculator.setDiscount](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/CoreBundle/Billing/TotalCalculator.php#L112-L115)
+
+```php
+private function setDiscount(BaseInvoice|Quote $entity, BigDecimal|BigInteger $total): BigNumber
+{
+    return $total->minus($this->calculator->calculateDiscount($entity));
+}
+```
+
+- 输入 `$total` 是局部变量，代表**含税总额**（所有行项目 + 所有税额）
+- 减去折扣额后，返回扣完折扣的新 total
+- 这一步是总额**真正减少**的地方
+
+#### 阶段 3：挂回实体对象
+
+**文件**: [TotalCalculator.updateTotal](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/CoreBundle/Billing/TotalCalculator.php#L99-L106) + [BaseInvoice.setTotal](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/InvoiceBundle/Entity/BaseInvoice.php#L141-L146)
+
+```php
+$entity->setTotal($total);    // 第105行: 写回实体
+$entity->setTax($tax);        // 第106行: 税额写回（在折扣之后！）
+```
+
+setter 内部：
+```php
+$this->total = BigNumber::of($total);  // 用 BigNumber 包装，不改变数值
+```
+
+这一步只是把局部计算结果存入实体属性，**数值本身不变**。
+
+#### 阶段 4：落库取整
+
+**文件**: [BigIntegerType.convertToDatabaseValue](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/CoreBundle/Doctrine/Type/BigIntegerType.php#L50-L65)
+
+```php
+return $value->toScale(0, RoundingMode::HalfEven)->toInt();
+```
+
+Doctrine 持久化时，通过自定义类型 `BigIntegerType` 转换：
+1. `toScale(0, RoundingMode::HalfEven)` — **银行家舍入**到 0 位小数（即整数美分）
+2. `toInt()` — 转成整型存入数据库
+
+> **何时会有小数？**
+> - Inclusive 税的 `dividedBy(..., 2, HalfEven)` 保留 2 位小数，所以 subTotal/tax 可能有小数
+> - 百分比折扣的中间计算精度很高，但最终结果通常是整数
+> - 如果总额本身有小数，落库时会被取整
+
+#### 完整生命周期示例追踪
+
+**场景**：price=15000, qty=2, Inclusive 20%, 百分比折扣 15%（即 1500 千分位）
+
+| 阶段 | 操作 | total 值 | 说明 |
+|------|------|----------|------|
+| 行循环结束 | 累加 line.total + Inclusive 税处理 | 30000（整数） | total 是含税价，不变；subTotal 减了 5000 税 |
+| 阶段1：算出折扣 | 基数=25000+0=25000, 折扣=25000×15%=3750 | — | 折扣额 = 3750 |
+| 阶段2：从总额扣除 | total = 30000 - 3750 | **26250** | 总额真正减少 3750 |
+| 阶段3：挂回对象 | entity.setTotal(26250) | 26250 | 数值不变，只是存入实体 |
+| 阶段4：落库取整 | toScale(0, HalfEven) → toInt() | 26250 | 已是整数，无变化 |
+
+**有小数的场景**：price=1000, qty=1, Inclusive 3%, 百分比折扣 10%
+
+| 阶段 | 操作 | total 值 | subTotal 值 | tax 值 |
+|------|------|----------|-------------|--------|
+| 行循环结束 | divisor=1.03, taxAmount=29.13 | 1000 | 970.87 | 29.13 |
+| 阶段1：算折扣 | 基数=970.87 + 0(旧) = 970.87, 折扣=97.087 | — | | |
+| 阶段2：扣折扣 | total = 1000 - 97.087 | **902.913** | | |
+| 阶段3：挂回对象 | entity.setTotal(902.913) | 902.913 | 970.87 | 29.13 |
+| 阶段4：落库取整 | toScale(0, HalfEven) | **903**（四舍五入） | 971 | 29 |
+
+> 注意：落库时 total、baseTotal、tax 三个字段**各自独立取整**，可能出现 `baseTotal + tax ≠ total` 的微小偏差（1 美分以内），这是银行家舍入的正常现象。
+
 ---
 
 ## 5. 七大创建路径中税额的预赋值与折扣基数分析（⭐ 新章节）
 
 在 SolidInvoice 中，创建 Invoice 的代码路径共有 **7 条**。每条路径在调用 `calculateTotals()` 之前，对 `entity.tax`、`entity.baseTotal`、`entity.total` 的预赋值行为都不同，这直接影响百分比折扣的计算基数。
+
+### 5.0 两类路径总览
+
+所有路径可分为 **两大类别**：
+
+| 类别 | 特点 | 代表路径 | 折扣基数是否可能有偏差 |
+|------|------|---------|----------------------|
+| **A. 创建时直接带旧税额** | 新 Invoice 从**另一个已有实体**复制 tax 值过来，创建时就有非零税额 | Quote 转换、RecurringInvoice 转换、克隆 | 行项目不变时无偏差；行项目改动后有偏差 |
+| **B. 后期修正流程** | 初始 tax=0 或由 DTO 传入，税额通过 calculateTotals 逐步计算得出 | MCP API、传统表单创建、Live 组件、编辑已有发票、DummyData、removeTax | 首次计算有偏差；后续计算逐步修正 |
+
+**核心区别**：
+- **A 类**：税额是"继承"来的，来源是另一个实体的持久化值
+- **B 类**：税额是"算出来"的，经过 0 → 第一次计算 → 第二次计算 → 最终落库的修正过程
 
 ### 路径总览表
 
