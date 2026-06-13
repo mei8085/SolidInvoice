@@ -1001,10 +1001,227 @@ balance = total - totalPaid
 
 4. **回写顺序是设计关键**: `setBaseTotal → 折扣计算 → setTotal → setTax` 的顺序导致折扣计算时 `entity.tax` 仍为旧值。这不是 bug，而是有意识的实现决策——但在不同创建路径下行为不一致。
 
-5. **7 条创建路径行为不统一**: 从 MCP API 创建时 tax 预赋值为 0，从 Live 组件提交时 tax 预赋值为上次渲染算出的值，从 Quote 转换时为源对象的税额，从传统表单首次提交时为 0。百分比折扣的实际基数因此不同。
+5. **7 条创建路径分两大类**:
+   - **A 类（创建时带旧税额）**: Quote/RecurringInvoice 转换、克隆 —— 税额从源实体"继承"而来，行项目不变时折扣基数正确
+   - **B 类（后期修正流程）**: MCP API、传统表单、Live 组件、DummyData、removeTax —— 初始 tax=0 或手动值，经过多次 calculateTotals 逐步修正到正确值
 
 6. **重新计算不会残留旧值**: `updateTotal()` 用局部变量从零累加，完全覆盖实体上的旧值。唯一的"旧值影响"是折扣基数读取的 `entity.tax`。
 
-7. **精度保障**: 使用 `Brick\Math` 库的任意精度运算，中间计算保留充足精度，仅在最终结果时按银行家舍入法舍入。
+7. **折扣生命周期四阶段**: 算出数值（Calculator）→ 从总额扣除（setDiscount）→ 挂回实体（setter）→ 落库取整（BigIntegerType）。只有第 2 阶段真正改变了总额数值，其他阶段只是传递或取整。
 
-8. **自动化触发**: 通过 Doctrine 生命周期监听器在 `prePersist` 和 `preUpdate` 时自动重新计算，确保数据一致性。但在 MCP 等路径中会出现 calculateTotals 被调用两次的情况（显式+监听）。
+8. **落库时独立取整**: total、baseTotal、tax 三个字段在持久化时各自独立调用 `toScale(0, HalfEven)` 取整，可能出现 `round(baseTotal) + round(tax) ≠ round(total)` 的 1 美分偏差，属正常现象。
+
+9. **精度保障**: 使用 `Brick\Math` 库的任意精度运算，中间计算保留充足精度，仅在最终结果和落库时按银行家舍入法舍入。
+
+10. **自动化触发**: 通过 Doctrine 生命周期监听器在 `prePersist` 和 `preUpdate` 时自动重新计算，确保数据一致性。但在 MCP 等路径中会出现 calculateTotals 被调用两次的情况（显式+监听）。
+
+---
+
+## 13. 三个关键问题的深入澄清（⭐ 新增章节）
+
+### 13.1 问题一：传统表单单次调用 vs MCP 两次调用 — 折扣基数是否系统性偏小？
+
+#### 核心发现："传统表单"其实用的是 Live 组件，DTO.tax 已被刷新
+
+模板 [create.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/InvoiceBundle/Resources/views/Default/create.html.twig#L18) 第 18 行：
+
+```twig
+<twig:CreateInvoice :form="form" :dto="dto" :isEdit="isEdit" :invoice="invoice|default(null)" />
+```
+
+也就是说，**浏览器正常用户走的不是 Create 控制器的 HTTP form 提交分支，而是 Live 组件的 AJAX 提交**。Live 组件每次用户操作都会触发 `PreReRender(priority -10)`，在 [CreateInvoice.calculateTotals](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/InvoiceBundle/Twig/Components/CreateInvoice.php#L117-L136) 中：
+1. 建临时 Invoice 并 calculateTotals
+2. 把算出的 `total/baseTotal/tax` 写回 DTO（第 133-135 行）
+
+**所以最终提交时，DTO.tax 已经是「上次 PreReRender 算出的正确税额」，不是默认 '0'。**
+
+#### 两条真正的代码路径对比
+
+| 路径 | 场景 | calculateTotals 调用次数 | 进入 prePersist 时 entity.tax | 折扣基数偏差 |
+|------|------|------------------------|-------------------------------|-------------|
+| **Live 组件提交**（正常用户） | 浏览器 JS 正常，走 AJAX | 多次 PreReRender + prePersist 1 次 | 上次 PreReRender 算出的税额 ≈ 新税 | **几乎无偏差** |
+| **Create 控制器 HTTP 提交**（JS 禁用 fallback） | JS 被禁用或 Live 组件失效 | 仅 prePersist 1 次 | DTO 默认值 '0' | **有偏差（tax 部分缺失）** |
+| **MCP API 创建** | 系统 API 调用 | 显式 1 次 + prePersist 1 次 = 2 次 | 第 1 次：0 → 第 2 次：第 1 次算出的税 | 第 1 次有偏差，**第 2 次自收敛** |
+
+#### MCP "自收敛"的完整时序
+
+```
+显式调用 calculateTotals（L154）
+  ├─ 循环算税 → 局部 tax=5000
+  ├─ setBaseTotal(25000)
+  ├─ 算折扣: base=25000 + entity.tax(0!) = 25000  ← ⚠️ 有偏差
+  ├─ setTotal(26250)
+  └─ setTax(5000)   ← 写回正确税额（BigDecimal，尚未取整）
+
+persist → prePersist 触发 InvoiceSaveListener
+  └─ 第二次 calculateTotals
+      ├─ 循环算税 → 局部 tax=5000（与上次相同）
+      ├─ setBaseTotal(25000)
+      ├─ 算折扣: base=25000 + entity.tax(5000!) = 30000  ← ✅ 已修正
+      ├─ setTotal(30000 - 4500 = 25500)
+      └─ setTax(5000)
+```
+
+**结论**：MCP 两次调用确实会让折扣基数"自己收敛"（从 25000 → 30000）。但 Live 组件正常路径因为 PreReRender 先刷过 DTO.tax，prePersist 时已经是正确值，不需要"收敛"。**只有 JS 禁用的 Create 控制器 fallback 路径才会出现「单次调用 + DTO.tax='0'」导致折扣基数系统性偏小。** 在实际生产中这个路径几乎不被使用。
+
+---
+
+### 13.2 问题二：两次调用之间 entity.tax 是 BigDecimal 还是已取整整数？取整时点在哪？
+
+#### Doctrine flush 精确时序
+
+Doctrine ORM 在 `flush()` 时的执行顺序是：
+
+```
+flush() 被调用
+  │
+  ▼
+1. 遍历所有 NEW/MANAGED 实体
+  │
+  ▼
+2. 触发生命周期事件（prePersist / preUpdate）
+  │   └─ InvoiceSaveListener 调用 calculateTotals()
+  │       └─ setTax($tax)  ← 写的是内存 BigDecimal 对象，可能带小数
+  │
+  ▼
+3. 计算 changeset（对比实体原始值和当前值）
+  │   └─ 对每个字段调用 Type::convertToDatabaseValue()
+  │       └─ BigIntegerType: $value->toScale(0, HalfEven)->toInt()
+  │           ← 【★ 取整在这里才发生！】
+  │
+  ▼
+4. 生成 INSERT / UPDATE SQL（使用取整后的 int 值）
+  │
+  ▼
+5. 执行 SQL
+  │
+  ▼
+6. 触发 postPersist / postUpdate 事件
+```
+
+**关键结论**：
+1. **在 calculateTotals 执行过程中，entity.tax 始终是内存中的 BigNumber/BigDecimal 对象**，可能保留 2 位小数（Inclusive 税场景）
+2. **取整发生在所有生命周期事件之后、SQL 生成之前**
+3. MCP 路径中两次 calculateTotals 调用之间**没有 flush**，所以中间夹着的 entity.tax 是**内存 BigDecimal，尚未取整**
+
+#### 完整 MCP 时序+取整演示
+
+场景：price=15000, qty=2, Inclusive 20%, 15% 折扣（MCP 传 discount_value=1500 经过 DiscountTransformer 约定）
+
+```
+显式 calculateTotals（L154）
+  ├─ subTotal = 25000, tax = 5000, total_before_discount = 30000
+  ├─ setBaseTotal(25000)
+  ├─ 折扣: base = 25000 + 0(构造函数值) = 25000
+  │        discount = 25000 × 15% = 3750
+  │        total = 30000 - 3750 = 26250
+  ├─ setTotal(26250)        ← 内存 BigNumber，整数
+  └─ setTax(5000)           ← 内存 BigNumber，整数（本次为整数，可能带小数）
+        │
+        ▼ 无 flush，entity.tax 仍是内存 BigDecimal 5000
+
+invoiceManager->create() -> persist()
+  │
+  ▼
+prePersist -> InvoiceSaveListener -> 第二次 calculateTotals
+  ├─ subTotal = 25000, tax = 5000, total_before_discount = 30000
+  ├─ setBaseTotal(25000)
+  ├─ 折扣: base = 25000 + 5000(上次写入的值!) = 30000  ← 已自收敛
+  │        discount = 30000 × 15% = 4500
+  │        total = 30000 - 4500 = 25500
+  ├─ setTotal(25500)
+  └─ setTax(5000)           ← 仍是内存 BigDecimal
+
+flush() 发生在 prePersist 之后
+  │
+  ▼
+UnitOfWork computeChangeSet
+  ├─ total: convertToDatabaseValue(25500) → toScale(0) → (int)25500
+  ├─ baseTotal: convertToDatabaseValue(25000) → (int)25000
+  └─ tax: convertToDatabaseValue(5000) → (int)5000
+        │
+        ▼
+INSERT SQL（三个整数）
+
+最终落库: total=25500, baseTotal=25000, tax=5000 ✅
+```
+
+**MCP 最终结果正确**——第二次 calculateTotals 已自收敛，取整只是最后一步把内存 BigNumber 转为 int，不改变数值（如果是整数的话）。
+
+> **有小数场景**：如果 Inclusive 税算出的 tax 是 29.13（保留 2 位小数），那么：
+> - calculateTotals 内部 setTax(29.13) — 内存 BigDecimal
+> - flush 时 convertToDatabaseValue(29.13) → 29（HalfEven 取整）
+> - 落库值是 29，与内存值可能差 ±0.5 美分以内
+
+---
+
+### 13.3 问题三：`percentage > 100 就除以 100` 分支的真实语义
+
+#### 文档此前解读不准确，真实链路是「表单整数化约定」
+
+此前文档将此标为"千分位约定"，这个说法不准确。完整调用链路如下：
+
+##### 链路 A：表单（浏览器用户）路径
+
+**关键文件**: [DiscountTransformer](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/CoreBundle/Form/Transformer/DiscountTransformer.php#L27-L60)
+
+```
+前端用户输入: "15" （表示 15%）
+    │
+    ▼
+DiscountTransformer.reverseTransform()   （表单提交时，L52-L59）
+    BigNumber::of('15')->multipliedBy(100) = 1500
+    │
+    ▼
+Discount.setValue(1500)                   （L100-L115 of Discount.php）
+    case TYPE_PERCENTAGE:
+        setValuePercentage(1500.0)         ← Discount.valuePercentage = 1500.0
+        setValueMoney(0)
+    │
+    ▼
+Calculator.calculateDiscount() 调用 getValue()   （L90 of Discount.php）
+    match TYPE_PERCENTAGE => getValuePercentage() = 1500.0
+    │
+    ▼
+Calculator.calculatePercentage(amount, 1500.0)    （L49-L56 of Calculator.php）
+    if (1500 > 100) { 1500 /= 100; }  ← percentage = 15.0  ✅ 还原为 15%
+    return amount × (15.0 / 100) = amount × 0.15
+```
+
+##### 链路 B：API/程序内部直接调用
+
+**关键文件**: [LineItemBuilder.buildDiscount](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/McpBundle/Mcp/Tool/LineItemBuilder.php#L82-L86)、[CalculatorTest.testCalculateDiscount](file:///d:/fz/0601-1/solo-dogfeeding/code/48-SolidInvoice/src/MoneyBundle/Tests/CalculatorTest.php#L29-L40)
+
+```php
+// MCP API 路径: 直接 setValuePercentage((float)$value)
+// 测试: discount_value = 10，表示 10%
+$discount->setValuePercentage((float)10);  // = 10.0
+
+// CalculatorTest.testCalculateDiscount L35:
+$discount->setValue(10);  // 直接传 10
+```
+
+这种情况下 `getValuePercentage() = 10.0`，`calculatePercentage(amount, 10.0)` 中 10 ≤ 100，直接用 `10 / 100 = 0.10`。
+
+#### 正确解读
+
+`percentage > 100 时除以 100` **不是容错，也不是千分位约定，而是「表单层把百分比乘以 100 存成整数」的桥接逻辑**：
+
+| 约定类型 | 说明 | 是否准确 |
+|---------|------|---------|
+| ❌ 千分位约定 | 千分位通常是 ×1000（存 15000 表示 15%），与代码 ÷100 不匹配 | 不准确 |
+| ❌ 容错逻辑 | 容错是"用户输错了，系统猜一个合理值"，但这是链路 A/B 两条路径的有意设计 | 不准确 |
+| ✅ 表单整数化约定 | 表单层把用户输入的百分比 ×100 存整数避免浮点精度问题；Calculator 用时 ÷100 还原。链路 B 直接传小数/整数 ≤100，不需要还原。 | **准确** |
+
+> 为什么要这么做？因为用户输入 15.3 这样的百分比时，用 float 存储可能有 IEEE 754 精度损失。表单层把它乘以 100 变成 1530（整数）存储，用时再还原，是一种精度保护手段。
+
+#### 两条链路传入的 percentage 值范围对比
+
+| 入口 | 用户/调用方传入 | 中间处理 | 传入 calculatePercentage 的值 | >100 分支是否触发 |
+|------|---------------|---------|------------------------------|------------------|
+| 表单（链路 A） | "15"（用户输入） | ×100 → 1500 | 1500.0 | ✅ 是，÷100 → 15.0 |
+| MCP API（链路 B） | discount_value=10（调用方传 10 表示 10%） | 直接 setValuePercentage(10.0) | 10.0 | ❌ 否 |
+| 程序直接 setValue(15)（链路 B） | 15（开发者传 15 表示 15%） | setValuePercentage(15.0) | 15.0 | ❌ 否 |
+| DummyData/测试 | 1500（测试模拟表单链路） | setValue(1500) | 1500.0 | ✅ 是，÷100 → 15.0 |
+
+所以这是**两条合法链路**，不是"容错"——链路 A 触发 ÷100 分支，链路 B 不触发，两者都是正常预期行为。
