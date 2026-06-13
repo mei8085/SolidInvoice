@@ -123,25 +123,41 @@ return sprintf('%s%s%s', $prefix, $invoiceId, $suffix);
 **核心算法**：
 
 ```php
-// 第 54-60 行 —— 临时禁用软删除过滤器（归档记录也要计入最大值）
-$filter = $repository->getEntityManager()->getFilters()->getFilter('archivable');
-$filter->setEnabledForEntity($entity::class, false);
+// 第 48-51 行 —— 获取过滤器集合并禁用归档过滤器
+$filters = $em->getFilters();
+$filters->disable('archivable');
 
-// 第 66-74 行 —— 查询 MAX + 1
-$lastId = $repository
-    ->createQueryBuilder('e')
-    ->select(sprintf('MAX(ABS(TO_NUMBER(%s)))', $field))
-    ->getQuery()
-    ->getSingleScalarResult();
+try {
+    // 第 60-68 行 —— 前缀/后缀处理（若有）
+    if ($prefixLength > 0 || $suffixLength > 0) {
+        $field = sprintf('SUBSTRING(%s, %d, LENGTH(%s) - %d)', $field, $prefixLength + 1, $field, $prefixLength + $suffixLength);
+    }
+
+    // 第 70-75 行 —— 查询 MAX + 1
+    $lastId = $this->registry
+        ->getRepository($entity::class)
+        ->createQueryBuilder('e')
+        ->select(sprintf('MAX(ABS(TO_NUMBER(%s)))', $field))
+        ->getQuery()
+        ->getSingleScalarResult();
+} catch (NonUniqueResultException|NoResultException) {
+    $lastId = 0;
+} finally {
+    // 第 78-79 行 —— finally 块中恢复归档过滤器
+    $filters->enable('archivable');
+}
 
 return (string) ($lastId + 1);
 ```
 
 **关键细节**：
-- **归档过滤器开关方式**：查询前通过 `$filters->disable('archivable')` 禁用（[第 51 行](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/CoreBundle/Generator/BillingIdGenerator/AutoIncrementIdGenerator.php#L51)），查询后在 `finally` 块中通过 `$filters->enable('archivable')` 恢复（[第 79 行](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/CoreBundle/Generator/BillingIdGenerator/AutoIncrementIdGenerator.php#L79)）。**注意**：此处使用的是 `disable/enable` 而非 `suspend/restore`（后者仅在 [ArchivableFilter::disableForGrid()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/CoreBundle/Doctrine/Filter/ArchivableFilter.php#L28-L37) DataGrid 查询场景中使用）
-- 若配置了前缀/后缀，使用 `SUBSTRING()` SQL 函数截取中间的纯数字部分再做 MAX 计算（[第 60-68 行](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/CoreBundle/Generator/BillingIdGenerator/AutoIncrementIdGenerator.php#L60-L68)）
-- 捕获 `NonUniqueResultException|NoResultException`，异常时降级为 0
-- **无任何锁机制**，纯 SELECT MAX + 自增，存在 TOCTOU 竞态
+- **归档过滤器开关方式**：使用 `disable/enable` 全局禁用/启用模式（区别于 DataGrid 的 `suspend/restore`）
+  - 禁用：`$filters->disable('archivable')`（[第 51 行](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/CoreBundle/Generator/BillingIdGenerator/AutoIncrementIdGenerator.php#L51)）
+  - 恢复：`$filters->enable('archivable')`（[第 79 行](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/CoreBundle/Generator/BillingIdGenerator/AutoIncrementIdGenerator.php#L79)）
+  - 使用 `try-finally` 确保无论查询成功或失败，过滤器都会被恢复
+- 若配置了前缀/后缀，使用 `SUBSTRING()` SQL 函数截取中间的纯数字部分再做 MAX 计算
+- 捕获 `NonUniqueResultException|NoResultException`，异常时降级为 0（首次创建时无记录）
+- **无任何锁机制**，纯 SELECT MAX + 自增，存在 TOCTOU 竞态条件
 
 ### 3.2 RandomNumberGenerator — 随机数策略
 
@@ -624,14 +640,14 @@ Invoice 和 Quote 都使用了 [CompanyAware](file:///d:/fz/0601-1/solo-dogfeedi
 | API 触发 Processor | [GenerateInvoiceFromRecurringProcessor.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/ApiBundle/State/Processor/GenerateInvoiceFromRecurringProcessor.php) |
 | InvoiceManager（createFromRecurring） | [InvoiceManager.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Manager/InvoiceManager.php#L69-L100) |
 
-### 6.7 路径 5：MCP 工具创建
+### 6.8 路径 5：MCP 工具创建
 
 | 模块 | 文件路径 |
 |------|---------|
 | InvoiceWriteTools | [InvoiceWriteTools.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Mcp/InvoiceWriteTools.php#L90-L159) |
 | QuoteWriteTools | [QuoteWriteTools.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/QuoteBundle/Mcp/QuoteWriteTools.php#L78-L158) |
 
-### 6.8 路径 6：克隆
+### 6.9 路径 6：克隆
 
 | 模块 | 文件路径 |
 |------|---------|
@@ -639,7 +655,7 @@ Invoice 和 Quote 都使用了 [CompanyAware](file:///d:/fz/0601-1/solo-dogfeedi
 | InvoiceCloner | [InvoiceCloner.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Cloner/InvoiceCloner.php) |
 | QuoteCloner | [QuoteCloner.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/QuoteBundle/Cloner/QuoteCloner.php) |
 
-### 6.9 数据库迁移
+### 6.10 数据库迁移
 
 | 迁移文件 | 说明 |
 |---------|------|
@@ -647,7 +663,7 @@ Invoice 和 Quote 都使用了 [CompanyAware](file:///d:/fz/0601-1/solo-dogfeedi
 | [Version20300.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/migrations/Version20300.php#L162) | 给 quote_id 外键加唯一索引（不是业务编号） |
 | [Version30000_5.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/migrations/Version30000_5.php) | 3.0 外键级联调整 |
 
-### 6.10 测试相关
+### 6.11 测试相关
 
 | 测试文件 | 文件路径 |
 |---------|---------|
