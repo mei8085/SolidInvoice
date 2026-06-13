@@ -11,14 +11,15 @@
 - [一、核心概念澄清](#一核心概念澄清)
 - [二、编号生成器架构](#二编号生成器架构)
 - [三、五种序列策略详解](#三五序列策略详解)
-- [四、编号生成与落盘的完整链路](#四编号生成与落盘的完整链路)
-- [五、触发场景全景](#五触发场景全景)
-- [六、并发与重试场景下的防重号机制分析](#六并发与重试场景下的防重号机制分析)
-- [七、关键源码索引](#七关键源码索引)
+- [四、六条编号写入路径全景](#四六编号写入路径全景)
+- [五、并发与重试场景下的防重号机制分析](#五并发与重试场景下的防重号机制分析)
+- [六、关键源码索引](#六关键源码索引)
 
 ---
 
 ## 一、核心概念澄清
+
+### 1.1 两个 ID 的区别
 
 在深入分析之前，必须先明确两个容易混淆的字段：
 
@@ -31,13 +32,38 @@
 
 > 历史沿革：在 2.2 版本之前（[Version20201.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/migrations/Version20201.php#L100-L104)），发票编号直接使用自增主键 `id`。2.2 版本引入独立的 `invoice_id` 列以支持自定义编号格式（前缀、后缀、不同生成策略）。
 
+### 1.2 保存前监听器职责澄清
+
+**重要修正**：[InvoiceSaveListener](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Listener/Doctrine/InvoiceSaveListener.php) **完全不涉及编号生成**。
+
+该监听器通过 `#[AsDoctrineListener]` 同时监听 `prePersist` 和 `preUpdate` 事件，职责只有两个：
+1. 调用 `TotalCalculator::calculateTotals()` 重新计算发票总金额（[第 69 行](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Listener/Doctrine/InvoiceSaveListener.php#L69)）
+2. 检查折扣值，如果折扣金额为 0 则清空折扣类型（[checkDiscount()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Listener/Doctrine/InvoiceSaveListener.php#L52-L58)）
+
+```php
+// InvoiceSaveListener.php 第 63-75 行
+private function calculateTotals(LifecycleEventArgs $event): void
+{
+    $entity = $event->getObject();
+    if ($entity instanceof BaseInvoice) {
+        try {
+            $this->totalCalculator->calculateTotals($entity);
+        } catch (MathException) {
+        }
+        $this->checkDiscount($entity);
+    }
+}
+```
+
+**结论：整个落盘过程中，没有任何 Doctrine 事件监听器（prePersist / preUpdate / onFlush）会介入生成或校验编号。**
+
 ---
 
 ## 二、编号生成器架构
 
 ### 2.1 策略模式
 
-编号生成采用**策略模式**，核心入口为 [BillingIdGenerator](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/CoreBundle/Generator/BillingIdGenerator.php)（门面类），通过 Symfony `ServiceLocator` 根据策略名称分发到具体实现。
+编号生成采用**策略模式**，核心入口为 [BillingIdGenerator](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/CoreBundle/Generator/BillingIdGenerator.php)（门面类），通过 Symfony `ServiceLocator`（`#[TaggedLocator]`）根据策略名称分发到具体实现。
 
 ```
 BillingIdGenerator (门面/调度器)
@@ -52,13 +78,39 @@ BillingIdGenerator (门面/调度器)
 
 [BillingIdGenerator::generate()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/CoreBundle/Generator/BillingIdGenerator.php#L42-L67) 流程：
 
-1. 根据实体类名（`Invoice::class` 或 `Quote::class`）从系统配置中读取：
-   - 策略名称（`invoice/id_generation/strategy`）
-   - 前缀（`invoice/id_generation/prefix`）
-   - 后缀（`invoice/id_generation/suffix`）
-2. 从 ServiceLocator 中获取对应的生成器实例
-3. 调用生成器的 `generate()` 方法，传入 Repository、字段名、前缀、后缀等选项
-4. 最终返回值 = `前缀 + 生成值 + 后缀`
+```php
+// 第 44-48 行
+$settingSection = match (true) {
+    $entity instanceof Invoice => 'invoice',
+    $entity instanceof Quote => 'quote',
+    default => throw new InvalidArgumentException('Invalid entity type'),
+};
+
+// 第 50-53 行 —— 配置键名：id_prefix / id_suffix
+$strategy = $strategy ?: $this->config->get($settingSection . '/id_generation/strategy');
+$prefix = $this->config->get($settingSection . '/id_generation/id_prefix') ?? '';
+$suffix = $this->config->get($settingSection . '/id_generation/id_suffix') ?? '';
+
+// 第 56-57 行 —— 前后缀同时透传给生成器
+$options['prefix'] = $prefix;
+$options['suffix'] = $suffix;
+
+// 第 59 行 —— 从 ServiceLocator 取具体策略实例
+$invoiceId = $this->generators->get($strategy ?? 'auto_increment')->generate($entity, $options);
+
+// 第 61-66 行 —— 门面层再拼一次前后缀
+return sprintf('%s%s%s', $prefix, $invoiceId, $suffix);
+```
+
+**配置键名最终确认**（经 BillingIdGenerator 源码 + Settings 测试双重核实）：
+
+| 配置项 | 完整键名 | 默认值 |
+|--------|---------|-------|
+| 策略 | `invoice/id_generation/strategy` | `auto_increment` |
+| 前缀 | `invoice/id_generation/id_prefix` | `''` |
+| 后缀 | `invoice/id_generation/id_suffix` | `''` |
+
+> 注：报价单的前缀配置键是 `quote/id_generation/id_prefix`、`quote/id_generation/id_suffix`，与发票独立。
 
 ---
 
@@ -71,7 +123,11 @@ BillingIdGenerator (门面/调度器)
 **核心算法**：
 
 ```php
-// 第 66-74 行
+// 第 54-60 行 —— 临时禁用软删除过滤器（归档记录也要计入最大值）
+$filter = $repository->getEntityManager()->getFilters()->getFilter('archivable');
+$filter->setEnabledForEntity($entity::class, false);
+
+// 第 66-74 行 —— 查询 MAX + 1
 $lastId = $repository
     ->createQueryBuilder('e')
     ->select(sprintf('MAX(ABS(TO_NUMBER(%s)))', $field))
@@ -82,10 +138,10 @@ return (string) ($lastId + 1);
 ```
 
 **关键细节**：
-- 执行查询前**临时禁用 `archivable` 过滤器**（软删除过滤器），确保已归档的发票也被计入最大值（第 58-60 行）
-- 若配置了前缀/后缀，使用 `SUBSTRING()` SQL 函数截取中间的纯数字部分再做 MAX 计算（第 76-79 行）
+- 执行查询前**临时禁用 `archivable` 过滤器**（软删除过滤器），确保已归档的发票也被计入最大值
+- 若配置了前缀/后缀，使用 `SUBSTRING()` SQL 函数截取中间的纯数字部分再做 MAX 计算（[第 76-79 行](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/CoreBundle/Generator/BillingIdGenerator/AutoIncrementIdGenerator.php#L76-L79)）
 - 捕获 `NonUniqueResultException|NoResultException`，异常时降级为 0
-- **无任何锁机制**，纯 SELECT MAX + 自增
+- **无任何锁机制**，纯 SELECT MAX + 自增，存在 TOCTOU 竞态
 
 ### 3.2 RandomNumberGenerator — 随机数策略
 
@@ -135,166 +191,300 @@ return UuidV7::generate();
 - 时间有序 + 高随机性
 - 抗碰撞性极强
 
+### 3.6 各策略抗碰撞能力对比
+
+| 策略 | 并发重号概率 | 重试重号概率 | 说明 |
+|------|:-----------:|:-----------:|------|
+| `auto_increment` | 🔴 高 | 🔴 高 | 完全依赖 MAX 查询，无锁保护，两个并发请求必撞 |
+| `timestamp` | 🔴 极高 | 🔴 极高 | 同一秒内并发必撞；重试若在同一秒内也必撞 |
+| `random_number` | 🟡 中 | 🟡 中 | 6 位数 ~90 万空间，生日悖论下约 1000 次生成后碰撞概率 ~40% |
+| `ulid` | 🟢 极低 | 🟢 极低 | 48 位毫秒时间戳 + 80 位随机，同毫秒内理论碰撞概率可忽略 |
+| `uuid` | 🟢 极低 | 🟢 极低 | UUID v7 带 74 位随机，碰撞概率可忽略 |
+
 ---
 
-## 四、编号生成与落盘的完整链路
+## 四、六条编号写入路径全景
 
-### 4.1 表单创建流程（Web 端）
+编号生成在以下 **6 条主要路径** 中被触发，每条路径的生成时机和上下文都不同。
 
-以下以发票创建为例，报价单流程完全一致。
+---
 
-#### 第 1 步：Action 层初始化 DTO
+### 路径 1：Web 端创建发票（POST /invoices/create）
 
+**完整链路**：
+
+```
+用户 GET /invoices/create
+    ↓
 [Create::__invoke()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Action/Create.php#L64-L98)
-
-```php
-$dto = new InvoiceFormDTO();          // 第 79 行
-$dto->invoiceDate = new DateTimeImmutable();
-$dto->lines->add(new Line());
-
-$form = $this->createForm(InvoiceType::class, $dto, $formOptions);
-$form->handleRequest($request);
-```
-
-#### 第 2 步：表单构建时生成编号
-
-[InvoiceType::buildForm()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Form/Type/InvoiceType.php#L155-L172)
-
-```php
-// 第 162-166 行
-$data = $options['data'] ?? null;
-if (! $data instanceof InvoiceFormDTO || '' === $data->invoiceId) {
-    $invoiceId = $this->billingIdGenerator->generate(Invoice::class);
-    $builder->add('invoiceId', null, ['data' => $invoiceId]);
-}
-```
-
-**关键点**：
-- 编号在**表单构建阶段**就生成了（GET 请求时）
-- 只有当 DTO 的 `invoiceId` 为空时才生成（编辑模式下不会重新生成）
-- 生成的编号通过表单字段的 `data` 选项作为默认值传入
-
-#### 第 3 步：模板渲染
-
-[CreateInvoice.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Resources/views/Components/CreateInvoice.html.twig#L92-L118)
-
-编号字段在模板中有**两种展示形态**，通过 Stimulus 控制器 `billing-id` 切换：
-
-- **展示模式**（默认）：显示编号文本 + 编辑按钮
-  ```twig
-  <span class="billing-id-value">{{ form.invoiceId.vars.data }}</span>
-  <button type="button" class="billing-id-edit" {{ stimulus_action('billing-id', 'edit') }}>
-  ```
-
-- **编辑模式**：输入框 + 保存/取消按钮
-  ```twig
-  {{ form_widget(form.invoiceId, {attr: {class: 'form-control'}}) }}
-  ```
-
-> 重要事实：**invoiceId 不是隐藏字段，用户可以主动编辑修改编号。**
-
-#### 第 4 步：提交后 DTO → 实体映射
-
-[InvoiceFormManager::createInvoiceFromDTO()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Manager/InvoiceFormManager.php#L40-L78)
-
-```php
-// 第 49 行 —— 直接赋值，无任何校验或重新生成
-$invoice->setInvoiceId($dto->invoiceId);
-```
-
-#### 第 5 步：持久化落盘
-
+    → new InvoiceFormDTO()
+    → $this->createForm(InvoiceType::class, $dto)
+        ↓
+[InvoiceType::buildForm()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Form/Type/InvoiceType.php#L161-L166)
+    → 第 164 行：生成编号并作为表单字段默认值
+        $data = $dto->invoiceId !== ''
+            ? $dto->invoiceId
+            : $this->billingIdGenerator->generate(new Invoice(), ['field' => 'invoiceId']);
+    → add('invoiceId', null, ['data' => $data])
+        ↓
+模板渲染 [CreateInvoice.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Resources/views/Components/CreateInvoice.html.twig#L92-L118)
+    → 编号字段默认展示为文本，用户可点击"编辑"按钮切换为输入框
+        ↓
+用户提交表单 POST
+    ↓
 [Create::__invoke()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Action/Create.php#L100-L119)
-
-```php
-$invoice = $this->formManager->createInvoiceFromDTO($dto);  // 第 106 行
-$this->invoiceStateMachine->apply($invoice, Graph::TRANSITION_NEW);  // 第 109 行
-
-$entityManager = $this->doctrine->getManager();
-$entityManager->persist($invoice);  // 第 118 行
-$entityManager->flush();            // 第 119 行
+    → 第 106 行：$invoice = $this->formManager->createInvoiceFromDTO($dto)
+        ↓
+[InvoiceFormManager::createInvoiceFromDTO()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Manager/InvoiceFormManager.php#L40-L78)
+    → 第 49 行：直接赋值，无任何校验或重新生成
+        $invoice->setInvoiceId($dto->invoiceId);
+        ↓
+[Create::__invoke()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Action/Create.php#L117-L119)
+    → $entityManager->persist($invoice);
+    → $entityManager->flush();
+        ↓
+落盘完成 ✅
 ```
 
 **关键观察**：
-- 整个落盘过程中，**没有任何 prePersist 事件或监听器**介入重新生成或校验编号
-- Invoice 实体上的 `#[ORM\PrePersist]` 方法只有 [updateLines()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Entity/Invoice.php#L351-L357)，用于更新行项目总额，与编号无关
-- [InvoiceSaveListener](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Listener/Doctrine/InvoiceSaveListener.php) 也只处理状态变更，不涉及编号
+- 编号在 **GET 请求（打开表单时）** 就生成了，而不是在 POST 提交时
+- 编号字段在表单中是**可见且可编辑**的（不是隐藏字段），通过 Stimulus 控制器切换展示/编辑模式
+- 提交后直接从 DTO 赋值到实体，**没有任何重新生成或校验**
+- `InvoiceSaveListener` 的 prePersist 只计算金额，不涉及编号
 
-### 4.2 数据库层面
+---
 
-#### 列定义
+### 路径 2：API 直接创建发票（POST /api/invoices）
 
-[invoice 实体定义](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Entity/Invoice.php#L137-L139)
+**⚠️ 关键发现：API 直接创建发票时，系统不会自动生成编号。**
 
-```php
-#[ORM\Column(name: 'invoice_id', type: Types::STRING, length: 255)]
-#[Groups(['invoice_api:read', 'invoice_api:write', 'searchable'])]
-private string $invoiceId = '';
+```
+客户端 POST /api/invoices  { client, invoiceDate, lines, (invoiceId 可选) }
+    ↓
+API Platform 反序列化
+    → Invoice 实体的 invoiceId 字段在 [invoice_api:write](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Entity/Invoice.php#L138) 组中
+    → 如果客户端传了 invoiceId → 使用客户端传的值
+    → 如果客户端没传 → 保持默认空字符串 ''
+        ↓
+Doctrine persist + flush
+    → 没有任何 StateProcessor 会在此时介入生成编号
+        ↓
+落盘完成，但 invoiceId 可能是空字符串 ⚠️
 ```
 
-#### 唯一约束核查
+经核查所有 Processor：
+- [InvoiceTransitionProcessor.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/ApiBundle/State/Processor/InvoiceTransitionProcessor.php) — 只处理状态流转
+- [InvoiceLinePersistProcessor.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/ApiBundle/State/Processor/InvoiceLinePersistProcessor.php) — 只处理行项目关联
+- 其他 Processor 都不涉及发票创建时的编号生成
 
-经核查所有迁移文件，**`invoices.invoice_id` 列上没有任何唯一约束**：
-
-- [Version20201.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/migrations/Version20201.php#L98-L104)：添加 `invoice_id` 列，无唯一约束
-- [Version20300.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/migrations/Version20300.php#L162)：只给 `quote_id` 加了唯一索引（因为一个报价单只能转成一张发票）
-- 所有 3.0 版本迁移中，均未对 `invoice_id` 加唯一约束
-
-> ⚠️ 注意：很多迁移文件中出现的 `invoice_id` 是**外键列**（关联到 invoices 表的主键 id），不是业务编号列。业务编号列是 `invoices.invoice_id`。
+> **设计缺陷**：API 直接创建发票不会自动生成编号，客户端必须手动传入，否则编号为空。
 
 ---
 
-## 五、触发场景全景
+### 路径 3：报价单转发票（Quote → Invoice）
 
-编号生成在以下 6 个场景中被触发：
+**有两个调用入口**：
 
-| # | 场景 | 触发位置 | 生成时机 |
-|---|------|---------|---------|
-| 1 | Web 端新建发票表单渲染 | [InvoiceType::buildForm()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Form/Type/InvoiceType.php#L164) | GET 请求，表单构建时 |
-| 2 | Web 端新建报价单表单渲染 | [QuoteType::buildForm()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/QuoteBundle/Form/Type/QuoteType.php#L167) | GET 请求，表单构建时 |
-| 3 | 克隆发票 | [InvoiceCloner::clone()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Cloner/InvoiceCloner.php#L90) | 克隆时，flush 之前 |
-| 4 | 克隆报价单 | [QuoteCloner::clone()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/QuoteBundle/Cloner/QuoteCloner.php#L57) | 克隆时，flush 之前 |
-| 5 | Quote 转 Invoice | [InvoiceManager::createFromObject()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Manager/InvoiceManager.php#L122) | 转换时，flush 之前 |
-| 6 | 定期账单生成 | [GenerateInvoiceFromRecurringProcessor](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/ApiBundle/State/Processor/GenerateInvoiceFromRecurringProcessor.php) | 定期任务执行时 |
+#### 入口 A：API 转换（POST /api/quotes/{id}/transitions/accept）
 
-### 关于 API 直接创建
+```
+[QuoteToInvoiceProcessor::process()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/ApiBundle/State/Processor/QuoteToInvoiceProcessor.php#L31-L42)
+    → 第 35 行：检查 $data->getInvoice() !== null（防重复转换）
+    → 第 39 行：$invoice = $this->invoiceManager->createFromQuote($data)
+        ↓
+[InvoiceManager::createFromQuote()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Manager/InvoiceManager.php#L60-L64)
+    → return $this->createFromObject($quote)->setQuote($quote)
+        ↓
+[InvoiceManager::createFromObject()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Manager/InvoiceManager.php#L105-L149)
+    → 第 122 行：**生成编号**
+        $invoice->setInvoiceId($this->billingIdGenerator->generate($invoice, ['field' => 'invoiceId']));
+    → 复制报价单的客户、行项目、金额等
+        ↓
+回到 Processor 第 41 行
+    → $this->invoiceManager->create($invoice)
+        ↓
+[InvoiceManager::create()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Manager/InvoiceManager.php#L154-L171)
+    → 第 158-159 行：persist + flush（第一次 flush，状态设为 New）
+    → 第 161 行：应用状态流转 TRANSITION_NEW
+    → 第 163 行：派发 INVOICE_PRE_CREATE 事件
+    → 第 165-166 行：persist + flush（第二次 flush）
+    → 第 168 行：派发 INVOICE_POST_CREATE 事件
+        ↓
+落盘完成 ✅
+```
 
-**特别注意**：通过 `POST /api/invoices` 直接创建发票时，**系统不会自动生成编号**。
+#### 入口 B：MCP 工具转换（convert_quote_to_invoice）
 
-- `invoiceId` 在 `invoice_api:write` 序列化组中（[Invoice.php#L138](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Entity/Invoice.php#L138)），客户端可以传值
-- 如果客户端不传，`invoiceId` 将保持默认空字符串 `''`
-- 没有任何 StateProcessor 会在 API 创建时自动调用 BillingIdGenerator
+[QuoteWriteTools::convertQuoteToInvoice()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/QuoteBundle/Mcp/QuoteWriteTools.php#L233-L258) 内部同样调用 `$this->invoiceManager->createFromQuote($quote)` + `$this->invoiceManager->create($invoice)`，与入口 A 完全一致。
+
+**路径 3 关键观察**：
+- 编号在 `createFromObject()` 方法中生成（第 122 行），**紧邻 persist 之前**
+- 比 Web 表单路径安全，因为生成和落盘的时间差很短
+- 但仍然是 **先生成编号，再 flush**，没有数据库层面的唯一约束保护
+- 整个流程中执行了**两次 flush**（第 159 行和第 166 行）
 
 ---
 
-## 六、并发与重试场景下的防重号机制分析
+### 路径 4：定期账单生成发票
 
-### 6.1 总体结论
+**有两个调用入口**：
+
+#### 入口 A：API 触发（POST /api/recurring_invoices/{id}/generate）
+
+```
+[GenerateInvoiceFromRecurringProcessor::process()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/ApiBundle/State/Processor/GenerateInvoiceFromRecurringProcessor.php#L32-L43)
+    → 第 36 行：检查 $data->hasInvoiceForDay(new DateTimeImmutable())（当天防重）
+    → 第 40 行：$invoice = $this->invoiceManager->createFromRecurring($data)
+        ↓
+[InvoiceManager::createFromRecurring()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Manager/InvoiceManager.php#L69-L100)
+    → 调用 $this->createFromObject($recurringInvoice)
+    → 替换行项目描述中的日期占位符（{day}, {month}, {year} 等）
+        ↓
+[InvoiceManager::createFromObject()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Manager/InvoiceManager.php#L105-L149)
+    → 第 122 行：**生成编号**
+        $invoice->setInvoiceId($this->billingIdGenerator->generate($invoice, ['field' => 'invoiceId']));
+        ↓
+回到 Processor 第 42 行
+    → $this->invoiceManager->create($invoice)（两次 flush，同路径 3）
+        ↓
+落盘完成 ✅
+```
+
+#### 入口 B：Cron 调度（每小时通过 Messenger 异步触发）
+
+```
+Symfony Scheduler 触发 #[AsCronTask('#hourly')]
+    ↓
+[SendRecurringInvoicesCommand::handle()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Command/SendRecurringInvoicesCommand.php#L49-L97)
+    → 第 58-59 行：临时禁用 companyFilter（跨所有公司查询）
+    → 第 64 行：getActiveRecurringInvoices()
+    → 第 75-79 行：逐个检查下一次执行日期是否为今天 + 当天是否已生成
+    → 第 78 行：dispatch MessageBus 消息
+        ↓
+[CreateInvoiceFromRecurringHandler::__invoke()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Message/Handler/CreateInvoiceFromRecurringHandler.php#L45-L68)
+    → 第 54 行：companySelector->switchCompany()（切换到账单所属公司）
+    → 第 57-59 行：再次检查当天是否已生成（Handler 层二次防重）
+    → 第 60 行：$newInvoice = $this->invoiceManager->createFromRecurring($invoice)
+    → 第 61 行：$this->invoiceManager->create($newInvoice)
+    → 第 62 行：应用 TRANSITION_ACCEPT（直接过账为已发送状态）
+        ↓
+落盘完成 ✅
+```
+
+**路径 4 关键观察**：
+- 编号生成逻辑与路径 3 完全相同（共用 `createFromObject()`）
+- 有**双重防重检查**（Command 层 + Handler 层各检查一次 `hasInvoiceForDay()`）
+- 但防重检查只针对**同一个定期账单**，不防止不同定期账单之间的编号冲突
+- Cron 版本会自动应用 `TRANSITION_ACCEPT`，发票直接进入"已发送"状态
+
+---
+
+### 路径 5：MCP 工具直接创建发票（AI Agent 调用）
+
+```
+AI Agent 调用 create_invoice MCP 工具
+    ↓
+[InvoiceWriteTools::createInvoice()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Mcp/InvoiceWriteTools.php#L90-L159)
+    → 第 100-101 行：接受可选参数 $invoice_id（可由调用方显式指定）
+    → 第 148-152 行：生成编号或使用调用方传入值
+        $invoice->setInvoiceId(
+            $invoice_id !== null && $invoice_id !== ''
+                ? $invoice_id
+                : $this->billingIdGenerator->generate($invoice, ['field' => 'invoiceId']),
+        );
+    → 第 154 行：计算总额
+    → 第 156 行：$this->invoiceManager->create($invoice)（两次 flush）
+        ↓
+落盘完成 ✅
+```
+
+报价单对应路径为 [QuoteWriteTools::createQuote()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/QuoteBundle/Mcp/QuoteWriteTools.php#L78-L158)，逻辑一致。
+
+**路径 5 关键观察**：
+- MCP 工具支持**调用方显式指定编号**（可选参数 `$invoice_id`）
+- 若未指定则自动生成，生成时机紧邻 flush 之前
+- 同样使用 `invoiceManager->create()`，编号生成和落盘的时间差短
+
+---
+
+### 路径 6：克隆发票/报价单（Clone）
+
+```
+用户 GET /invoices/{id}/clone 或 MCP clone_invoice
+    ↓
+[InvoiceCloner::clone()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Cloner/InvoiceCloner.php#L49-L104)
+    → 第 55 行：手动 new Invoice()，不使用 clone 关键字
+    → 第 88-90 行：只对普通 Invoice 生成编号（RecurringInvoice 不走这里，因为 RecurringInvoice 不用 invoice_id）
+        if (! $invoice instanceof RecurringInvoice) {
+            $newInvoice->setInvoiceId($this->billingIdGenerator->generate($newInvoice, ['field' => 'invoiceId']));
+        }
+    → 第 99-101 行：调用 invoiceManager->create($newInvoice)
+        ↓
+落盘完成 ✅
+```
+
+报价单对应路径为 [QuoteCloner::clone()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/QuoteBundle/Cloner/QuoteCloner.php#L42-L72)，第 57 行生成编号。
+
+---
+
+### 附加路径：演示数据加载（Fixture / DummyData）
+
+[InvoiceDummyDataLoader](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/DummyData/InvoiceDummyDataLoader.php#L155) 第 155 行直接调用：
+
+```php
+$invoice->setInvoiceId($this->billingIdGenerator->generate($invoice, ['field' => 'invoiceId']));
+```
+
+仅用于开发/测试环境，不计入生产路径。
+
+---
+
+### 六条路径对比总结
+
+| # | 路径 | 生成时机 | 生成位置 | 用户可否编辑编号 | 自动生成 | 支持手动指定 |
+|---|------|---------|---------|:-----------:|:--------:|:----------:|
+| 1 | Web 创建 | GET 打开表单时 | InvoiceType::buildForm() | ✅ 可编辑 | ✅ 是 | ✅ 可编辑 |
+| 2 | API 直接创建 | 不自动生成 | 无 | ❌ N/A | ❌ 否 | ✅ 通过 JSON payload |
+| 3 | Quote → Invoice | 转换时，flush 前 | InvoiceManager::createFromObject() | ❌ 不可编辑 | ✅ 是 | ❌ |
+| 4 | 定期生成 | 生成时，flush 前 | InvoiceManager::createFromObject() | ❌ 不可编辑 | ✅ 是 | ❌ |
+| 5 | MCP 工具创建 | 创建时，flush 前 | InvoiceWriteTools::createInvoice() | ❌ N/A | ✅ 是 | ✅ 通过参数 |
+| 6 | 克隆发票 | 克隆时，flush 前 | InvoiceCloner::clone() | ❌ 不可编辑 | ✅ 是 | ❌ |
+| - | 演示数据 | 加载时，flush 前 | InvoiceDummyDataLoader | ❌ N/A | ✅ 是 | ❌ |
+
+---
+
+## 五、并发与重试场景下的防重号机制分析
+
+### 5.1 总体结论
 
 **当前实现几乎没有任何可靠的防重号保护，存在明显的并发重号风险。**
 
 具体表现为：
 - ❌ 数据库无唯一约束
 - ❌ 自增策略无锁（TOCTOU 竞态）
-- ❌ 无应用层重试机制
+- ❌ 无应用层重试/冲突检测机制
 - ❌ 表单预生成模式加剧了重号风险
+- ❌ API 直接创建甚至不自动生成编号
 
 ---
 
-### 6.2 数据库层面：无唯一约束
+### 5.2 数据库层面：无唯一约束
 
-如第 4.2 节所述，`invoices.invoice_id` 列上**没有任何唯一约束**。
+经核查所有迁移文件，**`invoices.invoice_id` 列上没有任何唯一约束**：
+
+- [Version20201.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/migrations/Version20201.php#L98-L104)：添加 `invoice_id` 列，无唯一约束
+- 所有 3.0 版本迁移（Version30000_1 ~ Version30000_5）中，均未对 `invoice_id` 加唯一约束
+
+> 补充：`invoices.quote_id` 有唯一索引（[Version20300.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/migrations/Version20300.php#L162)），但这是**外键约束**（一个报价单只能转成一张发票），不是业务编号约束。
 
 这意味着：
 - 即使生成了重复编号，数据库也不会报错
 - 重号数据会**静默写入**，只有在业务层面发现时才会暴露
 - 多租户场景下（不同 company）可以有相同编号，但同一 company 内也没有联合唯一约束
 
-> 补充：`invoices.quote_id` 有唯一约束（一个报价单只能转一张发票），但这是外键约束，不是业务编号约束。
-
 ---
 
-### 6.3 AutoIncrement 策略：纯 SELECT MAX，无任何锁
+### 5.3 AutoIncrement 策略：纯 SELECT MAX，无任何锁
 
 **最严重的风险在默认策略 `auto_increment` 上。**
 
@@ -325,19 +515,7 @@ private string $invoiceId = '';
 
 ---
 
-### 6.4 各策略抗碰撞能力对比
-
-| 策略 | 并发重号概率 | 重试重号概率 | 说明 |
-|------|:-----------:|:-----------:|------|
-| `auto_increment` | 🔴 高 | 🔴 高 | 完全依赖 MAX 查询，无锁保护，两个并发请求必撞 |
-| `timestamp` | 🔴 极高 | 🔴 极高 | 同一秒内并发必撞；重试若在同一秒内也必撞 |
-| `random_number` | 🟡 中 | 🟡 中 | 6 位数 ~90 万空间，生日悖论下约 1000 次生成后碰撞概率 ~40% |
-| `ulid` | 🟢 极低 | 🟢 极低 | 48 位毫秒时间戳 + 80 位随机，同毫秒内理论碰撞概率可忽略 |
-| `uuid` | 🟢 极低 | 🟢 极低 | UUID v7 带 74 位随机，碰撞概率可忽略 |
-
----
-
-### 6.5 表单预生成模式加剧风险
+### 5.4 表单预生成模式加剧风险
 
 Web 表单场景下，编号在 **GET 请求（打开表单时）** 就生成了，而不是在 **POST 提交时**生成。这带来了额外的风险：
 
@@ -348,28 +526,32 @@ Web 表单场景下，编号在 **GET 请求（打开表单时）** 就生成了
 
 ---
 
-### 6.6 重试场景分析
+### 5.5 重试场景逐条分析
 
 重试场景通常来自：
 - 用户提交表单后网络超时，浏览器重复提交
 - API 调用失败后客户端自动重试
-- 消息队列消费失败后的重试
+- 消息队列消费失败后的重试（如 Cron 异步路径）
 
-对不同策略的影响：
+逐条分析：
 
-| 策略 | 重试是否会重号 | 原因 |
-|------|:-------------:|------|
-| `auto_increment` | 🔴 是 | 编号在表单构建时就确定了，重试带着同一个号提交 |
-| `timestamp` | 🔴 是 | 同一秒内重试结果相同 |
-| `random_number` | 🟡 可能 | 随机生成，但因为是表单预生成，重试带着同一个号 |
-| `ulid` | 🟢 否（表单场景同左） | 算法保证唯一性，但表单预生成模式下重试也会重号 |
-| `uuid` | 🟢 否（表单场景同左） | 同上 |
+| 路径 | 策略 | 重试是否会重号 | 原因 |
+|------|------|:-------------:|------|
+| Web 创建（路径 1） | 任意 | 🔴 是 | 编号在表单构建时就固定了，重试带着同一个号提交 |
+| API 直接创建（路径 2） | 任意 | 🟡 取决于客户端 | 如果客户端每次重试重新生成编号则不会，否则会；甚至可能编号为空 |
+| Quote→Invoice（路径 3） | auto_increment | 🔴 高概率 | 如果重试时上次 flush 未完成，MAX 未更新则必撞 |
+| Quote→Invoice（路径 3） | ulid/uuid | 🟢 否 | 每次重试都会重新调用 generate()，算法保证唯一性 |
+| 定期生成（路径 4） | 任意 | 🟡 低风险 | 有 hasInvoiceForDay 当天防重，但同一秒内并发仍可能编号冲突 |
+| MCP 工具（路径 5） | auto_increment | 🔴 高概率 | 同路径 3 |
+| MCP 工具（路径 5） | ulid/uuid | 🟢 否 | 每次重试都重新生成 |
+| 克隆（路径 6） | auto_increment | 🔴 高概率 | 同路径 3 |
+| 克隆（路径 6） | ulid/uuid | 🟢 否 | 每次重试都重新生成 |
 
 > 关键洞察：**即使使用 ULID/UUID 这种天然唯一的策略，在 Web 表单场景下也可能因为"预生成 + 重试"而导致重号**——因为编号在表单渲染时就固定了，重试时不会重新生成。
 
 ---
 
-### 6.7 多租户下的情况
+### 5.6 多租户下的情况
 
 Invoice 和 Quote 都使用了 [CompanyAware](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/CoreBundle/Traits/Entity/CompanyAware.php) trait，全局启用了 `CompanyFilter`。
 
@@ -382,9 +564,9 @@ Invoice 和 Quote 都使用了 [CompanyAware](file:///d:/fz/0601-1/solo-dogfeedi
 
 ---
 
-## 七、关键源码索引
+## 六、关键源码索引
 
-### 7.1 生成器核心
+### 6.1 生成器核心
 
 | 模块 | 文件路径 |
 |------|---------|
@@ -396,43 +578,83 @@ Invoice 和 Quote 都使用了 [CompanyAware](file:///d:/fz/0601-1/solo-dogfeedi
 | ULID 策略 | [UlidGenerator.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/CoreBundle/Generator/BillingIdGenerator/UlidGenerator.php) |
 | UUID 策略 | [UuidGenerator.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/CoreBundle/Generator/BillingIdGenerator/UuidGenerator.php) |
 
-### 7.2 表单与 DTO 链路
+### 6.2 保存前监听器
+
+| 模块 | 文件路径 | 职责 |
+|------|---------|------|
+| InvoiceSaveListener | [InvoiceSaveListener.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Listener/Doctrine/InvoiceSaveListener.php) | 计算总金额、检查折扣类型（**不涉及编号**） |
+
+### 6.3 路径 1：Web 创建
 
 | 模块 | 文件路径 |
 |------|---------|
-| 发票创建 Action | [Create.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Action/Create.php) |
-| 发票表单类型 | [InvoiceType.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Form/Type/InvoiceType.php) |
-| 发票表单 DTO | [InvoiceFormDTO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/DTO/InvoiceFormDTO.php) |
-| 发票表单管理器 | [InvoiceFormManager.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Manager/InvoiceFormManager.php) |
-| 发票创建模板 | [CreateInvoice.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Resources/views/Components/CreateInvoice.html.twig) |
+| 创建 Action | [Create.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Action/Create.php) |
+| 表单类型 | [InvoiceType.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Form/Type/InvoiceType.php) |
+| 表单 DTO | [InvoiceFormDTO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/DTO/InvoiceFormDTO.php) |
+| 表单管理器 | [InvoiceFormManager.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Manager/InvoiceFormManager.php) |
+| 创建模板 | [CreateInvoice.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Resources/views/Components/CreateInvoice.html.twig) |
+| 编辑 Action | [Edit.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Action/Edit.php) |
 | 报价单对应表单类型 | [QuoteType.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/QuoteBundle/Form/Type/QuoteType.php) |
 | 报价单表单管理器 | [QuoteFormManager.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/QuoteBundle/Manager/QuoteFormManager.php) |
 
-### 7.3 实体与数据库
+### 6.4 路径 2：API 直接创建
 
 | 模块 | 文件路径 |
 |------|---------|
-| Invoice 实体 | [Invoice.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Entity/Invoice.php) |
-| Quote 实体 | [Quote.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/QuoteBundle/Entity/Quote.php) |
-| invoice_id 列添加迁移 | [Version20201.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/migrations/Version20201.php) |
-| 3.0 外键级联迁移 | [Version30000_5.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/migrations/Version30000_5.php) |
+| Invoice 实体（序列化组） | [Invoice.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Entity/Invoice.php#L137-L139) |
+| 状态流转 Processor | [InvoiceTransitionProcessor.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/ApiBundle/State/Processor/InvoiceTransitionProcessor.php) |
+| 行项目关联 Processor | [InvoiceLinePersistProcessor.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/ApiBundle/State/Processor/InvoiceLinePersistProcessor.php) |
 
-### 7.4 其他生成场景
+### 6.5 路径 3：Quote → Invoice
 
-| 场景 | 文件路径 |
+| 模块 | 文件路径 |
 |------|---------|
-| 发票克隆 | [InvoiceCloner.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Cloner/InvoiceCloner.php) |
-| 报价单克隆 | [QuoteCloner.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/QuoteBundle/Cloner/QuoteCloner.php) |
-| Quote 转 Invoice | [InvoiceManager.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Manager/InvoiceManager.php) |
-| API Quote 转 Invoice 处理器 | [QuoteToInvoiceProcessor.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/ApiBundle/State/Processor/QuoteToInvoiceProcessor.php) |
+| QuoteToInvoiceProcessor | [QuoteToInvoiceProcessor.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/ApiBundle/State/Processor/QuoteToInvoiceProcessor.php) |
+| InvoiceManager（createFromQuote） | [InvoiceManager.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Manager/InvoiceManager.php#L60-L64) |
+| InvoiceManager（createFromObject） | [InvoiceManager.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Manager/InvoiceManager.php#L105-L149) |
+| InvoiceManager（create） | [InvoiceManager.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Manager/InvoiceManager.php#L154-L171) |
+| MCP 转换入口 | [QuoteWriteTools.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/QuoteBundle/Mcp/QuoteWriteTools.php#L233-L258) |
 
-### 7.5 测试相关
+### 6.6 路径 4：定期生成
+
+| 模块 | 文件路径 |
+|------|---------|
+| Cron 调度命令 | [SendRecurringInvoicesCommand.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Command/SendRecurringInvoicesCommand.php) |
+| 异步消息 Handler | [CreateInvoiceFromRecurringHandler.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Message/Handler/CreateInvoiceFromRecurringHandler.php) |
+| API 触发 Processor | [GenerateInvoiceFromRecurringProcessor.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/ApiBundle/State/Processor/GenerateInvoiceFromRecurringProcessor.php) |
+| InvoiceManager（createFromRecurring） | [InvoiceManager.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Manager/InvoiceManager.php#L69-L100) |
+
+### 6.7 路径 5：MCP 工具创建
+
+| 模块 | 文件路径 |
+|------|---------|
+| InvoiceWriteTools | [InvoiceWriteTools.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Mcp/InvoiceWriteTools.php#L90-L159) |
+| QuoteWriteTools | [QuoteWriteTools.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/QuoteBundle/Mcp/QuoteWriteTools.php#L78-L158) |
+
+### 6.8 路径 6：克隆
+
+| 模块 | 文件路径 |
+|------|---------|
+| 克隆 Action | [CloneInvoice.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Action/CloneInvoice.php) |
+| InvoiceCloner | [InvoiceCloner.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Cloner/InvoiceCloner.php) |
+| QuoteCloner | [QuoteCloner.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/QuoteBundle/Cloner/QuoteCloner.php) |
+
+### 6.9 数据库迁移
+
+| 迁移文件 | 说明 |
+|---------|------|
+| [Version20201.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/migrations/Version20201.php#L98-L104) | 添加 invoice_id 列，无唯一约束 |
+| [Version20300.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/migrations/Version20300.php#L162) | 给 quote_id 外键加唯一索引（不是业务编号） |
+| [Version30000_5.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/migrations/Version30000_5.php) | 3.0 外键级联调整 |
+
+### 6.10 测试相关
 
 | 测试文件 | 文件路径 |
 |---------|---------|
 | 自增策略单元测试 | [AutoIncrementIdGeneratorTest.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/CoreBundle/Tests/Generator/BillingIdGenerator/AutoIncrementIdGeneratorTest.php) |
 | 发票表单类型测试 | [InvoiceTypeTest.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Tests/Form/Type/InvoiceTypeTest.php) |
 | 发票管理器测试 | [InvoiceManagerTest.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Tests/Manager/InvoiceManagerTest.php) |
+| 定期生成 Handler 测试 | [CreateInvoiceFromRecurringHandlerTest.php](file:///d:/fz/0601-1/solo-dogfeeding/code/47-SolidInvoice/src/InvoiceBundle/Tests/Message/Handler/CreateInvoiceFromRecurringHandlerTest.php) |
 
 ---
 
@@ -441,7 +663,7 @@ Invoice 和 Quote 都使用了 [CompanyAware](file:///d:/fz/0601-1/solo-dogfeedi
 > 以下为审计发现的改进方向，供参考：
 
 1. **添加数据库唯一约束**（高优先级）：在 `invoices` 和 `quotes` 表上添加 `(company_id, invoice_id)` 联合唯一索引，作为最后一道防线
-2. **改生成时机为提交时**：将编号生成从"表单构建时"推迟到"提交落盘前"，减少预生成带来的问题
-3. **为自增策略加锁**：使用 `SELECT ... FOR UPDATE` 或独立序号表 + 行锁，保证自增的原子性
-4. **API 创建自动生成**：API 直接创建发票时也应自动生成编号，而不是依赖客户端传入
+2. **修正 API 创建行为**：为 `POST /api/invoices` 添加 StateProcessor，在编号为空时自动生成
+3. **改生成时机为提交时**：将编号生成从"表单构建时"推迟到"提交落盘前"，减少预生成带来的问题
+4. **为自增策略加锁**：使用 `SELECT ... FOR UPDATE` 或独立序号表 + 行锁，保证自增的原子性
 5. **高并发场景推荐 ULID/UUID**：如果业务允许，切换到 ULID 或 UUID 策略，从算法层面避免碰撞，无需数据库协调
