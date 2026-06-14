@@ -86,8 +86,29 @@ public function onKernelRequest(RequestEvent $event): void
 
 4. **未安装时的额外处理**：
    - 启动 Session
-   - 将 Session ID 设为临时的 `APP_SECRET`（第 102 行）
+   - 将 Session ID 设为临时的 `SOLIDINVOICE_APP_SECRET`（第 102 行），**同时写入 `$_SERVER` 和 `$_ENV`**
    - 重置环境变量缓存 `$container->resetEnvCache()`（第 107 行）
+
+### 注意点：重定向后代码继续执行
+
+`redirectToRoute()` 方法只设置 Response 并调用 `stopPropagation()`，但**方法内没有 return**，所以重定向之后的代码仍然会执行：
+
+```php
+if (null === $route || ! in_array($route, $this->allowRoutes, true)) {
+    $this->redirectToRoute($event, self::INSTALLER_ROUTE);
+    // 没有 return，下面的代码继续跑
+}
+
+// 即使重定向了，以下代码仍会执行
+$session = $request->getSession();
+if (! $session->isStarted()) {
+    $session->start();
+}
+$_SERVER['SOLIDINVOICE_APP_SECRET'] = $_ENV['SOLIDINVOICE_APP_SECRET'] = $request->getSession()->getId();
+// ... resetEnvCache
+```
+
+也就是说：**即使请求被重定向到安装页，Session 启动、临时 APP_SECRET 设置、环境缓存重置这三件事依然会发生。**
 
 ### 二次拦截（Action 内部）
 
