@@ -383,17 +383,45 @@ sqlite:///{path_to_db_file}
 
 **文件**：[RunMigrationsStep.php](file:///d:/fz/0601-1/solo-dogfeeding/code/96-SolidInvoice/src/InstallBundle/Step/RunMigrationsStep.php)
 
-**核心实现**：[Migration.php](file:///d:/fz/0601-1/solo-dogfeeding/code/96-SolidInvoice/src/InstallBundle/Installer/Database/Migration.php)
+此步骤完成两件独立的事：**建表** 和 **记录版本号**。建表委托给 [Migration](file:///d:/fz/0601-1/solo-dogfeeding/code/96-SolidInvoice/src/InstallBundle/Installer/Database/Migration.php)，版本号更新在本步骤内直接完成。
 
-**执行逻辑**（Migration 第 43-81 行）：
-1. 初始化迁移元数据存储（`ensureInitialized()`）
-2. 使用 SchemaTool 的 `getUpdateSchemaSql()` 计算需要执行的 SQL
-3. 逐条执行 SQL 语句
-4. 将所有迁移版本标记为已执行（`complete()`）
+**完整 execute() 方法**（第 34-46 行）：
 
-> **注意**：安装时不按迁移文件逐个执行，而是直接用 SchemaTool 生成最终 schema，再批量标记迁移版本。这样更快且避免了迁移脚本的兼容性问题。
+```php
+public function execute(Installation $installationData, ?callable $callback = null): \Generator
+{
+    // ── 第一件：建表 + 标记迁移版本 ──
+    yield from $this->migration->migrate($callback);
 
-**最后操作**：更新 `Version` 实体记录当前版本号。
+    // ── 第二件：更新 Version 实体 ──
+    $version = SolidInvoiceCoreBundle::VERSION;
+    $entityManager = $this->registry->getManager();
+    /** @var VersionRepository $repository */
+    $repository = $entityManager->getRepository(Version::class);
+    $repository->updateVersion($version);
+}
+```
+
+**第一件：Migration::migrate() 做了什么**（[Migration.php](file:///d:/fz/0601-1/solo-dogfeeding/code/96-SolidInvoice/src/InstallBundle/Installer/Database/Migration.php#L43-L81) 第 43-81 行）
+
+Migration 只负责建表和标记迁移版本，**不涉及 Version 实体**：
+
+1. `ensureInitialized()` — 初始化迁移元数据表 `doctrine_migration_versions`
+2. `SchemaTool::getUpdateSchemaSql()` — 从所有 Entity 元数据计算出建表 SQL
+3. 逐条执行 SQL（通过 `yield from $callback($sql)` 回传进度）
+4. 批量将所有迁移版本标记为已执行（`$metadataStorage->complete()`）
+
+> 安装时不按迁移文件逐个跑，而是用 SchemaTool 一次性生成完整 schema 再批量标记，更快且避免迁移脚本兼容性问题。
+
+**第二件：Version 实体更新归 RunMigrationsStep 管**
+
+`$repository->updateVersion($version)` 是在 `yield from` **之后**、RunMigrationsStep 自身代码中直接调用的。它不在 Migration::migrate() 里。
+
+- 传入的版本号来自 `SolidInvoiceCoreBundle::VERSION` 常量
+- `VersionRepository::updateVersion()` 是 upsert 操作（存在则更新，不存在则插入）
+- 写入的 `Version` 实体存放在 `Version` 表中，供 UpgradeListener 判断是否需要自动迁移
+
+> **为什么归 RunMigrationsStep 不归 Migration？** Migration 是纯粹的数据库迁移工具类（建表 + 标记迁移版本），不关心业务语义。Version 实体是业务概念，代表"当前安装的应用版本号"，由调用方（RunMigrationsStep）决定何时更新更合理。
 
 #### 5. CreateUserStep
 
@@ -541,21 +569,44 @@ if ($form->isSubmitted() && $form->isValid() && $form->isFinished()) {
 
 ## 命令行安装链路（InstallCommand）
 
-除了 Web 安装向导，SolidInvoice 还提供了命令行安装方式。
+除了 Web 安装向导，SolidInvoice 还提供了完整的命令行安装方式。这是一条独立的执行链路。
 
 **文件**：[InstallCommand.php](file:///d:/fz/0601-1/solo-dogfeeding/code/96-SolidInvoice/src/InstallBundle/Command/InstallCommand.php)
 
 **命令名**：`app:install`（执行方式：`bin/console app:install`）
 
+**完整执行链路**：
+
+```
+execute() → validate() → saveConfig() → install()
+```
+
+### execute() 入口（第 100-124 行）
+
+1. **检查是否已安装**（第 110-114 行）：
+   ```php
+   if ($this->installed !== null) {
+       throw new ApplicationInstalledException();  // 已安装则抛异常
+   }
+   ```
+   异常会被 ExceptionListener 捕获，重定向到首页。
+
+2. **判断是否交互模式**（第 116-122 行）：
+   - 没有传任何必需参数 → 进入交互模式，逐个提问
+   - 传了必需参数 → 非交互模式，直接执行
+
+3. **调用三个阶段方法**：
+   ```php
+   $this->validate($input);          // 阶段 1：参数校验
+   $this->saveConfig($input);        // 阶段 2：保存配置
+   $this->install($input, $output);  // 阶段 3：执行安装
+   ```
+
 ### 是否启用
 
-通过 `isEnabled()` 方法控制（第 79-82 行），已安装时命令不可用。
+通过 `isEnabled()` 方法控制（第 79-82 行），已安装时命令不可用，执行 `list` 时看不到此命令。
 
-### 执行流程
-
-```
-validate() → saveConfig() → install()
-```
+---
 
 #### 第一阶段：validate() - 参数校验（第 128-153 行）
 
@@ -565,27 +616,117 @@ validate() → saveConfig() → install()
 
 校验内容：
 1. 必填选项是否都提供了
-2. locale 是否合法
+2. locale 是否合法（检查 `Locale::exists()`）
 3. application-url 是否包含 http/https 协议且格式有效
+
+---
 
 #### 第二阶段：saveConfig() - 保存配置（第 229-271 行）
 
-1. 组装配置数组（数据库配置、locale、application_url、app_secret 等）
-2. **测试数据库连接**（`DriverManager::getConnection()`）
-3. 获取数据库服务器版本（`PDO::ATTR_SERVER_VERSION`）
-4. 通过 `ConfigWriter` 批量保存所有配置
-5. **重置整个容器**（`$container->reset()`）使新配置生效
+**完整流程**：
 
-> 与 Web 向导的区别：命令行安装是一次性把所有配置写入，而 Web 向导分两阶段——先在 InstallFlowType 中写数据库配置，最后在 Install Action 中写安装标记。
+```php
+private function saveConfig(InputInterface $input): self
+{
+    $config = [
+        'database_driver' => $input->getOption('database-driver'),
+        'database_host' => $input->getOption('database-host'),
+        'database_port' => $input->getOption('database-port'),
+        'database_name' => $input->getOption('database-name'),
+        'database_user' => $input->getOption('database-user'),
+        'database_password' => $input->getOption('database-password'),
+        'locale' => $input->getOption('locale'),
+        'application_url' => $input->getOption('application-url'),
+        'app_secret' => Key::createNewRandomKey()->saveToAsciiSafeString(),  // ← defuse 生成
+    ];
+
+    // 测试数据库连接
+    $nativeConnection = DriverManager::getConnection([
+        'host' => $config['database_host'] ?? null,
+        'port' => $config['database_port'] ?? null,
+        'name' => $config['database_name'] ?? null,  // ← 注意：没有 unset dbname！
+        'user' => $config['database_user'] ?? null,
+        'password' => $config['database_password'] ?? null,
+        'driver' => $config['database_driver'] ?? null,
+    ])->getNativeConnection();
+
+    // 获取数据库版本
+    $version = $nativeConnection->getAttribute(PDO::ATTR_SERVER_VERSION);
+    $config['database_version'] = $version;
+
+    // 批量保存所有配置
+    $this->configWriter->save($config);
+
+    // 重置容器
+    $container = $this->kernel->getContainer();
+    if ($container instanceof ResetInterface) {
+        $container->reset();
+        $container->set('kernel', $this->kernel);
+    }
+}
+```
+
+**关键细节**：
+1. **APP_SECRET 由 defuse 生成**（第 241 行）：和 Web 向导一致，使用 `Defuse\Crypto\Key::createNewRandomKey()->saveToAsciiSafeString()`
+2. **没有 unset dbname**：命令行安装的连接测试**带 dbname** 连接，这意味着如果数据库不存在，这一步会失败。命令行安装要求数据库已提前创建好（和 Web 向导设计不同）
+3. **配置键名自动加前缀**：传入的是 `app_secret`、`database_driver` 等，ConfigWriter 会自动转成 `SOLIDINVOICE_APP_SECRET`、`SOLIDINVOICE_DATABASE_DRIVER`
+4. **批量写入 + 容器重置**：一次性批量写入所有配置，然后重置整个容器使新配置生效
+
+> **与 Web 向导的区别**：
+> - Web 向导分两阶段写：先在 InstallFlowType 中写数据库配置，最后在 Install Action 中写安装标记
+> - 命令行是一次性批量写入所有配置
+
+---
 
 #### 第三阶段：install() - 执行安装（第 158-180 行）
 
-1. 遍历所有 `InstallationStepInterface` 步骤并逐个执行
-2. 如果不跳过用户创建，调用 `createAdminUser()` 创建管理员
-3. 更新 Version 实体记录版本号
-4. **最后写入 `installed` 标记**，标记安装完成
+**完整代码**：
 
-> 与 Web 向导的区别：命令行安装的 Version 更新和 installed 标记写入都在 `install()` 方法内完成；而 Web 向导中 Version 由 RunMigrationsStep 更新，installed 由 Install Action 写入。
+```php
+private function install(InputInterface $input, OutputInterface $output): void
+{
+    // 1. 遍历执行所有安装步骤（共 5 个）
+    foreach ($this->installationSteps as $step) {
+        $output->writeln(sprintf('<info>Running step: %s</info>', $step->getLabel()));
+        $step->execute(new Installation(), function (string $content) use ($output): void {
+            $output->writeln($content, OutputInterface::VERBOSITY_VERBOSE);
+        });
+    }
+    // ↑ RunMigrationsStep 内部已经调用了 $repository->updateVersion($version)
+
+    // 2. 创建管理员用户（如果不跳过）
+    if (! $input->getOption('skip-user')) {
+        $this->createAdminUser($input, $output);
+    }
+
+    // 3. 再次更新 Version（冗余操作）
+    $version = SolidInvoiceCoreBundle::VERSION;
+    $entityManager = $this->registry->getManager();
+    /** @var VersionRepository $repository */
+    $repository = $entityManager->getRepository(Version::class);
+    $repository->updateVersion($version);  // ← RunMigrationsStep 已经更新过一次
+
+    // 4. 最后写入 installed 标记
+    $time = new DateTime('NOW');
+    $config = ['installed' => $time->format(DateTimeInterface::ATOM)];
+    $this->configWriter->save($config);
+}
+```
+
+**关键细节**：
+1. **Version 被更新两次**：
+   - 第一次：在 `RunMigrationsStep::execute()` 内（第 428 行）
+   - 第二次：在 `InstallCommand::install()` 内（第 176 行）
+   - 这是冗余设计，但不影响功能（`updateVersion()` 内部是 upsert 操作）
+
+2. **installed 标记最后写入**：确保前面所有步骤都成功后才标记为已安装
+
+> **与 Web 向导的区别**：
+> - Web 向导中 Version 只由 RunMigrationsStep 更新一次
+> - Web 向导中 installed 标记由 Install Action 在 finish 步骤写入
+> - 命令行都在 `install()` 方法内完成
+
+---
 
 ### 交互模式
 
@@ -603,6 +744,17 @@ validate() → saveConfig() → install()
 **命令名**：`solidinvoice:is-installed`（隐藏命令）
 
 **用途**：脚本中判断应用是否已安装。已安装退出码 0，未安装退出码 1。常用于 CI/CD 或容器启动脚本中。
+
+**核心逻辑**（第 36-42 行）：
+```php
+protected function execute(InputInterface $input, OutputInterface $output): int
+{
+    if ($this->installed !== null) {
+        return Command::SUCCESS;    // 已安装 → 退出码 0
+    }
+    return Command::FAILURE;        // 未安装 → 退出码 1
+}
+```
 
 ---
 
