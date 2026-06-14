@@ -328,10 +328,83 @@ sqlite:///{path_to_db_file}
 
 **执行流程**：
 1. 校验 CSRF Token（第 104-108 行）
-2. 根据 `action` 参数从 ServiceLocator 获取对应步骤（第 110-116 行）
+2. action 参数经 title 化后从 ServiceLocator 查找步骤（第 110-116 行）
 3. 返回 `EventStreamResponse`，在 Generator 中执行步骤
 4. 步骤通过 `yield` 推送进度信息
 5. 成功时推送 `complete` 事件，失败时推送 `error` 事件
+
+#### action 参数经 title 化转 ServiceLocator key 的完整链路
+
+前端用蛇形命名发 SSE 请求，后端用 `u()->replace()->title()` 转成 Title Case，再从 ServiceLocator 按 `getLabel()` 索引查找。完整链路分 5 步：
+
+**第 1 步：ServiceLocator 以 getLabel() 为索引**
+
+[Install.php](file:///d:/fz/0601-1/solo-dogfeeding/code/96-SolidInvoice/src/InstallBundle/Action/Install.php#L48-L50) 构造函数中：
+
+```php
+#[AutowireLocator(
+    services: InstallationStepInterface::DI_TAG,        // 标签: solidinvoice.installation_step
+    defaultIndexMethod: 'getLabel',                     // 索引方法: getLabel()
+    defaultPriorityMethod: 'priority'                   // 排序方法: priority()
+)]
+private readonly ServiceLocator $steps,
+```
+
+- `defaultIndexMethod: 'getLabel'` → ServiceLocator 内部以每个步骤的 `getLabel()` 返回值作为 key
+- `defaultPriorityMethod: 'priority'` → 按 `priority()` 返回值排序（数字越大越优先）
+- 所有实现了 `InstallationStepInterface` 的类通过 `#[AutoconfigureTag]` 自动注册
+
+**第 2 步：每个步骤的 getLabel() 返回值**
+
+| 步骤类 | getLabel() | priority() |
+|--------|-----------|------------|
+| GenerateSecretStep | `'Generating secret'` | 30 |
+| GenerateBuildIdStep | `'Generating build id'` | 25 |
+| CreateDatabaseStep | `'Creating database'` | 20 |
+| RunMigrationsStep | `'Creating database schema'` | 10 |
+| CreateUserStep | `'Creating admin user'` | 5 |
+
+**第 3 步：前端发送蛇形 action 参数**
+
+前端 SSE 请求 URL 中的 action 是蛇形命名：
+```
+/_system_install?action=generating_secret&token=xxx
+/_system_install?action=creating_database_schema&token=xxx
+```
+
+**第 4 步：后端 title 化转换**
+
+[Install.php](file:///d:/fz/0601-1/solo-dogfeeding/code/96-SolidInvoice/src/InstallBundle/Action/Install.php#L110) 第 110 行：
+
+```php
+$action = u($request->query->get('action'))  // "creating_database_schema"
+    ->replace('_', ' ')                      // "creating database schema"
+    ->title()                                // "Creating Database Schema"
+    ->toString();
+```
+
+`u()` 是 Symfony String 组件的辅助函数，返回 `UnicodeString` 对象。`title()` 将每个单词首字母大写。
+
+**第 5 步：从 ServiceLocator 查找并执行**
+
+```php
+if (! $this->steps->has($action)) {         // 检查 key 是否存在
+    throw new BadRequestException('Invalid action: ' . $action);
+}
+$step = $this->steps->get($action);          // 按 getLabel() 值取步骤
+```
+
+ServiceLocator 的 `has()`/`get()` 对大小写不敏感，因此 `"Creating Database Schema"` 能匹配到 `'Creating database schema'`。
+
+**完整映射表**：
+
+| 前端 action | replace → title 化后 | 匹配 getLabel() | 步骤类 |
+|-------------|---------------------|-----------------|--------|
+| `generating_secret` | `Generating Secret` | `Generating secret` | GenerateSecretStep |
+| `generating_build_id` | `Generating Build Id` | `Generating build id` | GenerateBuildIdStep |
+| `creating_database` | `Creating Database` | `Creating database` | CreateDatabaseStep |
+| `creating_database_schema` | `Creating Database Schema` | `Creating database schema` | RunMigrationsStep |
+| `creating_admin_user` | `Creating Admin User` | `Creating admin user` | CreateUserStep |
 
 ### 安装步骤顺序
 
@@ -496,13 +569,36 @@ if ($container instanceof ResetInterface) {
 
 #### 3. OPcache 失效
 
-**ConfigWriter**（第 56-58 行）：
+**代码位置**：[ConfigWriter.php](file:///d:/fz/0601-1/solo-dogfeeding/code/96-SolidInvoice/src/CoreBundle/ConfigWriter.php#L43-L59)
+
+`opcache_invalidate()` 调用位于 `foreach` 循环内部，紧接在每次 `seal()` 之后：
+
 ```php
-if ($opCacheEnabled && opcache_is_script_cached($this->pathPrefix . 'list.php')) {
-    opcache_invalidate($this->pathPrefix . 'list.php', true);
+public function save(array $config): void
+{
+    $this->vault->generateKeys();
+    $opCacheEnabled = function_exists('opcache_invalidate');
+
+    foreach ($config as $key => $value) {
+        if (! str_starts_with($key, self::CONFIG_PREFIX)) {
+            $key = self::CONFIG_PREFIX . $key;
+        }
+
+        $this->vault->seal(strtoupper($key), (string) $value);    // ← seal() 加密写入
+
+        // ↓ 紧接在 seal 之后、下一次循环之前
+        if ($opCacheEnabled && opcache_is_script_cached($this->pathPrefix . 'list.php')) {
+            opcache_invalidate($this->pathPrefix . 'list.php', true);
+        }
+    }
 }
 ```
-写入配置后使配置列表文件的 OPcache 失效。
+
+**为什么每次 seal 后都要失效？** `seal()` 每写入一个配置项，vault 的 `list.php` 文件内容就会变化。如果不清 OPcache，下一次 PHP 请求可能读到旧的列表文件，找不到刚写入的配置项。因此在循环内部、每写一条就失效一次，确保下一次请求一定能读到最新列表。
+
+- 失效的文件是 `{SOLIDINVOICE_CONFIG_DIR}/{env}.{env}.list.php`
+- 保存 N 个配置项 → 触发 N 次 `opcache_invalidate()`
+- `true` 参数表示强制递归失效
 
 ---
 
