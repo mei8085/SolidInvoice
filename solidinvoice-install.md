@@ -205,8 +205,11 @@ public static function validate(self $data, ExecutionContextInterface $execution
         && null !== $data->name && null !== $data->host) {
         try {
             $params = (array) $data;
-            unset($params['name']);
+            unset($params['name']);   // ← 关键：测连前 unset 数据库名
             $params['driver'] = Drivers::getDriver($data->driver);
+            $params['driverOptions'] = [
+                PDO::ATTR_TIMEOUT => 5,
+            ];
             DriverManager::getConnection($params)->getNativeConnection();
         } catch (Throwable $e) {
             $executionContext->addViolation($e->getMessage());
@@ -215,7 +218,28 @@ public static function validate(self $data, ExecutionContextInterface $execution
 }
 ```
 
-> 关键点：这一步**只验证能否连接数据库服务器**，不验证数据库是否存在，也不创建数据库。
+> **为什么测连前必须 unset dbname？**
+> 
+> 这是整个安装流程时序设计的核心，理解这点才能看清全貌：
+> 
+> **时序约束**：
+> 1. **database_config 表单阶段**（当前）：用户填写数据库信息 → 点击"下一步"
+> 2. **CreateDatabaseStep 异步安装阶段**（后续）：真正执行 `CREATE DATABASE` 语句
+> 
+> **如果不 unset 会发生什么**：
+> - `DriverManager::getConnection($params)` 会在建立连接后立即执行 `USE <dbname>`
+> - 但此时数据库还没被创建（创建是在后面的 CreateDatabaseStep）
+> - 必然返回 `Unknown database '<dbname>'` 错误，用户永远无法通过这一步
+> 
+> **unset 后的行为**：
+> - MySQL：连接到默认的 `mysql` 系统库
+> - PostgreSQL：连接到默认的 `postgres` 系统库
+> - 只要用户名、密码、主机、端口正确，就能连上
+> - 目的是验证"用户有没有权限连接到这台数据库服务器"，而不关心具体数据库
+>
+> 其他细节：
+> - `PDO::ATTR_TIMEOUT => 5`：5 秒连接超时，避免界面长时间卡住
+> - `Drivers::getDriver($data->driver)`：将用户选择的 `mysql`/`mariadb` 等映射为 `pdo_mysql` 等真实驱动名
 
 #### 步骤 4：user_account
 
@@ -512,6 +536,73 @@ if ($form->isSubmitted() && $form->isValid() && $form->isFinished()) {
 **执行操作**：自动调用 `$this->migration->migrate()` 执行迁移。
 
 > 这意味着：即使在已安装状态下，如果代码更新带来了新的迁移，第一次访问会自动执行数据库迁移。
+
+---
+
+## 命令行安装链路（InstallCommand）
+
+除了 Web 安装向导，SolidInvoice 还提供了命令行安装方式。
+
+**文件**：[InstallCommand.php](file:///d:/fz/0601-1/solo-dogfeeding/code/96-SolidInvoice/src/InstallBundle/Command/InstallCommand.php)
+
+**命令名**：`app:install`（执行方式：`bin/console app:install`）
+
+### 是否启用
+
+通过 `isEnabled()` 方法控制（第 79-82 行），已安装时命令不可用。
+
+### 执行流程
+
+```
+validate() → saveConfig() → install()
+```
+
+#### 第一阶段：validate() - 参数校验（第 128-153 行）
+
+校验必填选项：
+- `--database-host`、`--database-user`、`--locale`、`--application-url`
+- 如果不跳过用户创建（无 `--skip-user`），还需 `--admin-password`、`--admin-email`
+
+校验内容：
+1. 必填选项是否都提供了
+2. locale 是否合法
+3. application-url 是否包含 http/https 协议且格式有效
+
+#### 第二阶段：saveConfig() - 保存配置（第 229-271 行）
+
+1. 组装配置数组（数据库配置、locale、application_url、app_secret 等）
+2. **测试数据库连接**（`DriverManager::getConnection()`）
+3. 获取数据库服务器版本（`PDO::ATTR_SERVER_VERSION`）
+4. 通过 `ConfigWriter` 批量保存所有配置
+5. **重置整个容器**（`$container->reset()`）使新配置生效
+
+> 与 Web 向导的区别：命令行安装是一次性把所有配置写入，而 Web 向导分两阶段——先在 InstallFlowType 中写数据库配置，最后在 Install Action 中写安装标记。
+
+#### 第三阶段：install() - 执行安装（第 158-180 行）
+
+1. 遍历所有 `InstallationStepInterface` 步骤并逐个执行
+2. 如果不跳过用户创建，调用 `createAdminUser()` 创建管理员
+3. 更新 Version 实体记录版本号
+4. **最后写入 `installed` 标记**，标记安装完成
+
+> 与 Web 向导的区别：命令行安装的 Version 更新和 installed 标记写入都在 `install()` 方法内完成；而 Web 向导中 Version 由 RunMigrationsStep 更新，installed 由 Install Action 写入。
+
+### 交互模式
+
+如果命令选项未提供参数，会进入交互模式（`interact()` 方法），逐个提问：
+- 数据库类型（从可用 PDO 驱动中选择，SQLite 被排除）
+- 数据库主机、端口、库名、用户名、密码
+- locale
+- application URL
+- 管理员邮箱和密码
+
+### IsInstalledCommand
+
+**文件**：[IsInstalledCommand.php](file:///d:/fz/0601-1/solo-dogfeeding/code/96-SolidInvoice/src/InstallBundle/Command/IsInstalledCommand.php)
+
+**命令名**：`solidinvoice:is-installed`（隐藏命令）
+
+**用途**：脚本中判断应用是否已安装。已安装退出码 0，未安装退出码 1。常用于 CI/CD 或容器启动脚本中。
 
 ---
 
