@@ -327,11 +327,19 @@ base.html.twig (邮件基础模板)
 - 定义mPDF的pagefooter、watermark等通用配置
 - 定义 `body` block 供子模板覆盖
 
-**发票PDF模板：**
-1. **默认模板** - [invoice.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Pdf/invoice.html.twig#L55-L60)
-2. **Classic模板** - [classic/pdf.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/classic/pdf.html.twig#L14-L16)
-3. **Friendly模板** - [friendly/pdf.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/friendly/pdf.html.twig#L23)
-4. **Studio模板** - [studio/pdf.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/studio/pdf.html.twig#L15)
+**8 套 PDF variant 子模板（全部继承 `_pdf_base.html.twig`）：**
+1. **Classic** - [classic/pdf.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/classic/pdf.html.twig)
+2. **Friendly** - [friendly/pdf.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/friendly/pdf.html.twig)
+3. **Studio** - [studio/pdf.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/studio/pdf.html.twig)
+4. **Modern** - [modern/pdf.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/modern/pdf.html.twig)
+5. **Compact** - [compact/pdf.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/compact/pdf.html.twig)
+6. **Editorial** - [editorial/pdf.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/editorial/pdf.html.twig)
+7. **Monochrome** - [monochrome/pdf.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/monochrome/pdf.html.twig)
+8. **Photographer** - [photographer/pdf.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/photographer/pdf.html.twig)
+
+**独立模板体系（不继承基础层）：**
+- 默认发票模板 - [invoice.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Pdf/invoice.html.twig)
+- 默认报价单模板 - [quote.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/QuoteBundle/Resources/views/Pdf/quote.html.twig)
 
 **报价单PDF模板：**
 - [quote.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/QuoteBundle/Resources/views/Pdf/quote.html.twig#L54-L60)
@@ -421,75 +429,218 @@ SolidInvoice 的 PDF 使用 **mPDF** 引擎渲染，涉及三个与品牌资产�
 
 **覆盖关系：** 子模板（classic/friendly/studio 等）**都不覆盖**页脚，全部继承基础模板。
 
-#### 4.2.3 页眉 (Header)
+#### 4.2.3 页眉 (Header) —— 八套子模板全景对比（徽标与公司名双通道拆分）
 
-**重要理解：** 此处"页眉"**不是** mPDF 的 `<pageheader>` 标签，而是各 PDF 模板在 `<body>` 开头用普通 HTML 表格实现的品牌抬头区域。每页第一页显示，后续页不重复（这是内容的一部分，不是 mPDF 层面的页面页眉）。
+**重要理解：** 此处"页眉"**不是** mPDF 的 `<pageheader>` 标签，而是各 PDF 模板在 `<body>` 开头用普通 HTML 表格实现的品牌抬头区域。每页第一页显示，后续页不重复。
 
-**品牌资产引用（三套子模板对比）：**
+**三通道品牌架构定义：**
 
-| 模板 | Logo 尺寸 | Logo 条件判断 | 公司名来源 | 其他品牌信息 | 代码位置 |
-|------|-----------|--------------|-----------|-------------|----------|
-| **Classic** | 50px | `if setting('system/company/logo') is not empty` | `company_name()` | 无（公司详情在下方 from_block 中） | [classic/pdf.html.twig#L14-L17](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/classic/pdf.html.twig#L14-L17) |
-| **Friendly** | 40px | `if setting('system/company/logo') is not empty` | `company_name()` | 无 | [friendly/pdf.html.twig#L23-L24](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/friendly/pdf.html.twig#L23-L24) |
-| **Studio** | 40px | `if setting('system/company/logo') is not empty` | 仅 Invoice 编号（公司名在 from_block 中） | 项目名称大标题 | [studio/pdf.html.twig#L15](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/studio/pdf.html.twig#L15) |
+| 通道 | 标识 | 函数/宏 | 数据来源 | 说明 |
+|------|------|---------|----------|------|
+| 通道 A：徽标 | A | `app_logo(N)` | `system/company/logo` | 图片形式的品牌识别 |
+| 通道 B：公司名 | B | `company_name()` | `system/company/company_name` → APP_NAME 降级 | 文字形式的品牌识别（页眉直接调用） |
+| 通道 C：发件方信息 | C | `inv.from_block()` | `company_name()` + vat_number + email + phone + address | 完整联系信息块（内部也会输出公司名） |
+
+**八套 variant 三通道对照矩阵：**
+
+| 模板 | 通道A 徽标 | 通道B 页眉公司名 | 通道C from_block 宏 | 三通道状态 | 页眉风格分类 |
+|------|----------|----------------|-------------------|-----------|------------|
+| **Classic** | ✅ 50px | ✅ 直接调用 | ✅ L31 `inv.from_block()` | ✅✅✅ 三通道全 | 徽标+公司名 分栏布局（边框 masthead） |
+| **Friendly** | ✅ 40px | ✅ 直接调用 | ✅ L61 `inv.from_block()` | ✅✅✅ 三通道全 | 徽标+公司名 分栏布局（暖桃色背景） |
+| **Studio** | ✅ 40px | ❌ 页眉无直接调用 | ✅ L32 `inv.from_block('invoice.template.studio.studio')` | ✅❌✅ A+C 仅 | 仅徽标 + 项目名称大标题（项目导向） |
+| **Modern** | ❌ 无徽标 | ❌ 页眉无直接调用 | ✅ L29 `inv.from_block()` | ❌❌✅ 仅C | 极简主义，大号 amount 36pt 数字英雄区 |
+| **Compact** | ❌ 无徽标 | ✅ 16pt 粗体 深色横条 | ✅ L33 `inv.from_block()` | ❌✅✅ B+C 仅 | 公司名+左侧6px绿色竖条 + 深色横条 |
+| **Editorial** | ❌ 无徽标 | ✅ 斜体 14pt 右对齐 | ✅ L34 `inv.from_block()` | ❌✅✅ B+C 仅 | 杂志衬线体，罗马数字分节 I./II./III. |
+| **Monochrome** | ❌ 无徽标 | ✅ 8pt 大写字母间距 右上角 | ❌ L52 `{{ invoice.client }}` 直接输出客户名 | ❌✅❌ 仅B（异常！） | 奶油色英雄卡 + 白色账本卡 + 全出血黑底 |
+| **Photographer** | ❌ 无徽标 | ✅ 28pt Georgia 衬线大标题 | ✅ L44 `inv.from_block('invoice.template.photographer.studio_label')` | ❌✅✅ B+C 仅 | 14mm 陶土色左竖条 + 行业定制标签 |
+
+**通道独立性统计：**
+- 通道 A（徽标）覆盖率：**3/8**（classic、friendly、studio）
+- 通道 B（页眉直接公司名）覆盖率：**6/8**（classic、friendly、compact、editorial、monochrome、photographer）
+- 通道 C（from_block 宏）覆盖率：**7/8**（除 monochrome 外全部）
+- 三通道全覆盖：**2/8**（classic、friendly）
+- 完全无品牌英雄（页眉A+B都缺）：**1/8**（仅 modern）
+
+**用户观察验证：** 确实有 **4 套 variant（modern/compact/editorial/photographer）** 未调整徽标渲染入口（无通道A），却仍以 `company_name()` 展示公司名（通道B），加上 **monochrome**（也无A有B）= **5 套无徽标但有公司名**。modern 是唯一页眉中既无徽标也无直接公司名调用的 variant。
+
+**八套页眉布局风格分类：**
+
+| 风格类型 | 包含模板 | 设计特征 |
+|----------|---------|---------|
+| 徽标+公司名 分栏布局 | classic, friendly | 左右两列，左徽标+文字，右发票编号 |
+| 仅徽标导向 | studio | 左徽标，右编号，下方独立项目色块 |
+| 公司名+行业色彩条 | compact, photographer | 强烈的色彩/几何元素 + 大号公司名 |
+| 排版艺术导向 | editorial, monochrome | 字体排印为主，用字号/斜体/字间距塑造品牌感 |
+| 极简数据导向 | modern | 完全弱化品牌，突出金额数字 |
 
 **默认发票模板（独立体系）：**
-- Logo 尺寸：50px
-- 公司名：`company_name()` 18pt 粗体
-- 额外信息：VAT 号、邮箱、电话、地址（全部在页眉内联展示，不用 from_block 宏）
+- 通道 A ✅ Logo 50px
+- 通道 B ✅ `company_name()` 18pt 粗体
+- 通道 C ❌ 不调用 from_block 宏（VAT/邮箱/电话/地址全部内联展示在页眉）
 - 代码：[invoice.html.twig#L54-L88](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Pdf/invoice.html.twig#L54-L88)
-
-**三套子模板页眉布局差异：**
-
-**Classic：** 左右两列表格布局，左侧 Logo + 公司名，右侧发票编号（带边框 masthead）
-
-**Friendly：** 左右两列表格布局，左侧 Logo + 公司名（margin-top: 8px），右侧发票编号（温暖桃色风格）
-
-**Studio：** 左右两列表格布局，左侧 Logo，右侧发票编号，下方另有独立的项目名称大色块（项目导向设计）
 
 **覆盖关系：**
 - 基础模板 `_pdf_base.html.twig` **不定义页眉**（仅定义水印和页脚）
 - 每个子模板在 `{% block body %}` 内自行实现页眉
-- 三套模板之间**互不继承**，各自独立实现页眉样式
+- 八套子模板之间**互不继承**，各自独立实现页眉样式
 
-#### 4.2.4 品牌信息的两大来源对比
+#### 4.2.4 品牌资产三通道独立架构
 
-| 品牌元素 | 来源函数/常量 | 底层数据 | 出现位置 |
-|----------|--------------|----------|----------|
-| **公司徽标** | `app_logo(N)` | `system/company/logo` 设置 | 页眉（3种 variant 有 + 默认模板 + 邮件模板）、Web页面、设置预览 |
-| **公司名称** | `company_name()` | `system/company/company_name` 设置 | 页眉、from_block 宏、Web页面、Email |
-| **应用名** | `APP_NAME` 常量 | 硬编码 `'SolidInvoice'` | 页脚 "Powered by SolidInvoice" |
-| **公司联系信息** | `setting()` + `address()` | `vat_number` / `email` / `phone_number` / `address` | from_block 宏、默认模板页眉 |
+品牌资产不是单一通道，而是三个**完全解耦**的独立通道：
 
-**公司名的降级逻辑：** `company_name()` 函数优先从 `system/company/company_name` 读取，若为空则回退到 `APP_NAME` 常量（即 "SolidInvoice"）。
+| 通道 | 入口函数/宏 | 底层数据 | 独立性证明 |
+|------|------------|----------|-----------|
+| **A. 公司徽标** | `app_logo(N)` | `system/company/logo` | 可独立开关（if setting 判断），与公司名无依赖 |
+| **B. 公司名称** | `company_name()` | `system/company/company_name` → `APP_NAME` 降级 | 可独立存在于任何位置，不需要徽标先存在 |
+| **C. 发件方信息块** | `inv.from_block(label)` | `company_name()` + 4 项 `setting()` 调用 | 内部包含通道B，还额外包含 VAT/邮箱/电话/地址，是通道B的超集 |
 
-### 4.3 三套子模板与基础模板的覆盖关系总览
+**三通道解耦关系图：**
+
+```
+        ┌──────────────────────────────────────┐
+        │        app_config 数据库表            │
+        │  (system/company/* 多租户隔离)        │
+        └──────┬──────────┬──────────┬─────────┘
+               │          │          │
+     ┌─────────▼──┐  ┌───▼──────┐  ┌▼────────────────────┐
+     │ A: app_logo │  │ B:company│  │ C: inv.from_block() │
+     │  (图片)     │  │  _name() │  │  (宏 - 内部调用B)   │
+     └─────────────┘  │  (文字)  │  │  + vat/email/phone/ │
+                      └──────────┘  │  address            │
+                                    └─────────────────────┘
+```
+
+**独立性证明（按 variant 交叉验证）：**
+
+| 证明目标 | 证据 variant | 说明 |
+|----------|-------------|------|
+| A可独立于B存在 | studio | 有徽标(A)，页眉无直接 company_name(B)，B仅出现在 from_block(C) 内部 |
+| B可独立于A存在 | compact, editorial, monochrome, photographer | 有公司名(B)，完全无徽标(A) |
+| C可独立于A存在 | modern, compact, editorial, photographer | from_block(C) 存在但无徽标(A) |
+| C包含B | 所有调用 from_block 的 variant | from_block 宏内部第4行就调用 `company_name()` |
+| B和C可同时在页眉存在 | classic, friendly | 页眉直接调用 company_name(B) + 下方调用 from_block(C)，导致公司名出现两次 |
+
+**各品牌元素的完整引用位置汇总：**
+
+| 品牌元素 | 来源函数/常量 | 底层数据 | PDF variant 引用 | Email 引用 | Web 引用 |
+|----------|--------------|----------|-----------------|-----------|---------|
+| **A 公司徽标** | `app_logo(N)` | `system/company/logo` | 3/8 variant + 默认模板 | ✅ base.html.twig | ✅ top.html.twig + 设置预览 |
+| **B 公司名称** | `company_name()` | `system/company/company_name` → APP_NAME | 6/8 variant 页眉直接 + 7/8 via from_block | ✅ base + _email_base | ✅ top.html.twig |
+| **应用名** | `APP_NAME` 常量 | 硬编码 `'SolidInvoice'` | ✅ 所有 PDF 页脚 | ✅ Email 签名 | ✅ 登录页等 |
+| **C 公司联系信息** | `setting()` + `address()` | vat_number/email/phone_number/address | 7/8 variant via from_block | ❌ Email 正文不含 | ❌ Web 不含 |
+
+**公司名的降级逻辑：** `company_name()` 函数优先从 `system/company/company_name` 读取，若为空则回退到 `APP_NAME` 常量（即 "SolidInvoice"）。但邮件基础模板使用 `setting('system/company/company_name')` 直接读取，**无降级**。
+
+#### 4.2.5 发件方信息宏 (from_block) 作为第三品牌通道
+
+**宏定义位置：** [_macros.html.twig#L38-L68](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/_macros.html.twig#L38-L68)
+
+**完整宏代码：**
+
+```twig
+{% macro from_block(label='invoice.from') %}
+    <div>
+        <div style="...">{{ label|trans }}</div>
+        <div style="...">{{ company_name() }}</div>
+        <div>
+            {% set vatNumber = setting('system/company/vat_number') %}
+            {% if vatNumber is not empty %}<div>...{% endif %}
+            {% set companyEmail = setting('system/company/contact_details/email') %}
+            {% if companyEmail is not empty %}<div>{{ companyEmail }}</div>{% endif %}
+            {% set companyPhone = setting('system/company/contact_details/phone_number') %}
+            {% if companyPhone is not empty %}<div>{{ companyPhone }}</div>{% endif %}
+            {% set companyAddress = setting('system/company/contact_details/address', null, true) %}
+            {% if companyAddress is not empty %}<div>{{ address(companyAddress)|replace({"\n": ", "}) }}</div>{% endif %}
+        </div>
+    </div>
+{% endmacro %}
+```
+
+**宏内部的数据库查询（单次调用 = 5 次 DB 查询）：**
+1. `company_name()` → `system/company/company_name`
+2. `setting('system/company/vat_number')`
+3. `setting('system/company/contact_details/email')`
+4. `setting('system/company/contact_details/phone_number')`
+5. `setting('system/company/contact_details/address')`
+
+**八套 variant 调用情况对比：**
+
+| 模板 | 是否调用 from_block | 自定义 label 参数 | 实际输出的公司名来源 | 异常检查 |
+|------|-------------------|------------------|-------------------|---------|
+| Classic | ✅ L31 | ❌ 默认 `invoice.from` | 宏内部 `company_name()` | 正常 |
+| Friendly | ✅ L61 | ❌ 默认 `invoice.from` | 宏内部 `company_name()` | 正常 |
+| Studio | ✅ L32 | ✅ `invoice.template.studio.studio`（译为 "Studio"） | 宏内部 `company_name()` | 正常 |
+| Modern | ✅ L29 | ❌ 默认 `invoice.from` | 宏内部 `company_name()` | 正常 |
+| Compact | ✅ L33 | ❌ 默认 `invoice.from` | 宏内部 `company_name()` | 正常 |
+| Editorial | ✅ L34 | ❌ 默认 `invoice.from` | 宏内部 `company_name()` | 正常 |
+| **Monochrome** | ❌ **不调用！** | —— | L52 `{{ invoice.client }}` 输出**客户名称** | ⚠️ **异常：缺少开票方联系信息** |
+| Photographer | ✅ L44 | ✅ `invoice.template.photographer.studio_label`（译为 "Studio"） | 宏内部 `company_name()` | 正常 |
+
+**Monochrome 模板异常分析：**
+- 位置：[monochrome/pdf.html.twig#L52](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/monochrome/pdf.html.twig#L52)
+- 代码：`{{ invoice.client }}` —— 此变量输出**客户/收票方公司名称**，不是开票方
+- 后果：该模板可能完全缺失开票方的 VAT 号、邮箱、电话、地址等关键联系信息
+- 修复建议：替换为 `{{ inv.from_block() }}` 或至少调用 `{{ company_name() }}` + 四项联系信息 setting
+
+**页眉/正文中通道使用的五种模式：**
+
+| 模式 | 页眉通道 | 正文from_block | 包含模板数 | 品牌露出次数 |
+|--------|---------|--------------|-----------|------------|
+| 模式一：三通道全 | A+B 直接 | ✅ C | 2（classic, friendly） | 公司名 ×2（页眉+from_block）+ 徽标 ×1 |
+| 模式二：仅A+C | A 直接 | ✅ C | 1（studio） | 公司名 ×1（from_block内）+ 徽标 ×1 |
+| 模式三：仅B+C | B 直接 | ✅ C | 3（compact, editorial, photographer） | 公司名 ×2（页眉+from_block内） |
+| 模式四：仅C | ❌ A+B | ✅ C | 1（modern） | 公司名 ×1（from_block内） |
+| 模式五：仅B异常 | B 直接 | ❌ C（用invoice.client替代） | 1（monochrome） | 公司名 ×1（页眉右上角小字） |
+
+### 4.3 八套子模板与基础模板的覆盖关系总览
 
 ```
 _pdf_base.html.twig (基础层)
-  ├── @page { footer: footer; margin-* }   ← CSS 页面布局
-  ├── <watermarktext>                      ← 水印（继承，全部子模板都不改）
-  ├── <pagefooter name="footer">           ← 页脚（继承，全部子模板都不改）
-  ├── {% block extra_styles %}             ← 额外样式块
-  │      ├── Friendly: 背景色 #fffaf3
-  │      ├── Classic: 不覆盖（默认）
-  │      └── Studio: 不覆盖（默认）
-  ├── {% block body_attrs %}               ← body 属性块
-  │      └── Friendly: style="background-color: #fffaf3;"
-  └── {% block body %}                      ← 正文块（每个子模板全覆盖）
-         ├── 页眉（各自实现）
-         ├── 发件/收件信息（from_block 宏）
+  ├── @page { footer: footer; margin-* }      ← CSS 页面布局
+  ├── <watermarktext>                         ← 水印（继承，全部子模板都不改）
+  ├── <pagefooter name="footer">              ← 页脚（继承，全部子模板都不改）
+  ├── {% block extra_styles %}                ← 额外样式块（5 套覆盖）
+  │      ├── Friendly:   背景色 #fffaf3 + 自定义内边距
+  │      ├── Modern:     Helvetica 字体族 + 自定义颜色
+  │      ├── Editorial:  Georgia/Times 衬线字体
+  │      ├── Monochrome:  奶油/黑双色方案 + 卡片圆角
+  │      ├── Photographer: 陶土色 #c2724f + Georgia 字体
+  │      ├── Classic:    不覆盖（默认）
+  │      ├── Studio:     不覆盖（默认）
+  │      └── Compact:    不覆盖（默认）
+  ├── {% block body_attrs %}                  ← body 属性块（3 套覆盖）
+  │      ├── Friendly:    style="background-color: #fffaf3;"
+  │      ├── Monochrome:  style="background-color: #f5f1e8;" 奶油色全出血
+  │      ├── Photographer: style="margin-left: 14mm;" 14mm 左侧色条
+  │      └── 其余 5 套:  不覆盖（默认）
+  └── {% block body %}                         ← 正文块（全部 8 套全覆盖）
+         ├── 页眉（8 套各自独立实现）
+         ├── 发件/收件信息（7/8 用 from_block 宏，1/8 异常）
          ├── 明细表格
          ├── 总计
          ├── 条款
          └── 支付按钮
 ```
 
-**继承规则：**
-- Classic：仅覆盖 `body` block
-- Friendly：覆盖 `body` + `extra_styles` + `body_attrs`（自定义背景色）
-- Studio：仅覆盖 `body` block
-- 三套模板**都不覆盖**水印和页脚
+**继承规则完整对照（8 套）：**
+
+| 模板 | extra_styles | body_attrs | body | 水印 | 页脚 |
+|------|-------------|-----------|------|------|------|
+| Classic | ❌ | ❌ | ✅ 全覆盖 | ❌ 继承 | ❌ 继承 |
+| Friendly | ✅ 暖桃色背景 | ✅ 背景色 | ✅ 全覆盖 | ❌ 继承 | ❌ 继承 |
+| Studio | ❌ | ❌ | ✅ 全覆盖 | ❌ 继承 | ❌ 继承 |
+| Modern | ✅ Helvetica 字体 | ❌ | ✅ 全覆盖 | ❌ 继承 | ❌ 继承 |
+| Compact | ❌ | ❌ | ✅ 全覆盖 | ❌ 继承 | ❌ 继承 |
+| Editorial | ✅ 衬线字体 | ❌ | ✅ 全覆盖 | ❌ 继承 | ❌ 继承 |
+| Monochrome | ✅ 双色卡片 | ✅ 奶油色背景 | ✅ 全覆盖 | ❌ 继承 | ❌ 继承 |
+| Photographer | ✅ 陶土色+Georgia | ✅ 14mm左边距 | ✅ 全覆盖 | ❌ 继承 | ❌ 继承 |
+
+**全局覆盖规律：**
+- 水印：0/8 覆盖（全部继承基础层）
+- 页脚：0/8 覆盖（全部继承基础层）
+- body：8/8 全覆盖（各自独立实现页眉和内容）
+- extra_styles：5/8 覆盖（friendly/modern/editorial/monochrome/photographer）
+- body_attrs：3/8 覆盖（friendly/monochrome/photographer）
 
 ### 4.4 两套 PDF 模板体系的区别
 
@@ -502,12 +653,12 @@ SolidInvoice 中实际上存在**两套独立的 PDF 模板体系**：
 | 水印 | 独立实现（逻辑相同） | 继承基础模板 |
 | 页脚 | 独立实现（但逻辑不同⚠️） | 继承基础模板 |
 | 页眉 | 内联实现，包含完整公司联系信息 | 各自实现，公司详情用 from_block 宏 |
-| 数量 | 1 个（发票）+ 1 个（报价单） | 9 种变体 |
+| 数量 | 1 个（发票）+ 1 个（报价单） | 8 种 variant |
 | hide_powered_by 检查 | 仅检查设置值 | 检查设置 + custom_branding 功能 |
 
-**品牌资产复用方式总结：**
+**品牌资产复用方式总结（按通道拆分）：**
 
-**所有 PDF 模板统一调用 `app_logo()` 函数：**
+**通道 A —— 徽标：3/8 variant + 默认模板**
 
 ```twig
 {% if setting('system/company/logo') is not empty %}
@@ -515,11 +666,17 @@ SolidInvoice 中实际上存在**两套独立的 PDF 模板体系**：
 {% endif %}
 ```
 
+**通道 B —— 公司名：6/8 variant 页眉直接 + 7/8 via from_block + 默认模板**
+
+```twig
+{{ company_name() }}  {# 页眉直接调用，带 APP_NAME 降级 #}
+```
+
 **关键特性：**
 - ✅ **完全复用Web端同一函数**：`app_logo()` 同一套代码
 - ✅ **同一数据源**：读取 `system/company/logo` 同一配置
 - ✅ **无特殊处理**：data URI 格式直接被 mPDF 识别渲染
-- ✅ **多模板一致**：Classic/Friendly/Studio/默认 模板都使用相同方式
+- ✅ **多模板一致**：3/8 variant 有徽标，6/8 variant 有页眉公司名，7/8 有 from_block
 
 ### 4.5 PDF生成完整流程
 
@@ -580,9 +737,9 @@ View Action - [View.php#L48-L50](file:///d:/fz/0601-1/solo-dogfeeding/code/97-So
           ┌───────────────────────────┼───────────────────────────┐
           ▼                           ▼                           ▼
 ┌─────────────────────┐   ┌─────────────────────┐   ┌─────────────────────┐
-│  Web页眉渲染         │   │  PDF渲染            │   │  表单预览           │
+│  Web页眉渲染         │   │  PDF渲染            │   │  表单预览           │   │  表单预览           │
 │  top.html.twig      │   │  invoice.html.twig  │   │  fields.html.twig   │
-│  {{ app_logo(25) }} │   │  {{ app_logo(50) }} │   │  {{ app_logo(80) }} │
+│  {{ app_logo(25) }} │   │  {{ company_name() }}│   │  {{ app_logo(80) }} │
 └───────────┬─────────┘   └───────────┬─────────┘   └───────────┬─────────┘
             │                         │                         │
             └─────────────────────────┼─────────────────────────┘
@@ -630,17 +787,49 @@ View Action - [View.php#L48-L50](file:///d:/fz/0601-1/solo-dogfeeding/code/97-So
 | Action | [View.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Action/View.php) | 发票查看/导出 |
 | Action | [ViewBilling.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Action/ViewBilling.php) | 外部账单查看 |
 
-### PDF 模板
+### PDF 模板（含完整 8 variant + 三通道对照）
 
-| 模板 | 路径 | Logo | 水印 | 页脚 | 备注 |
-|------|------|------|------|------|------|
-| 基础层 | [_pdf_base.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/_pdf_base.html.twig) | — | ✅ | ✅ | 所有变体的父模板 |
-| 宏定义 | [_macros.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/_macros.html.twig) | — | — | — | `from_block()` 等共享宏 |
-| 默认发票 | [invoice.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Pdf/invoice.html.twig) | 50px | ✅ | ✅ | 独立模板（不继承基础层） |
-| Classic | [classic/pdf.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/classic/pdf.html.twig) | 50px | ✅(继承) | ✅(继承) | 专业边框风格 |
-| Friendly | [friendly/pdf.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/friendly/pdf.html.twig) | 40px | ✅(继承) | ✅(继承) | 温暖对话风格 |
-| Studio | [studio/pdf.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/studio/pdf.html.twig) | 40px | ✅(继承) | ✅(继承) | 项目导向风格 |
-| 报价单 | [quote.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/QuoteBundle/Resources/views/Pdf/quote.html.twig) | 50px | ✅ | ✅ | 独立模板（蓝色主题） |
+| 模板/层级 | 文件路径 | 通道A 徽标 | 通道B 公司名(页眉) | 通道C from_block | 继承/覆盖关系 | 风格备注 |
+|----------|---------|-----------|-------------------|-----------------|--------------|---------|
+| 基础层 | [_pdf_base.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/_pdf_base.html.twig) | — | — | — | 定义水印+页脚+3个block | 全部 variant 的父模板 |
+| 共享宏 | [_macros.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/_macros.html.twig) | — | ✅ 宏内部调用 | 宏本身定义处 | 被 7/8 variant import | from_block() = 5次DB查询 |
+| Email 基础 | [_email_base.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/_email_base.html.twig) | ✅ via base | ✅ JSON-LD + 正文文案 | ❌ | 继承 Email core base | 8 Email variant 的父模板 |
+| 默认发票(独立) | [invoice.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Pdf/invoice.html.twig) | ✅ 50px | ✅ 18pt粗体 | ❌ 内联展示 | 独立模板(不继承基础层) | 页眉内联VAT/邮箱/电话/地址 |
+| **Classic** | [classic/pdf.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/classic/pdf.html.twig) | ✅ 50px | ✅ 直接调用 | ✅ L31 | extends _pdf_base (仅body) | 专业边框风格 masthead |
+| **Friendly** | [friendly/pdf.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/friendly/pdf.html.twig) | ✅ 40px | ✅ 直接调用 | ✅ L61 | extends _pdf_base (+extra_styles+body_attrs) | 温暖桃色对话风 #fffaf3 |
+| **Studio** | [studio/pdf.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/studio/pdf.html.twig) | ✅ 40px | ❌ 页眉无 | ✅ L32 | extends _pdf_base (仅body) | 项目导向，自定义label |
+| **Modern** | [modern/pdf.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/modern/pdf.html.twig) | ❌ 无 | ❌ 页眉无 | ✅ L29 | extends _pdf_base (+extra_styles Helvetica) | 极简主义，大号金额36pt |
+| **Compact** | [compact/pdf.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/compact/pdf.html.twig) | ❌ 无 | ✅ 16pt粗体深色横条 | ✅ L33 | extends _pdf_base (仅body) | 左侧6px绿竖条+深色横栏 |
+| **Editorial** | [editorial/pdf.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/editorial/pdf.html.twig) | ❌ 无 | ✅ 斜体14pt右对齐 | ✅ L34 | extends _pdf_base (+extra_styles 衬线) | 杂志衬线体，罗马数字分节 |
+| **Monochrome** | [monochrome/pdf.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/monochrome/pdf.html.twig) | ❌ 无 | ✅ 8pt大写字母间距 | ❌ 用invoice.client | extends _pdf_base (+extra_styles+body_attrs) | ⚠️异常! 缺少开票方联系信息 |
+| **Photographer** | [photographer/pdf.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/photographer/pdf.html.twig) | ❌ 无 | ✅ 28pt Georgia大标题 | ✅ L44 | extends _pdf_base (+extra_styles+body_attrs) | 14mm陶土色左竖条，行业定制label |
+| 报价单(独立) | [quote.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/QuoteBundle/Resources/views/Pdf/quote.html.twig) | ✅ 50px | ✅ 18pt粗体 | ❌ 内联展示 | 独立模板(不继承基础层) | 蓝色主题，水印独立实现 |
+
+### Email 模板（8 variant × 基础层）
+
+| 层级/模板 | 文件路径 | 通道A 徽标 | 通道B 公司名 | 继承关系 | 覆盖内容 |
+|----------|---------|-----------|------------|---------|---------|
+| Email 核心基础 | [base.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Resources/views/Layout/Email/base.html.twig#L57-L60) | ✅ `app_logo(100,null,true)` | ⚠️ `setting()`直接读取(无降级) | 最顶层 Email 基础 | 页眉品牌抬头全局定义 |
+| Email 组件宏 | [components.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Resources/views/Layout/Email/components.html.twig) | ✅ (company_header宏内含) | ✅ | 组件库 | company_header 宏（当前variants未使用） |
+| 发票 Email 基础 | [_email_base.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/_email_base.html.twig) | ✅ via base | ✅ JSON-LD+正文文案 | extends Email core base | intro + signoff blocks + JSON-LD |
+| **Email Classic** | [classic/email.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/classic/email.html.twig) | ✅ via继承 | ✅ via继承 | extends _email_base | 仅 `{% set accent = '#2e963a' %}` |
+| **Email Friendly** | [friendly/email.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/friendly/email.html.twig) | ✅ via继承 | ✅ via继承 | extends _email_base | 覆盖 intro block（温暖对话风） |
+| **Email Studio** | [studio/email.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/studio/email.html.twig) | ✅ via继承 | ✅ via继承 | extends _email_base | 覆盖 intro（项目导向文案） |
+| **Email Modern** | [modern/email.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/modern/email.html.twig) | ✅ via继承 | ✅ via继承 | extends _email_base | 覆盖 intro（极简风） |
+| **Email Compact** | [compact/email.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/compact/email.html.twig) | ✅ via继承 | ✅ via继承 | extends _email_base | 覆盖 intro（紧凑风） |
+| **Email Editorial** | [editorial/email.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/editorial/email.html.twig) | ✅ via继承 | ✅ via继承 | extends _email_base | 覆盖 intro（杂志衬线风） |
+| **Email Monochrome** | [monochrome/email.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/monochrome/email.html.twig) | ✅ via继承 | ✅ via继承 | extends _email_base | 覆盖 intro + signoff（黑白极简） |
+| **Email Photographer** | [photographer/email.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/photographer/email.html.twig) | ✅ via继承 | ✅ via继承 | extends _email_base | 覆盖 intro（行业定制） |
+
+**关键对比：PDF vs Email variant 品牌通道对称性**
+
+| 维度 | PDF 8 variant | Email 8 variant |
+|------|--------------|----------------|
+| 通道A（徽标）一致性 | ❌ 高度不一致（3/8有） | ✅ 完全一致（8/8 均通过继承获得） |
+| 通道B（公司名）一致性 | ⚠️ 部分一致（6/8页眉直接有） | ✅ 完全一致（8/8 均通过继承获得） |
+| 通道C（发件方信息） | ⚠️ 大部分有（7/8） | ❌ Email不含此类结构化发件方信息 |
+| 品牌展示方式 | 各variant独立设计 | 全部继承基础模板统一展示 |
+| 需要各自修改品牌抬头 | ✅ 是（8个文件都要改） | ❌ 否（改1个base文件即全局生效） |
 
 ### Web 模板
 
@@ -684,8 +873,10 @@ View Action - [View.php#L48-L50](file:///d:/fz/0601-1/solo-dogfeeding/code/97-So
 3. **缺少多尺寸生成**：Web端25px和PDF端50px使用同一张原图，浪费带宽和PDF体积。
 4. **Base64膨胀**：base64编码增加约33%体积，PDF中大量使用时会增大文件。
 5. **SystemConfig::get() 无缓存**：`SystemConfig.php` 的 `get()` 方法每次直接查询数据库，`self::$settings` 静态缓存仅用于 `getAll()` 批量读取。每个 `app_logo()` / `company_name()` / `setting()` 调用都触发一次 DB 查询。
-6. **Logo 不一致**：8种 PDF variant 子模板中仅3种（classic/friendly/studio）调用 `app_logo()`，其余5种（modern/compact/editorial/monochrome/photographer）完全不显示Logo。用户上传了Logo但部分模板看不到。
-7. **报价单PDF不继承基础层**：[quote.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/QuoteBundle/Resources/views/Pdf/quote.html.twig) 独立实现水印和页脚。根本原因是 `_pdf_base.html.twig` 的水印硬绑 `invoice.status.value` 变量，报价单的模板变量为 `quote`，无法直接继承（详见 4.2.1 节耦合分析）。
+6. **Logo 不一致**：8种 PDF variant 子模板中仅3种（classic/friendly/studio）调用 `app_logo()` 显示徽标（通道A），其余5种（modern/compact/editorial/monochrome/photographer）完全不显示徽标。但这5套中**有4套仍以 `company_name()` 函数展示公司名（通道B）** 作为品牌识别入口，仅 **modern** 一套在页眉中既无徽标也无公司名直接调用（仅通过 from_block 宏间接输出通道C）。用户上传了徽标但在多数模板中看不到，品牌展示完全依赖文字名称。
+7. **报价单PDF不继承基础层**：[quote.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/QuoteBundle/Resources/views/Pdf/quote.html.twig) 独立实现水印和页脚。根本原因是 `_pdf_base.html.twig` 的水印与 `invoice` 实体硬耦合（变量名 `invoice.status.value`、实体类型 `InvoiceStatus`、设置键 `invoice/watermark` 三重硬编码），报价单无法直接继承（详见 4.2.1 节耦合分析）。
 8. **`hide_powered_by` 逻辑不一致**：基础模板系使用两级开关（设置值 + `custom_branding` 功能），而默认发票/报价单模板仅检查设置值，可能导致免费用户也能隐藏 "Powered by SolidInvoice" 品牌标识。
 9. **两套PDF模板体系并存**：默认模板与模板变体各自独立实现水印、页脚和页眉，代码重复且逻辑有差异，维护成本高。
 10. **邮件模板公司名无降级**：[base.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Resources/views/Layout/Email/base.html.twig) 使用 `setting('system/company/company_name')` 而非 `company_name()` 函数，若公司名为空则显示空白，而 Web/PDF 端 `company_name()` 有降级到 `"SolidInvoice"` 的逻辑。
+11. **monochrome 模板缺少发件方联系信息**：[monochrome/pdf.html.twig#L52](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/monochrome/pdf.html.twig#L52) 是 8 套 variant 中唯一未调用 `inv.from_block()` 宏的模板，直接使用 `{{ invoice.client }}` 输出客户名称。这导致该模板可能缺少开票方的 VAT 号、邮箱、电话、地址等关键联系信息。
+12. **品牌通道三独立但缺乏统一配置**：徽标(A)、公司名(B)、发件方信息(C) 三个通道各自独立调用数据库，单次渲染可能产生 1(Logo) + 1(company_name) + 5(from_block) = **7 次数据库查询**（全部经由 `SystemConfig::get()`），加上邮件基础模板的额外 setting() 调用，性能有优化空间。
