@@ -58,9 +58,9 @@ new Config('system/company/company_name', $data['company_name'] ?? null, null, T
 
 ---
 
-## 二、徽标上传、处理与裁剪
+## 二、徽标上传的完整代码路径
 
-### 2.1 表单类型
+### 2.1 后端表单类型
 
 **ImageUploadType** - [ImageUploadType.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Form/Type/ImageUploadType.php)
 
@@ -72,14 +72,14 @@ new Config('system/company/company_name', $data['company_name'] ?? null, null, T
 ```php
 public const ALLOWED_MIME_TYPES = [
     'image/jpeg',
-    'image/png', 
+    'image/png',
     'image/gif',
     'image/webp',
 ];
 // SVG 被故意排除，因为内联SVG可执行JavaScript
 ```
 
-### 2.2 数据转换流程
+### 2.2 后端数据转换流程
 
 **DataTransformer::reverseTransform()** - [ImageUploadType.php#L67-L102](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Form/Type/ImageUploadType.php#L67-L102)
 
@@ -93,16 +93,87 @@ public const ALLOWED_MIME_TYPES = [
 **DataTransformer::transform()** - 反向转换
 - 从 `Setting` 实体读取值，创建虚拟 `File` 对象供表单显示
 
-### 2.3 关于裁剪
+### 2.3 客户端 Stimulus 控制器与 JS 模块
 
-**当前实现：无服务器端自动裁剪**
+#### 2.3.1 Stimulus 控制器注册
 
-- 仅在上传前通过表单提示推荐尺寸："Recommended: Square image, at least 200x200px"
-- 显示时通过HTML `width` 属性控制显示尺寸（CSS缩放）
-- 存储原始上传的base64数据，不做任何图像处理
-- 未使用GD/Imagick扩展进行裁剪或缩放
+**`logo_upload` 控制器** - 在 [fields.html.twig#L284](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Resources/views/Form/fields.html.twig#L284) 中通过 `stimulus_controller('logo_upload')` 绑定：
 
-**前端模板：** [fields.html.twig#L127-L144](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/SettingsBundle/Resources/views/Form/fields.html.twig#L127-L144)
+```twig
+<{{ element|default('div') }} {{ stimulus_controller('logo_upload') }}>
+    {{ app_logo(width=100, showDefault=false) }}
+    {{- form_widget(form, widget_attr) -}}
+    {{- form_help(form) -}}
+</{{ element|default('div') }}>
+```
+
+**⚠️ 关键发现：`logo_upload` 控制器当前无实现文件。** 在 `assets/controllers/` 目录和 `controllers.json` 中均未找到对应的 Stimulus 控制器注册。该 `stimulus_controller()` 调用仅会在 DOM 元素上生成 `data-controller="logo-upload"` 属性，但不会触发任何 JavaScript 逻辑。
+
+#### 2.3.2 UX Dropzone 控制器
+
+实际的上传交互由 **`@symfony/ux-dropzone`** 提供，注册于 [controllers.json#L34-L41](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/assets/controllers.json#L34-L41)：
+
+```json
+"@symfony/ux-dropzone": {
+    "dropzone": {
+        "enabled": true,
+        "fetch": "eager",
+        "autoimport": {
+            "@symfony/ux-dropzone/dist/style.min.css": true
+        }
+    }
+}
+```
+
+UX Dropzone 的客户端行为：
+- 将标准 `<input type="file">` 替换为拖拽区域 UI
+- 支持 **拖拽** 和 **点击选择** 两种上传方式
+- 上传后通过 Symfony Live Component（`data-action="live#action:prevent"` + `data-live-action-param="prevent|files|save"`）自动提交表单
+
+#### 2.3.3 客户端图片处理分析
+
+**当前状态：无客户端图片处理**
+
+| 处理环节 | 是否实现 | 说明 |
+|----------|----------|------|
+| 裁剪 (Crop) | ❌ | 无 Cropper.js 或类似库集成 |
+| 缩放 (Resize) | ❌ | 无 Canvas API 缩放逻辑 |
+| 压缩 (Compress) | ❌ | 无质量调节或格式转换 |
+| 尺寸校验 (Size Validation) | ❌ | 仅通过 help 文本提示推荐尺寸 |
+| MIME 校验 | ✅ | 后端 `ALLOWED_MIME_TYPES` + `getimagesize()` 双重验证 |
+| 伪造文件检测 | ✅ | `getimagesize()` 验证文件实际内容与扩展名一致 |
+
+**推荐尺寸提示** - 在 ImageUploadType 的 help 文本中：
+> "Recommended: Square image, at least 200x200px"
+
+此提示仅为文案，无 JavaScript 端强制校验。用户可上传任意尺寸/比例的图片，最终由 `app_logo()` 渲染时通过 HTML `width` 属性 CSS 缩放显示。
+
+### 2.4 上传提交流程（Live Component）
+
+**Settings 组件** - [Settings.html.twig#L41-L46](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/SettingsBundle/Resources/views/Components/Settings.html.twig#L41-L46)
+
+```twig
+{{ form_start(form, {
+    attr: {
+        'data-action': 'live#action:prevent',
+        'data-live-action-param': 'prevent|files|save'
+    }
+}) }}
+```
+
+- 表单提交通过 Symfony UX Live Component 的 `save` action 处理
+- `prevent|files|save` 参数指示 Live Component 同时处理文件上传
+- 后端 [Settings.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/SettingsBundle/Twig/Components/Settings.php#L131-L154) 从 `$request->files->all()` 提取文件
+
+### 2.5 引导流程中的品牌检查
+
+**Dashboard Checklist** - [UploadLogoItem.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/DashboardBundle/Checklist/Items/UploadLogoItem.php)
+- 在用户仪表盘显示"上传徽标"待办项
+- `isComplete()` 检查 `system/company/logo` 是否有值
+
+**SaaS Onboarding** - [CustomizeLogoStep.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/SaasBundle/Onboarding/Step/CustomizeLogoStep.php)
+- 引导步骤：如果 `system/company/logo` 为空则发送提醒邮件
+- 优先级 60（在设置公司名称之后）
 
 ---
 
