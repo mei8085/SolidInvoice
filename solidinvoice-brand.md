@@ -261,17 +261,182 @@ GlobalExtension::displayAppLogo()
 **报价单PDF模板：**
 - [quote.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/QuoteBundle/Resources/views/Pdf/quote.html.twig#L54-L60)
 
-### 4.2 品牌资产复用方式
+### 4.2 mPDF 三大区块深度解析：水印 / 页脚 / 页眉
 
-**所有PDF模板统一调用 `app_logo()` 函数：**
+SolidInvoice 的 PDF 使用 **mPDF** 引擎渲染，涉及三个与品牌资产相关的区块：
+
+| 区块 | mPDF 标签 | 定义位置 | 品牌资产 | 可否被子模板覆盖 |
+|------|-----------|----------|----------|-----------------|
+| **水印** | `<watermarktext>` | 基础模板 `_pdf_base.html.twig` | 发票状态文本（非品牌） | ❌ 不能（子模板不覆盖） |
+| **页脚** | `<pagefooter>` | 基础模板 `_pdf_base.html.twig` | 应用名 `SolidInvoice` | ❌ 不能（子模板不覆盖） |
+| **页眉** | 普通 HTML 表格（在 `body` block 内） | 各子模板各自实现 | 公司徽标 + 公司名 | ✅ 可以（每个子模板自己定义） |
+
+> **⚠️ 重要理解：** mPDF 中没有 `<pageheader>` 标签用于页眉！"页眉"是在 `<body>` 内部用普通 HTML 表格实现的，每个子模板在 `{% block body %}` 开头自己写。而页脚和水印是 mPDF 的特殊标签，在页面布局层面全局生效。
+
+#### 4.2.1 水印 (Watermark)
+
+**定义位置：** [_pdf_base.html.twig#L33-L35](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/_pdf_base.html.twig#L33-L35)
 
 ```twig
-{# 先检查logo是否存在 #}
-{% set logo = setting('system/company/logo') %}
-{% if logo is not empty %}
-    <div class="company-logo" style="margin-bottom: 10px;">
-        {{ app_logo(50) }}
-    </div>
+{% if setting('invoice/watermark') %}
+    <watermarktext content="{{ invoice.status.value|upper }}" alpha="0.08"/>
+{% endif %}
+```
+
+**技术细节：**
+- **mPDF 标签**：`<watermarktext>` —— mPDF 专有元素，在每页背景渲染文字水印
+- **控制开关**：`setting('invoice/watermark')`（配置键 `invoice/watermark`，布尔值）
+- **内容来源**：`invoice.status.value|upper` —— 发票状态枚举值的大写（如 `DRAFT`、`PAID`、`PENDING`、`OVERDUE`）
+- **透明度**：`alpha="0.08"` —— 8% 透明度，极浅不影响阅读
+- **品牌属性**：水印内容是**状态文本**，不包含任何公司品牌信息
+
+**两套模板体系的差异：**
+
+| 模板体系 | 水印控制键 | 内容来源 |
+|----------|-----------|----------|
+| 基础模板系（classic/friendly 等变体） | `invoice/watermark` | `invoice.status.value` |
+| 默认发票模板（独立） | `invoice/watermark` | `invoice.status.value` 相同 |
+| 报价单模板（独立） | `quote/watermark` | `quote.status.value` |
+
+报价单水印状态示例：`DRAFT`、`PENDING`、`ACCEPTED`、`DECLINED`、`EXPIRED`
+
+**覆盖关系：** 子模板（classic/friendly/studio 等）**都不覆盖**水印块，全部继承基础模板的实现。
+
+#### 4.2.2 页脚 (Page Footer)
+
+**定义位置：** [_pdf_base.html.twig#L39-L47](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/_pdf_base.html.twig#L39-L47)
+
+```twig
+{% set hide_powered_by_value = setting('system/general/hide_powered_by') is same as ('1') %}
+{% set hide_powered_by = hide_powered_by_value and feature_enabled('custom_branding') %}
+<pagefooter
+    name="footer"
+    content-left="{{ not hide_powered_by ? 'powered_by'|trans ~ ' ' ~ constant('SolidInvoice\\CoreBundle\\SolidInvoiceCoreBundle::APP_NAME') }}"
+    content-right="{{ 'pdf.page'|trans }} {PAGENO} {{ 'pdf.of'|trans }} {nb}"
+    line="on"
+    footer-style="border-top: 1px solid #e2e8f0; font-size: 8pt; color: #64748b; padding-top: 8px;"
+/>
+```
+
+**技术细节：**
+- **mPDF 标签**：`<pagefooter name="footer">` —— mPDF 专有元素
+- **CSS 关联**：`@page { footer: footer; }` —— 通过 `name` 属性与 CSS @page 规则绑定
+- **分隔线**：`line="on"` 显示页脚顶部 1px 分割线
+- **页码占位符**：`{PAGENO}`（当前页）、`{nb}`（总页数）由 mPDF 渲染时替换
+
+**左侧品牌信息（应用名）：**
+- **来源**：`SolidInvoiceCoreBundle::APP_NAME` 类常量，值为 `"SolidInvoice"`
+- **定义**：[SolidInvoiceCoreBundle.php#L26](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/SolidInvoiceCoreBundle.php#L26)
+- **文案**：`'powered_by'|trans ~ ' ' ~ 'SolidInvoice'` → `"Powered by SolidInvoice"`
+
+**显示控制（两级开关）：**
+1. 第一级：`setting('system/general/hide_powered_by')` —— 用户设置是否隐藏
+2. 第二级：`feature_enabled('custom_branding')` —— SaaS `custom_branding` 功能是否启用
+3. **隐藏条件**：两者同时为真才隐藏（SaaS 付费功能）
+
+**⚠️ 逻辑不一致发现：**
+
+| 模板 | hide_powered_by 判断逻辑 |
+|------|--------------------------|
+| 基础模板系（`_pdf_base`） | `hide_powered_by_value and feature_enabled('custom_branding')` —— 两级开关 |
+| 默认发票模板（`Pdf/invoice.html.twig`） | `setting('system/general/hide_powered_by') is not same as ('1')` —— 仅一级判断 |
+| 报价单模板（`Pdf/quote.html.twig`） | 同上，仅一级判断 |
+
+默认发票/报价单模板**没有**检查 `custom_branding` 功能开关，可能导致免费用户也能隐藏 "Powered by" 文字。
+
+**覆盖关系：** 子模板（classic/friendly/studio 等）**都不覆盖**页脚，全部继承基础模板。
+
+#### 4.2.3 页眉 (Header)
+
+**重要理解：** 此处"页眉"**不是** mPDF 的 `<pageheader>` 标签，而是各 PDF 模板在 `<body>` 开头用普通 HTML 表格实现的品牌抬头区域。每页第一页显示，后续页不重复（这是内容的一部分，不是 mPDF 层面的页面页眉）。
+
+**品牌资产引用（三套子模板对比）：**
+
+| 模板 | Logo 尺寸 | Logo 条件判断 | 公司名来源 | 其他品牌信息 | 代码位置 |
+|------|-----------|--------------|-----------|-------------|----------|
+| **Classic** | 50px | `if setting('system/company/logo') is not empty` | `company_name()` | 无（公司详情在下方 from_block 中） | [classic/pdf.html.twig#L14-L17](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/classic/pdf.html.twig#L14-L17) |
+| **Friendly** | 40px | 内联 if（不带 is not empty 判断） | `company_name()` | 无 | [friendly/pdf.html.twig#L23-L24](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/friendly/pdf.html.twig#L23-L24) |
+| **Studio** | 40px | `if setting('system/company/logo') is not empty` | 仅 Invoice 编号（公司名在 from_block 中） | 项目名称大标题 | [studio/pdf.html.twig#L15](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/studio/pdf.html.twig#L15) |
+
+**默认发票模板（独立体系）：**
+- Logo 尺寸：50px
+- 公司名：`company_name()` 18pt 粗体
+- 额外信息：VAT 号、邮箱、电话、地址（全部在页眉内联展示，不用 from_block 宏）
+- 代码：[invoice.html.twig#L54-L88](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Pdf/invoice.html.twig#L54-L88)
+
+**三套子模板页眉布局差异：**
+
+**Classic：** 左右两列表格布局，左侧 Logo + 公司名，右侧发票编号（带边框 masthead）
+
+**Friendly：** 左右两列表格布局，左侧 Logo + 公司名（margin-top: 8px），右侧发票编号（温暖桃色风格）
+
+**Studio：** 左右两列表格布局，左侧 Logo，右侧发票编号，下方另有独立的项目名称大色块（项目导向设计）
+
+**覆盖关系：**
+- 基础模板 `_pdf_base.html.twig` **不定义页眉**（仅定义水印和页脚）
+- 每个子模板在 `{% block body %}` 内自行实现页眉
+- 三套模板之间**互不继承**，各自独立实现页眉样式
+
+#### 4.2.4 品牌信息的两大来源对比
+
+| 品牌元素 | 来源函数/常量 | 底层数据 | 出现位置 |
+|----------|--------------|----------|----------|
+| **公司徽标** | `app_logo(N)` | `system/company/logo` 设置 | 页眉（4种模板有）、Web页面、设置预览 |
+| **公司名称** | `company_name()` | `system/company/company_name` 设置 | 页眉、from_block 宏、Web页面、Email |
+| **应用名** | `APP_NAME` 常量 | 硬编码 `'SolidInvoice'` | 页脚 "Powered by SolidInvoice" |
+| **公司联系信息** | `setting()` + `address()` | `vat_number` / `email` / `phone_number` / `address` | from_block 宏、默认模板页眉 |
+
+**公司名的降级逻辑：** `company_name()` 函数优先从 `system/company/company_name` 读取，若为空则回退到 `APP_NAME` 常量（即 "SolidInvoice"）。
+
+### 4.3 三套子模板与基础模板的覆盖关系总览
+
+```
+_pdf_base.html.twig (基础层)
+  ├── @page { footer: footer; margin-* }   ← CSS 页面布局
+  ├── <watermarktext>                      ← 水印（继承，全部子模板都不改）
+  ├── <pagefooter name="footer">           ← 页脚（继承，全部子模板都不改）
+  ├── {% block extra_styles %}             ← 额外样式块
+  │      ├── Friendly: 背景色 #fffaf3
+  │      ├── Classic: 不覆盖（默认）
+  │      └── Studio: 不覆盖（默认）
+  ├── {% block body_attrs %}               ← body 属性块
+  │      └── Friendly: style="background-color: #fffaf3;"
+  └── {% block body %}                      ← 正文块（每个子模板全覆盖）
+         ├── 页眉（各自实现）
+         ├── 发件/收件信息（from_block 宏）
+         ├── 明细表格
+         ├── 总计
+         ├── 条款
+         └── 支付按钮
+```
+
+**继承规则：**
+- Classic：仅覆盖 `body` block
+- Friendly：覆盖 `body` + `extra_styles` + `body_attrs`（自定义背景色）
+- Studio：仅覆盖 `body` block
+- 三套模板**都不覆盖**水印和页脚
+
+### 4.4 两套 PDF 模板体系的区别
+
+SolidInvoice 中实际上存在**两套独立的 PDF 模板体系**：
+
+| 维度 | 体系一：默认模板 | 体系二：模板变体 |
+|------|----------------|----------------|
+| 入口模板 | `InvoiceBundle/Resources/views/Pdf/invoice.html.twig` | `InvoiceBundle/Resources/views/Templates/{variant}/pdf.html.twig` |
+| 继承关系 | 独立模板，不继承任何基础模板 | 都继承 `_pdf_base.html.twig` |
+| 水印 | 独立实现（逻辑相同） | 继承基础模板 |
+| 页脚 | 独立实现（但逻辑不同⚠️） | 继承基础模板 |
+| 页眉 | 内联实现，包含完整公司联系信息 | 各自实现，公司详情用 from_block 宏 |
+| 数量 | 1 个（发票）+ 1 个（报价单） | 9 种变体 |
+| hide_powered_by 检查 | 仅检查设置值 | 检查设置 + custom_branding 功能 |
+
+**品牌资产复用方式总结：**
+
+**所有 PDF 模板统一调用 `app_logo()` 函数：**
+
+```twig
+{% if setting('system/company/logo') is not empty %}
+    {{ app_logo(50) }}
 {% endif %}
 ```
 
@@ -281,7 +446,7 @@ GlobalExtension::displayAppLogo()
 - ✅ **无特殊处理**：data URI 格式直接被 mPDF 识别渲染
 - ✅ **多模板一致**：Classic/Friendly/Studio/默认 模板都使用相同方式
 
-### 4.3 PDF生成完整流程
+### 4.5 PDF生成完整流程
 
 ```
 HTTP请求 ?format=pdf
@@ -381,14 +546,19 @@ View Action - [View.php#L48-L50](file:///d:/fz/0601-1/solo-dogfeeding/code/97-So
 ## 七、设计特点与注意事项
 
 ### 7.1 设计优点
-1. **单一数据源**：Web和PDF共用同一品牌配置，一致性有保障
+1. **单一数据源**：Web/PDF/Email 共用同一品牌配置，一致性有保障
 2. **多租户隔离**：通过 `CompanyAware` trait 和 `CompanyFilter` 自动隔离
-3. **安全编码**：SVG被禁止，防止存储型XSS攻击
+3. **安全编码**：SVG被禁止，防止存储型XSS攻击；`getimagesize()` 防伪造文件
 4. **无外部依赖**：base64内联图片不依赖文件系统或CDN
 5. **统一接口**：`app_logo()` 函数提供一致的调用方式
+6. **模板继承**：`_pdf_base.html.twig` 统一水印和页脚，变体只需关注内容
+7. **共享宏**：`_macros.html.twig` 的 `from_block()` 确保所有模板的发件方信息一致
 
-### 7.2 潜在改进点
-1. **缺少图片裁剪**：当前仅依赖用户上传合适尺寸，建议添加服务器端裁剪
-2. **缺少多尺寸生成**：Web端25px和PDF端50px使用同一张原图，浪费带宽
-3. **Base64膨胀**：base64编码增加约33%体积，PDF中大量使用时会增大文件
-4. **缺少缓存**：每次渲染都重新读取和解析，可考虑在SystemConfig层缓存解析结果
+### 7.2 已知问题
+1. **`logo_upload` Stimulus 控制器无实现**：[fields.html.twig#L284](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Resources/views/Form/fields.html.twig#L284) 引用了 `stimulus_controller('logo_upload')` 但 `assets/controllers/` 目录下无对应控制器文件。这可能是预留的扩展点，或者是从旧代码迁移后的残留。
+2. **缺少客户端图片处理**：无裁剪、缩放、压缩、尺寸校验。用户上传大图后原始数据直接存储，渲染时仅 CSS 缩放。
+3. **缺少多尺寸生成**：Web端25px和PDF端50px使用同一张原图，浪费带宽和PDF体积。
+4. **Base64膨胀**：base64编码增加约33%体积，PDF中大量使用时会增大文件。
+5. **缺少缓存**：每次渲染都重新读取和解析，可考虑在SystemConfig层缓存解析结果。
+6. **Logo 不一致**：9种PDF模板中仅4种显示Logo，其余5种（modern/compact/editorial/monochrome/photographer）完全不显示Logo，用户上传了Logo但部分模板看不到。
+7. **报价单PDF不继承基础层**：[quote.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/QuoteBundle/Resources/views/Pdf/quote.html.twig) 独立实现水印和页脚，与 `_pdf_base.html.twig` 逻辑重复。
