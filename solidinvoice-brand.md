@@ -1,4 +1,4 @@
-# SolidInvoice 公司品牌与页眉资源完整脉络
+﻿# SolidInvoice 公司品牌与页眉资源完整脉络
 
 ## 一、品牌设置的存取位置
 
@@ -38,12 +38,14 @@ new Config('system/company/company_name', $data['company_name'] ?? null, null, T
 
 **读取流程：**
 1. **SystemConfig** - [SystemConfig.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/SettingsBundle/SystemConfig.php)
-   - `get($key)` 方法调用 `SettingsRepository::getSetting()`
-   - 内部有静态缓存 `self::$settings` 避免重复查询
+   - `get($key)` 方法**每次直接查询数据库**，不经过缓存
+   - `getAll()` 方法使用 `self::$settings` 静态缓存（仅全量加载时使用，`get()` 不走此缓存）
+   - `set()` / `remove()` 时清空 `self::$settings` 缓存
 
 2. **SettingsRepository** - [SettingsRepository.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/SettingsBundle/Repository/SettingsRepository.php)
-   - `getSetting($key, $company)` 按公司隔离查询
+   - `getSetting($key, $company)` 按公司隔离查询（`findOneBy`）
    - 自动应用 `CompanyFilter` 多租户过滤器
+   - 传入 `$company` 时临时切换公司上下文（reset → 查询 → switchBack）
 
 **写入流程：**
 1. **Settings 组件** - [Settings.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/SettingsBundle/Twig/Components/Settings.php#L131-L154)
@@ -194,31 +196,104 @@ displayAppLogo(
 ): string
 ```
 
-### 3.2 解析流程
+### 3.2 解析流程（含完整分支逻辑）
+
+[GlobalExtension.php#L140-L159](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Twig/Extension/GlobalExtension.php#L140-L159)
 
 ```
-调用 {{ app_logo(50) }}
+调用 {{ app_logo(width, company, showDefault, showOnlyAppIcon) }}
     ↓
-GlobalExtension::displayAppLogo()
+┌─ 应用未安装 ($this->installed 为 null/空) → $logo = $showDefault ? DEFAULT_LOGO : null
+│
+├─ 应用已安装 + $showOnlyAppIcon=true → $logo = $showDefault ? DEFAULT_LOGO : null
+│   (跳过公司logo，仅显示默认应用图标)
+│
+└─ 应用已安装 + $showOnlyAppIcon=false
+    ├─ 公司选择器有值 → $logo = SystemConfig::get('system/company/logo', $company)
+    │   → 若 null，降级为 $showDefault ? DEFAULT_LOGO : null
+    │
+    └─ 公司选择器为空 → $logo = DEFAULT_LOGO
+
     ↓
-1. 检查应用是否已安装 ($this->installed)
-2. 检查公司选择器是否有当前公司
-3. 调用 SystemConfig::get('system/company/logo', $company)
-4. 若无值且 $showDefault=true，使用内置 DEFAULT_LOGO
-5. 解析存储格式：[$type, $base64] = explode('|', $logo)
-6. 渲染内联模板：
-   <img src="data:image/{{ type }};base64,{{ logo }}" 
-        class="navbar-brand-image m-2" 
-        width="{{ width }}"/>
-    ↓
-返回HTML字符串
+$logo 仍为 null → 返回空字符串 ''
+$logo 有值 → explode('|', $logo) → 渲染 data URI img
 ```
 
-**代码位置：** [GlobalExtension.php#L140-L159](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Twig/Extension/GlobalExtension.php#L140-L159)
+**关键分支说明：**
 
-### 3.3 使用场景
+| 分支条件 | 结果 | 触发场景 |
+|----------|------|----------|
+| 应用未安装 | 返回空或默认图标 | 安装向导阶段 |
+| `showOnlyAppIcon=true` | 返回空或默认图标 | 预留参数，当前模板未使用 |
+| 公司选择器为空 | 返回 DEFAULT_LOGO | 全局上下文无公司（如登录页面） |
+| 公司选择器有值 + logo 设置有值 | 返回公司徽标 | 正常业务页面/PDF |
+| 公司选择器有值 + logo 设置为空 | 返回空字符串 | 未上传徽标的公司 |
+| 公司选择器有值 + logo 空 + showDefault=true | 返回 DEFAULT_LOGO | 邮件模板、设置表单预览 |
 
-#### 3.3.1 Web页面页眉（导航栏）
+**`showDefault` 参数的实际使用：**
+- 邮件基础模板调用 `app_logo(100, null, true)`：无公司徽标时显示默认 SolidInvoice 图标
+- 其他模板（Web/PDF）使用 `app_logo(N)`：无公司徽标时不显示
+
+**`company_name()` 分支逻辑：**
+
+| 分支条件 | 返回值 | 说明 |
+|----------|--------|------|
+| 公司选择器有值 + 公司名称设置有值 | 公司名称 | 正常业务场景 |
+| 公司选择器有值 + 公司名称设置为空 | `"SolidInvoice"` | 降级到 APP_NAME |
+| 公司选择器为空 | `"SolidInvoice"` | 全局上下文无公司 |
+
+
+### 3.3 邮件模板中的品牌资产链路
+
+**⚠️ 之前描述"邮件模板不引用 Logo"是错误的。** 邮件基础模板确实引用了徽标和公司名。
+
+**邮件基础模板** - [base.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Resources/views/Layout/Email/base.html.twig)
+
+```twig
+{{- app_logo(100, null, true) -}}
+<p style="font-size: 20px; ...">
+    {{- setting('system/company/company_name') -}}
+</p>
+```
+
+**品牌资产引用链路：**
+
+```
+base.html.twig (邮件基础模板)
+    ├── app_logo(100, null, true)
+    │   └── GlobalExtension::displayAppLogo()
+    │       ├── 公司选择器有值 → SystemConfig::get('system/company/logo') → 公司徽标
+    │       └── 公司选择器为空 → DEFAULT_LOGO（内置 SolidInvoice 图标）
+    │       （showDefault=true: 无徽标时也显示默认图标）
+    │
+    └── setting('system/company/company_name')
+        └── SettingsExtension::getSetting()
+            └── SystemConfig::get() → 公司名称字符串（无降级，可能为 null）
+```
+
+**邮件 vs Web/PDF 的关键差异：**
+
+| 维度 | 邮件模板 | Web/PDF 模板 |
+|------|----------|-------------|
+| 徽标函数 | `app_logo(100, null, true)` | `app_logo(40~50)` |
+| showDefault 参数 | `true`（无徽标时显示默认图标） | `false`（无徽标时不显示） |
+| 公司名称 | `setting('system/company/company_name')`（直接读取，可能为空） | `company_name()`（有降级逻辑） |
+| 图标渲染 | data URI（内联 base64） | data URI（内联 base64） |
+
+**邮件组件 `company_header` 宏** - [components.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Resources/views/Layout/Email/components.html.twig)
+
+此宏提供另一种布局（左右两列），但当前变体邮件模板**未使用此宏**，而是通过继承 `_email_base.html.twig` → `base.html.twig` 的内联 header 实现。
+
+**发票邮件变体模板** - [_email_base.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/_email_base.html.twig)
+
+品牌资产引用位置：
+1. JSON-LD 结构化数据：`company_name()` 作为 `provider.name`
+2. 正文文案：`company_name()` 作为 `%company%` 占位符
+
+各变体邮件只覆盖 `intro` 和 `signoff` blocks，**不覆盖品牌资产引用**。
+### 3.4 使用场景
+
+#### 3.4.1 Web页面页眉（导航栏）
 **模板：** [top.html.twig#L17](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Resources/views/Menu/top.html.twig#L17)
 ```twig
 <button class="btn btn-outline-secondary dropdown-toggle">
@@ -229,7 +304,7 @@ GlobalExtension::displayAppLogo()
 - 尺寸：25px 高度
 - 位置：顶部导航栏公司切换按钮
 
-#### 3.3.2 设置表单预览
+#### 3.4.2 设置表单预览
 **模板：** [fields.html.twig#L128](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/SettingsBundle/Resources/views/Form/fields.html.twig#L128)
 ```twig
 {% set currentLogo = app_logo(width=80, showDefault=false) %}
@@ -237,7 +312,7 @@ GlobalExtension::displayAppLogo()
 - 尺寸：80px 高度
 - 用于上传前的现有徽标预览
 
-#### 3.3.3 公司名称辅助函数
+#### 3.4.3 公司名称辅助函数
 **company_name()** - [GlobalExtension.php#L113-L119](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Twig/Extension/GlobalExtension.php#L113-L119)
 - 读取 `system/company/company_name` 设置
 - 若无则返回应用默认名称 `SolidInvoiceCoreBundle::APP_NAME`
@@ -355,7 +430,7 @@ SolidInvoice 的 PDF 使用 **mPDF** 引擎渲染，涉及三个与品牌资产�
 | 模板 | Logo 尺寸 | Logo 条件判断 | 公司名来源 | 其他品牌信息 | 代码位置 |
 |------|-----------|--------------|-----------|-------------|----------|
 | **Classic** | 50px | `if setting('system/company/logo') is not empty` | `company_name()` | 无（公司详情在下方 from_block 中） | [classic/pdf.html.twig#L14-L17](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/classic/pdf.html.twig#L14-L17) |
-| **Friendly** | 40px | 内联 if（不带 is not empty 判断） | `company_name()` | 无 | [friendly/pdf.html.twig#L23-L24](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/friendly/pdf.html.twig#L23-L24) |
+| **Friendly** | 40px | `if setting('system/company/logo') is not empty` | `company_name()` | 无 | [friendly/pdf.html.twig#L23-L24](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/friendly/pdf.html.twig#L23-L24) |
 | **Studio** | 40px | `if setting('system/company/logo') is not empty` | 仅 Invoice 编号（公司名在 from_block 中） | 项目名称大标题 | [studio/pdf.html.twig#L15](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/studio/pdf.html.twig#L15) |
 
 **默认发票模板（独立体系）：**
@@ -381,7 +456,7 @@ SolidInvoice 的 PDF 使用 **mPDF** 引擎渲染，涉及三个与品牌资产�
 
 | 品牌元素 | 来源函数/常量 | 底层数据 | 出现位置 |
 |----------|--------------|----------|----------|
-| **公司徽标** | `app_logo(N)` | `system/company/logo` 设置 | 页眉（4种模板有）、Web页面、设置预览 |
+| **公司徽标** | `app_logo(N)` | `system/company/logo` 设置 | 页眉（3种 variant 有 + 默认模板 + 邮件模板）、Web页面、设置预览 |
 | **公司名称** | `company_name()` | `system/company/company_name` 设置 | 页眉、from_block 宏、Web页面、Email |
 | **应用名** | `APP_NAME` 常量 | 硬编码 `'SolidInvoice'` | 页脚 "Powered by SolidInvoice" |
 | **公司联系信息** | `setting()` + `address()` | `vat_number` / `email` / `phone_number` / `address` | from_block 宏、默认模板页眉 |
@@ -525,21 +600,70 @@ View Action - [View.php#L48-L50](file:///d:/fz/0601-1/solo-dogfeeding/code/97-So
 
 ## 六、关键文件索引
 
+### 后端核心
+
 | 模块 | 文件路径 | 主要职责 |
 |------|----------|----------|
+| 核心常量 | [SolidInvoiceCoreBundle.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/SolidInvoiceCoreBundle.php#L26) | `APP_NAME` 常量（应用名 "SolidInvoice"） |
 | 实体 | [Setting.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/SettingsBundle/Entity/Setting.php) | 配置存储实体 |
 | 存储 | [SettingsRepository.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/SettingsBundle/Repository/SettingsRepository.php) | 配置读写 |
-| 配置 | [SystemConfigProvider.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Config/SystemConfigProvider.php) | 品牌配置定义 |
-| 读取 | [SystemConfig.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/SettingsBundle/SystemConfig.php) | 系统配置门面 |
-| 表单 | [ImageUploadType.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Form/Type/ImageUploadType.php) | 图片上传表单类型 |
+| 配置定义 | [SystemConfigProvider.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Config/SystemConfigProvider.php) | 品牌配置定义 |
+| 配置门面 | [SystemConfig.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/SettingsBundle/SystemConfig.php) | 系统配置读取门面 |
+| 表单类型 | [ImageUploadType.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Form/Type/ImageUploadType.php) | 图片上传表单类型 |
 | 组件 | [Settings.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/SettingsBundle/Twig/Components/Settings.php) | 设置表单Live组件 |
-| 渲染 | [GlobalExtension.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Twig/Extension/GlobalExtension.php) | app_logo Twig函数 |
-| PDF | [Generator.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Pdf/Generator.php) | PDF生成器（mPDF） |
+
+### Twig 扩展
+
+| 函数 | 文件路径 | 功能 |
+|------|----------|------|
+| `app_logo()` | [GlobalExtension.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Twig/Extension/GlobalExtension.php) | 渲染公司徽标图片 |
+| `company_name()` | [GlobalExtension.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Twig/Extension/GlobalExtension.php#L113-L119) | 获取公司名称（带降级） |
+| `setting()` | [SettingsExtension.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/SettingsBundle/Twig/Extension/SettingsExtension.php) | 读取系统配置值 |
+| `address()` | [SettingsExtension.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/SettingsBundle/Twig/Extension/SettingsExtension.php#L46-L49) | 格式化地址数组 |
+
+### PDF 生成
+
+| 文件 | 路径 | 职责 |
+|------|------|------|
+| PDF生成器 | [Generator.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Pdf/Generator.php) | mPDF 封装 |
+| PDF响应 | [PdfResponse.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Response/PdfResponse.php) | PDF HTTP响应 |
 | Action | [View.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Action/View.php) | 发票查看/导出 |
 | Action | [ViewBilling.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Action/ViewBilling.php) | 外部账单查看 |
-| 页眉 | [top.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Resources/views/Menu/top.html.twig) | Web导航栏模板 |
-| PDF模板 | [invoice.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Pdf/invoice.html.twig) | 默认发票PDF模板 |
-| 表单模板 | [fields.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/SettingsBundle/Resources/views/Form/fields.html.twig) | 图片上传表单模板 |
+
+### PDF 模板
+
+| 模板 | 路径 | Logo | 水印 | 页脚 | 备注 |
+|------|------|------|------|------|------|
+| 基础层 | [_pdf_base.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/_pdf_base.html.twig) | — | ✅ | ✅ | 所有变体的父模板 |
+| 宏定义 | [_macros.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/_macros.html.twig) | — | — | — | `from_block()` 等共享宏 |
+| 默认发票 | [invoice.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Pdf/invoice.html.twig) | 50px | ✅ | ✅ | 独立模板（不继承基础层） |
+| Classic | [classic/pdf.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/classic/pdf.html.twig) | 50px | ✅(继承) | ✅(继承) | 专业边框风格 |
+| Friendly | [friendly/pdf.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/friendly/pdf.html.twig) | 40px | ✅(继承) | ✅(继承) | 温暖对话风格 |
+| Studio | [studio/pdf.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/InvoiceBundle/Resources/views/Templates/studio/pdf.html.twig) | 40px | ✅(继承) | ✅(继承) | 项目导向风格 |
+| 报价单 | [quote.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/QuoteBundle/Resources/views/Pdf/quote.html.twig) | 50px | ✅ | ✅ | 独立模板（蓝色主题） |
+
+### Web 模板
+
+| 位置 | 路径 | Logo 尺寸 |
+|------|------|-----------|
+| 侧边栏 | [default.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Resources/views/Layout/default.html.twig) | auto（默认） |
+| 顶部导航 | [top.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Resources/views/Menu/top.html.twig) | 25px |
+| 设置表单预览 | [fields.html.twig (Settings)](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/SettingsBundle/Resources/views/Form/fields.html.twig) | 80px |
+| 表单字段模板 | [fields.html.twig (Core)](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Resources/views/Form/fields.html.twig) | 100px |
+| 设置组件 | [Settings.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/SettingsBundle/Resources/views/Components/Settings.html.twig) | — |
+
+### 引导与检查
+
+| 文件 | 路径 | 职责 |
+|------|------|------|
+| 仪表盘检查项 | [UploadLogoItem.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/DashboardBundle/Checklist/Items/UploadLogoItem.php) | 检查Logo是否已上传 |
+| SaaS引导步骤 | [CustomizeLogoStep.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/SaasBundle/Onboarding/Step/CustomizeLogoStep.php) | Logo上传引导步骤 |
+
+### 测试
+
+| 文件 | 路径 | 职责 |
+|------|------|------|
+| 图片上传测试 | [ImageUploadTypeTest.php](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Tests/Form/Type/ImageUploadTypeTest.php) | 安全+格式测试 |
 
 ---
 
@@ -559,6 +683,9 @@ View Action - [View.php#L48-L50](file:///d:/fz/0601-1/solo-dogfeeding/code/97-So
 2. **缺少客户端图片处理**：无裁剪、缩放、压缩、尺寸校验。用户上传大图后原始数据直接存储，渲染时仅 CSS 缩放。
 3. **缺少多尺寸生成**：Web端25px和PDF端50px使用同一张原图，浪费带宽和PDF体积。
 4. **Base64膨胀**：base64编码增加约33%体积，PDF中大量使用时会增大文件。
-5. **缺少缓存**：每次渲染都重新读取和解析，可考虑在SystemConfig层缓存解析结果。
-6. **Logo 不一致**：9种PDF模板中仅4种显示Logo，其余5种（modern/compact/editorial/monochrome/photographer）完全不显示Logo，用户上传了Logo但部分模板看不到。
-7. **报价单PDF不继承基础层**：[quote.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/QuoteBundle/Resources/views/Pdf/quote.html.twig) 独立实现水印和页脚，与 `_pdf_base.html.twig` 逻辑重复。
+5. **SystemConfig::get() 无缓存**：`SystemConfig.php` 的 `get()` 方法每次直接查询数据库，`self::$settings` 静态缓存仅用于 `getAll()` 批量读取。每个 `app_logo()` / `company_name()` / `setting()` 调用都触发一次 DB 查询。
+6. **Logo 不一致**：8种 PDF variant 子模板中仅3种（classic/friendly/studio）调用 `app_logo()`，其余5种（modern/compact/editorial/monochrome/photographer）完全不显示Logo。用户上传了Logo但部分模板看不到。
+7. **报价单PDF不继承基础层**：[quote.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/QuoteBundle/Resources/views/Pdf/quote.html.twig) 独立实现水印和页脚。根本原因是 `_pdf_base.html.twig` 的水印硬绑 `invoice.status.value` 变量，报价单的模板变量为 `quote`，无法直接继承（详见 4.2.1 节耦合分析）。
+8. **`hide_powered_by` 逻辑不一致**：基础模板系使用两级开关（设置值 + `custom_branding` 功能），而默认发票/报价单模板仅检查设置值，可能导致免费用户也能隐藏 "Powered by SolidInvoice" 品牌标识。
+9. **两套PDF模板体系并存**：默认模板与模板变体各自独立实现水印、页脚和页眉，代码重复且逻辑有差异，维护成本高。
+10. **邮件模板公司名无降级**：[base.html.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/97-SolidInvoice/src/CoreBundle/Resources/views/Layout/Email/base.html.twig) 使用 `setting('system/company/company_name')` 而非 `company_name()` 函数，若公司名为空则显示空白，而 Web/PDF 端 `company_name()` 有降级到 `"SolidInvoice"` 的逻辑。
