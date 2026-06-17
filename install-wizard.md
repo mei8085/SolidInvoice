@@ -1425,3 +1425,222 @@ SystemConfig::get('email/from_address')
 两条链路互不干扰：
 - **Transport 链路**决定邮件通过什么服务器/API 发出去（物理通道）
 - **From 链路**决定收件人看到的"来自谁"（显示信息）
+
+---
+
+## 补充：发信配置的完整生命周期
+
+发信配置不是静态写入就结束的，而是从"公司创建"到"首次发信"经历了一个完整的状态变迁。本节从代码层面将这些环节的关系串清楚。
+
+### 公司创建触发链
+
+公司（Company）实体被 persist 到数据库后，Doctrine 事件监听器触发设置播种：
+
+```
+EntityManager::persist($company) + flush()
+    ↓
+Doctrine postPersist 事件
+    ↓
+CompanyCreatedListener::postPersist()      ← Doctrine Entity Listener
+    ├── dispatch(CompanyCreatedEvent)      ← Symfony EventDispatcher
+    │     └── CompanyEventSubscriber       ← SaaS 订阅/试用创建（仅 SaaS 模式）
+    │
+    ├── CompanySelector::switchCompany()   ← 切换到新公司的多租户上下文
+    │
+    └── DefaultData::__invoke()            ← 播种默认设置
+          ├── createAppConfig()            ← 遍历 ConfigProvider 播种 Setting 行
+          ├── createDefaultCustomFields()  ← 播种联系人自定义字段
+          └── createPaymentMethods()       ← 播种默认支付方式
+```
+
+文件：[CompanyCreatedListener.php](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/CoreBundle/Doctrine/Listener/CompanyCreatedListener.php#L25-L46)
+
+```php
+#[AsEntityListener(Events::postPersist, entity: Company::class)]
+final readonly class CompanyCreatedListener
+{
+    public function postPersist(Company $company): void
+    {
+        $this->eventDispatcher->dispatch(new CompanyCreatedEvent($company));
+
+        $this->companySelector->switchCompany($company->getId());
+
+        ($this->defaultData)($company, ['currency' => $company->currency]);
+    }
+}
+```
+
+**关键细节**：
+- `#[AsEntityListener(Events::postPersist, entity: Company::class)]` 只对 `Company` 实体的 postPersist 事件生效
+- 在播种默认设置前，先通过 `CompanySelector::switchCompany()` 切换多租户上下文，确保后续数据库查询走新公司的数据
+- `CompanyCreatedEvent` 是一个独立的事件，供其他模块（如 SaasBundle）订阅
+
+---
+
+### 默认设置播种的细节
+
+[DefaultData::createAppConfig()](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/CoreBundle/Company/DefaultData.php#L87-L107) 通过 `#[AutowireIterator(ProviderInterface::class)]` 收集所有 ConfigProvider，包括 MailerBundle 的 [ConfigProvider](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/MailerBundle/Config/ConfigProvider.php#L27-L46)。
+
+**播种时邮件设置的初始值**：
+
+| Setting.key | Setting.value | Setting.defaultValue | Setting.type | 说明 |
+|---|---|---|---|---|
+| `email/from_address` | `no-reply@solidinvoice.co` | `no-reply@solidinvoice.co` | EmailType | 初始就是可用值 |
+| `email/from_name` | `$company->getName()` | `$company->getName()` | TextType | 初始就是可用值 |
+| `email/sending_options/provider` | `null` | `null` | MailTransportType | **初始为空，用户必须手动选择 Provider** |
+
+`email/sending_options/provider` 初始值为 `null` 的含义：**播种时并没有选定邮件传输方式，邮件系统处于"只设了发件人、但无法发出"的中间态**。
+
+---
+
+### SystemConfig 读取的多层回退
+
+[SystemConfig::get()](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/SettingsBundle/SystemConfig.php#L40-L47) 是所有设置读取的统一入口，它内置了一层关键的回退：
+
+```php
+public function get(string $key, ?Company $company = null): ?string
+{
+    if (null === $this->installed || '' === $this->installed) {
+        return null;  // ← 安装前：所有设置读取一律返回 null
+    }
+
+    return $this->repository->getSetting($key, $company)?->getValue();
+}
+```
+
+**回退层次**：
+
+```
+SystemConfig::get('email/from_address')
+    ↓
+┌─ $this->installed 为 null 或空？
+│   是 → 直接返回 null（安装向导阶段，数据库可能还不存在）
+│
+└─ $this->installed 有值
+    ↓
+    ┌─ Setting 表中该 key 存在？
+    │   是 → 返回 Setting.value（可能为 null 或空字符串）
+    │   └─ 否 → getSetting() 返回 null → getValue() 不调用 → 整体返回 null
+```
+
+**实际影响**：调用方对 `null` 的处理各有不同——
+
+| 调用方 | 代码 | 对 `null` 的处理 |
+|---|---|---|
+| [EmailFromListener](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/CoreBundle/Listener/EmailFromListener.php#L41-L46) | `(string) $this->config->get('email/from_address')` | `null` → `''`（空字符串）→ 触发回退到当前用户邮箱 |
+| [MailerConfigFactory](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/MailerBundle/Factory/MailerConfigFactory.php#L47-L51) | `$this->config->get(self::CONFIG_KEY)` | `null` → 回退到 `env(SOLIDINVOICE_MAILER_DSN)` |
+| [SendOnboardingEmailHandler](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/SaasBundle/MessageHandler/SendOnboardingEmailHandler.php#L128-L133) | `$this->systemConfig->get('email/from_address')` | `null` → 不设置 `from()` → 由 EmailFromListener 在 MessageEvent 中注入 |
+
+注意 **EmailFromListener 与 SendOnboardingEmailHandler 的交互**：
+- `SendOnboardingEmailHandler` 通过 Messenger 异步处理，在 CLI worker 中运行
+- 它有条件地设置 `$email->from()`，当 `from_address` 为 null 时不设置
+- 随后 `$this->mailer->send($email)` 触发 Symfony Mailer 管线
+- `EmailFromListener` 监听 `MessageEvent`，如果邮件还没有 From，会再次尝试注入
+- 但在 CLI worker 中 `TokenStorage` 通常没有 token，所以 EmailFromListener 也不会设置 From
+- 这种情况下，**邮件的 From 头为空**，Symfony Mailer 会使用 Envelope Sender 作为兜底
+
+---
+
+### From Header 与 Envelope Sender 的边界
+
+邮件发送中有两个不同的"发件人"概念，SolidInvoice 将它们分属不同的配置层：
+
+| 概念 | RFC 定义 | 控制方 | 配置来源 | 用户可见 |
+|---|---|---|---|---|
+| **From Header** | RFC 5322 `From:` 头 | EmailFromListener（MessageEvent） | 数据库 `email/from_address` + `email/from_name`；回退当前用户邮箱 | ✅ 收件人看到的发件人 |
+| **Envelope Sender** | RFC 5321 `MAIL FROM` 命令 | Symfony Framework 配置 | `env(SOLIDINVOICE_MAILER_SENDER)` → `config/packages/mailer.php` | ❌ 对用户不可见，仅 SMTP 对话中使用 |
+
+**配置来源对比**：
+
+```php
+// From Header：公司级数据库设置（每个公司可不同）
+// 由 EmailFromListener 在 MessageEvent 中注入
+$fromAddress = (string) $this->config->get('email/from_address');
+$fromName = (string) $this->config->get('email/from_name');
+$message->from(new Address($fromAddress, $fromName));
+
+// Envelope Sender：部署级环境变量（全局统一）
+// 由 config/packages/mailer.php 在框架初始化时注入
+$frameworkConfig->mailer()
+    ->envelope()
+    ->sender(env('SOLIDINVOICE_MAILER_SENDER'));
+// 默认值：'SolidInvoice <no-reply@solidinvoice.co>'
+```
+
+**边界场景**：
+
+1. **正常发信**：From Header = 公司设置的发件人，Envelope Sender = `SOLIDINVOICE_MAILER_SENDER`
+2. **from_address 为空 + Web 请求**：From Header = 当前登录用户邮箱，Envelope Sender 不变
+3. **from_address 为空 + CLI worker**：From Header 无值（EmailFromListener 找不到 token），Symfony Mailer 自动将 Envelope Sender 填入 From Header
+4. **安装前**：`SystemConfig::get()` 一律返回 `null`，EmailFromListener 得到空字符串，回退到 token 或留空，最终依赖 Envelope Sender
+
+**为什么需要分开？**
+- Envelope Sender 是 SMTP 协议层的概念，用于退信（bounce）通知和 SPF/DKIM 验证
+- From Header 是邮件展示层的概念，收件人在邮件客户端看到的"来自"
+- 两者可以不同：Envelope Sender 可以是 `noreply@solidinvoice.co`（SPF 认证的域），From Header 可以是用户公司名称 `Acme Inc <billing@acme.com>`
+
+---
+
+### 发信配置生命周期总图
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                         安装前                                          │
+│                                                                          │
+│  SOLIDINVOICE_INSTALLED = null                                          │
+│  SOLIDINVOICE_MAILER_DSN = 'null://null'                               │
+│  SOLIDINVOICE_MAILER_SENDER = 'SolidInvoice <no-reply@solidinvoice.co>'│
+│                                                                          │
+│  SystemConfig::get() → 一律返回 null                                    │
+│  MailerConfigFactory → 回退 env → NullTransport（静默丢弃）             │
+│  EmailFromListener → 回退当前用户或留空 → Envelope Sender 兜底          │
+└──────────────────────────────────────────────────────────────────────────┘
+                              ↓ 安装完成
+┌──────────────────────────────────────────────────────────────────────────┐
+│                         安装后、公司创建前                               │
+│                                                                          │
+│  SOLIDINVOICE_INSTALLED = '2026-06-17T...'                              │
+│  SystemConfig::get() → 查询 Setting 表（但尚无 Setting 行）            │
+│  → 返回 null                                                            │
+│  → MailerConfigFactory 仍回退 env → NullTransport                       │
+│  → EmailFromListener 仍回退当前用户邮箱或 Envelope Sender              │
+└──────────────────────────────────────────────────────────────────────────┘
+                              ↓ 用户创建公司
+┌──────────────────────────────────────────────────────────────────────────┐
+│                         公司创建后（播种完成）                           │
+│                                                                          │
+│  CompanyCreatedListener::postPersist()                                  │
+│    └── DefaultData → ConfigProvider::provide()                          │
+│          ├── email/from_address = 'no-reply@solidinvoice.co'            │
+│          ├── email/from_name = 'Acme Inc'                               │
+│          └── email/sending_options/provider = null                      │
+│                                                                          │
+│  SystemConfig::get('email/from_address') → 'no-reply@solidinvoice.co'  │
+│  SystemConfig::get('email/sending_options/provider') → null            │
+│  → MailerConfigFactory 仍回退 env → NullTransport                       │
+│  → EmailFromListener 使用 from_address + from_name 设置 From           │
+│  → 邮件有 From 头了，但仍然发不出去（没有 Transport）                    │
+└──────────────────────────────────────────────────────────────────────────┘
+                              ↓ 用户在 Settings → Email 选择 Provider
+┌──────────────────────────────────────────────────────────────────────────┐
+│                         用户配置邮件 Provider 后                        │
+│                                                                          │
+│  email/sending_options/provider = '{"provider":"SMTP","config":{...}}'  │
+│                                                                          │
+│  MailerConfigFactory::fromStrings()                                      │
+│    → SystemConfig::get('email/sending_options/provider') → JSON 字符串│
+│    → json_decode → 匹配 SmtpConfigurator                               │
+│    → SmtpConfigurator::configure() → Dsn('smtp://...')                  │
+│    → $this->inner->fromDsnObject($dsn) → SmtpTransport 实例            │
+│                                                                          │
+│  EmailFromListener                                                       │
+│    → SystemConfig::get('email/from_address') → 设置 From Header        │
+│                                                                          │
+│  Envelope Sender                                                         │
+│    → env(SOLIDINVOICE_MAILER_SENDER) → MAIL FROM 命令                   │
+│                                                                          │
+│  ✅ 邮件完整可发：Transport 通道 + From 显示 + Envelope 退信           │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+**核心洞察**：发信配置的生命周期是**渐进式就绪**的——安装锁定了应用身份、公司创建锁定了发件人信息、用户选择 Provider 锁定了传输通道，三个阶段各解决一个问题，任何一个阶段缺失都会通过回退机制优雅降级而非报错。
