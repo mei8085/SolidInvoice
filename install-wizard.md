@@ -1228,3 +1228,200 @@ MailerConfigFactory::fromStrings() 被调用
 4. **遗留翻译键的历史残留**：
    - 翻译键 `email_settings` 作为安装向导的翻译与数据库配置同级存在，说明早期可能计划把邮件配置并入安装步骤
    - 最终选择了"安装后在 Settings 中配置"，翻译键未清理
+
+---
+
+### 补充：发件人 From 字段的设置与回退机制
+
+邮件的发件人（From Header）独立于 transport DSN 之外，由 Symfony Mailer 的 [MessageEvent](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/CoreBundle/Listener/EmailFromListener.php#L60-L65) 事件监听器在发送前注入。
+
+#### EmailFromListener 事件订阅者
+
+文件：[EmailFromListener.php](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/CoreBundle/Listener/EmailFromListener.php#L28-L65)
+
+它订阅 `MessageEvent::class`（Symfony Mailer 发送消息事件），在每次发信前动态覆盖 `From` 头。
+
+**回退优先级链**：
+
+```
+发信前触发 MessageEvent
+        ↓
+EmailFromListener::__invoke()
+        ↓
+┌─ 数据库中 email/from_address 有值（非空字符串）？
+│   是 → 读取 email/from_name（可为空）
+│        → $message->from(new Address($fromAddress, $fromName))
+│
+│   否 → 回退到当前登录用户
+│        → $tokenStorage->getToken()
+│        → $user->getEmail()
+│        → $message->from($user->getEmail())
+│
+│   连 token 都不存在（如 Console 命令发信）
+│        → 不覆盖 From，使用邮件类里直接设置的默认值
+│        → 最终用 env(SOLIDINVOICE_MAILER_SENDER) 作为 Envelope Sender
+```
+
+**源码**：
+
+```php
+// EmailFromListener.php L36-L58
+public function __invoke(MessageEvent $event): void
+{
+    /** @var TemplatedEmail $message */
+    $message = $event->getMessage();
+
+    $fromAddress = (string) $this->config->get('email/from_address');
+
+    if ('' !== $fromAddress) {
+        $fromName = (string) $this->config->get('email/from_name');
+        $message->from(new Address($fromAddress, $fromName));
+    } else {
+        // If a from address is not specified in the config,
+        // then we use the currently logged-in user's address
+        $token = $this->tokenStorage->getToken();
+
+        if ($token instanceof TokenInterface) {
+            /** @var User $user */
+            $user = $token->getUser();
+            $message->from($user->getEmail());
+        }
+    }
+}
+```
+
+**关键点**：
+- `email/from_address` 为空字符串而非 `null` 时，触发回退
+- `from_name` 可留空，仅在 `from_address` 有值时一起读取
+- 该监听器不负责 Envelope（信封）发送地址，那由 Symfony Mailer 根据 `env(SOLIDINVOICE_MAILER_SENDER)` 自动决定
+
+---
+
+### 补充：7 种邮件 Provider 的 DSN 生成差异
+
+每个 Configurator 的 `configure(array $config): Dsn` 方法将用户填写的表单字段拼接为 Symfony Mailer 支持的 DSN 字符串。所有 Provider 的差异如下：
+
+| Provider | 配置字段 | DSN 格式 | 对应 Configurator |
+|----------|---------|----------|-------------------|
+| **SMTP** | host、port、user、password | `smtp://user:urlencode(pass)@host:port`（无凭据时去掉 `user:pass@` 段） | [SmtpConfigurator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/MailerBundle/Configurator/SmtpConfigurator.php#L40-L47) |
+| **Gmail** | username、password | `gmail+smtp://username:password@default` | [GmailConfigurator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/MailerBundle/Configurator/GmailConfigurator.php#L37-L40) |
+| **Mailgun** | key、domain | `mailgun+api://key:domain@default` | [MailgunConfigurator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/MailerBundle/Configurator/MailgunConfigurator.php#L37-L40) |
+| **Postmark** | key | `postmark+api://key@default` | [PostmarkConfigurator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/MailerBundle/Configurator/PostmarkConfigurator.php#L37-L40) |
+| **Sendgrid** | key | `sendgrid+api://key@default` | [SendgridConfigurator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/MailerBundle/Configurator/SendgridConfigurator.php#L37-L40) |
+| **Amazon SES** | accessKey、accessSecret、region | `ses+api://accessKey:accessSecret@default?region=xx`（region 为空时不带 query 参数） | [SesConfigurator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/MailerBundle/Configurator/SesConfigurator.php#L37-L45) |
+| **Mailchimp Mandrill** | key | `mandrill+api://key@default` | [MailchimpConfigurator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/MailerBundle/Configurator/MailchimpConfigurator.php#L37-L40) |
+
+**SMTP 的特殊分支（无凭据时）**：
+
+```php
+// SmtpConfigurator.php L42-L46
+if (empty($config['user']) && empty($config['password'])) {
+    return Dsn::fromString(sprintf('smtp://%s:%d', $config['host'], $config['port'] ?? 25));
+}
+return Dsn::fromString(sprintf('smtp://%s:%s@%s:%d',
+    $config['user'], urlencode($config['password'] ?? ''),
+    $config['host'], $config['port'] ?? 25));
+```
+
+**Amazon SES 的 region 参数**：
+
+```php
+// SesConfigurator.php L39-L42
+$dsn = sprintf('ses+api://%s:%s@default', $config['accessKey'], $config['accessSecret']);
+if (array_key_exists('region', $config) && null !== $config['region']) {
+    $dsn .= '?region=' . $config['region'];
+}
+return Dsn::fromString($dsn);
+```
+
+---
+
+### 补充：默认设置播种到运行时生效的完整衔接
+
+#### 阶段一：容器编译期（服务注册与标签）
+
+文件：[SolidInvoiceMailerExtension.php](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/MailerBundle/DependencyInjection/SolidInvoiceMailerExtension.php#L24-L31)
+
+通过 `registerForAutoconfiguration` 为所有实现 `ConfiguratorInterface` 的类自动打上服务标签：
+
+```php
+$container->registerForAutoconfiguration(ConfiguratorInterface::class)
+    ->addTag('solidinvoice_mailer.transport.configurator');
+```
+
+文件：[MailerTransportConfigCompilerPass.php](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/MailerBundle/DependencyInjection/CompilerPass/MailerTransportConfigCompilerPass.php#L25-L38)
+
+CompilerPass 装饰框架的 `mailer.transport_factory`，并通过 `TaggedIteratorArgument` 把所有打了标签的 Configurator 注入到 `MailerConfigFactory`：
+
+```php
+$definition = new Definition(MailerConfigFactory::class);
+$definition->setDecoratedService('mailer.transport_factory');
+$definition->addArgument(new Reference(MailerConfigFactory::class . '.inner'));
+$definition->setArgument('$transports', new TaggedIteratorArgument('solidinvoice_mailer.transport.configurator'));
+$definition->setAutowired(true);
+```
+
+#### 阶段二：公司创建（默认设置播种）
+
+文件：[DefaultData.php](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/CoreBundle/Company/DefaultData.php#L87-L107) → 调用 [ConfigProvider.php](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/MailerBundle/Config/ConfigProvider.php#L27-L46)
+
+用户注册公司时，`DefaultData` 通过 `#[AutowireIterator(ProviderInterface::class)]` 收集所有 ConfigProvider，遍历后将 3 条邮件设置以 `Setting` 实体形式写入数据库：
+
+| Setting key | 初始值 | 表单类型 |
+|---|---|---|
+| `email/from_address` | `no-reply@solidinvoice.co` | EmailType |
+| `email/from_name` | `$company->getName()`（公司名） | TextType |
+| `email/sending_options/provider` | `null` | MailTransportType |
+
+此时 `email/sending_options/provider` 为 `null`，意味着**尚未选择任何邮件 Provider**。
+
+#### 阶段三：Settings 页面交互（用户配置 Provider）
+
+1. 页面加载：[Settings Live Component](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/SettingsBundle/Twig/Components/Settings.php) 根据 section 分组读取 Setting 记录，通过 [SettingsType.php](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/SettingsBundle/Form/Type/SettingsType.php) 渲染表单
+
+2. `MailTransportType` 构建子表单：根据注入的 `iterable $transports`（即 7 个 Configurator），循环调用 `getForm()` 获得子表单类型（如 `SmtpTransportConfigType`、`UsernamePasswordTransportConfigType` 等），每个 Provider 对应一组专属字段
+
+3. DataTransformer 将 JSON 字符串 ↔ 表单数组互相转换
+
+4. 用户提交后，`SettingsRepository::store()` 通过 DQL UPDATE 把 JSON 字符串写回 `email/sending_options/provider` 的 Setting.value 字段
+
+#### 阶段四：首次发信（运行时 Transport 生效）
+
+```
+邮件被发送
+    ↓
+Symfony Mailer 调用 mailer.transport_factory
+    ↓
+（装饰器）MailerConfigFactory::fromStrings()
+    ↓
+SystemConfig::get('email/sending_options/provider')
+    ↓
+┌─ value !== null
+│   → json_decode 得到 ['provider' => 'SMTP', 'config' => [...]]
+│   → 遍历 iterable<ConfiguratorInterface>，匹配 getName() === 'SMTP'
+│   → SmtpConfigurator::configure(config) 返回 Symfony\Component\Mailer\Transport\Dsn
+│   → $this->inner->fromDsnObject($dsn) 创建真实 Transport 实例
+│   → 邮件通过 SMTP 服务发送
+│
+└─ value === null
+    → return $this->inner->fromStrings($dsns)
+    → 框架使用 env(SOLIDINVOICE_MAILER_DSN)
+    → 默认值 null://null → NullTransport（静默丢弃不发信）
+```
+
+#### 阶段四同时：From Header 注入
+
+```
+MessageEvent 派发（Mailer sendMessage 过程中）
+    ↓
+EmailFromListener::__invoke()
+    ↓
+SystemConfig::get('email/from_address')
+    ↓
+┌─ 非空 → new Address(from_address, from_name) 设置到 message.from
+└─ 为空 → TokenStorage 当前登录用户的 email 设置到 message.from
+```
+
+两条链路互不干扰：
+- **Transport 链路**决定邮件通过什么服务器/API 发出去（物理通道）
+- **From 链路**决定收件人看到的"来自谁"（显示信息）
