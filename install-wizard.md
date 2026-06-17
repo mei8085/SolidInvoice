@@ -796,3 +796,391 @@ final class Installation
 ```
 
 配置一旦通过 `ConfigWriter` 写入 Symfony Secrets Vault，就处于加密锁定状态，只能通过 Vault 解密读取，不能直接明文修改，确保了配置的安全性。
+
+---
+
+## 补充：邮件投递配置的完整链路
+
+SolidInvoice 的邮件配置与数据库配置不同——**它不在安装向导中直接配置**，而是在安装完成后的系统设置中设置。本节完整梳理邮件环境变量的读入、配置写出、运行时生效的完整链路，以及 `email_settings` 翻译键"存在却未挂上安装向导的事实。
+
+### 邮件相关环境变量的框架读入入口
+
+邮件配置在框架层面有两个环境变量被直接读取：
+
+#### 1. `SOLIDINVOICE_MAILER_DSN` 和 `SOLIDINVOICE_MAILER_SENDER`
+
+**读入入口一：容器参数默认值定义
+
+文件：[config/services.php](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/config/services.php)
+
+```php
+// services.php L46-L47
+$parameters->set('env(SOLIDINVOICE_MAILER_DSN)', 'null://null');
+$parameters->set('env(SOLIDINVOICE_MAILER_SENDER)', 'SolidInvoice <no-reply@solidinvoice.co>');
+```
+
+这里定义了两个环境变量的**默认值**：
+- `MAILER_DSN` 默认值为 `null://null`（即不使用任何真实邮件传输）
+- `MAILER_SENDER` 默认值为 `SolidInvoice <no-reply@solidinvoice.co>`
+
+**读入入口二：框架 Mailer 组件配置**
+
+文件：[config/packages/mailer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/config/packages/mailer.php)
+
+```php
+return static function (FrameworkConfig $frameworkConfig): void {
+    $frameworkConfig->mailer()
+        ->dsn(env('SOLIDINVOICE_MAILER_DSN'))        // DSN 传输配置
+        ->envelope()
+        ->sender(env('SOLIDINVOICE_MAILER_SENDER'))   // 默认发件人信封
+    ;
+};
+```
+
+这里将两个环境变量直接注入到 Symfony Mailer 组件的配置中。这两个是**部署级配置**（Deployment-level），通过环境变量或 Symfony Secrets Vault 写入，适合固定部署时配置。
+
+---
+
+### `email_settings` 翻译键的"留存但未使用"事实
+
+文件：[InstallBundle/Resources/translations/messages.en.yml](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/InstallBundle/Resources/translations/messages.en.yml)
+
+```yaml
+# messages.en.yml L40-L43
+config:
+    title:
+        requirements_check: 'System Requirements Check'
+        database_config: 'Database Config'
+        email_settings: 'Email Settings'   # 翻译键存在
+```
+
+**事实**：`email_settings` 翻译键确实存在于安装向导的翻译文件中，与 `database_config` 并列，说明**早期版本或计划中将邮件配置作为安装向导的一个独立步骤。
+
+**但实际未使用**：在 [InstallationType.php](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/InstallBundle/Form/Type/InstallationType.php) 定义的 7 个步骤中，只有 `start` → `system_requirements` → `database_config` → `user_account` → `review` → `install` → `finish`，**没有 `email_settings` 步骤**，与翻译键对应的表单类型、Form Step、模板都不存在。
+
+这说明**邮件配置从安装向导中被移除了，但翻译键残留未清理。
+
+---
+
+### MailerBundle 配置写回与运行时 Transport 生效的真实路径
+
+邮件传输的真正配置入口位于**安装完成后的系统设置**（Settings），走一条独立的"设置页"链路，而非安装向导链路。
+
+#### 链路一：设置项的初始播种（首次创建公司时）
+
+邮件设置的**初始播种发生在公司创建时**，通过 ConfigProvider 机制注入默认值。
+
+**ConfigProvider 接口**：[SettingsBundle/Config/ProviderInterface.php](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/SettingsBundle/Config/ProviderInterface.php)
+
+各 Bundle 通过实现 `ProviderInterface` 提供默认设置项，由 `DefaultData` 在创建公司时播种到数据库：
+
+```php
+// MailerBundle/Config/ConfigProvider.php L27-L45
+final class ConfigProvider implements ProviderInterface
+{
+    public function provide(array $data): array
+    {
+        return [
+            new Config(
+                'email/from_address',
+                'no-reply@solidinvoice.co',
+                null,
+                EmailType::class,
+                ['trial_restricted' => true]
+            ),
+            new Config('email/from_name', $data['company_name'] ?? '', null, TextType::class),
+            new Config(
+                'email/sending_options/provider',
+                null,
+                null,
+                MailTransportType::class,
+                ['trial_restricted' => true]
+            ),
+        ];
+    }
+}
+```
+
+播种发生在公司创建流程中（[DefaultData.php](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/CoreBundle/Company/DefaultData.php)：
+
+```php
+// DefaultData.php L87-L106
+private function createAppConfig(Company $company, array $data): void
+{
+    foreach ($this->configProviders as $provider) {
+        foreach ($provider->provide($data + ['company_name' => $company->getName()]) as $config) {
+            $settingEntity = new Setting();
+            $settingEntity->setKey($config->key);           // email/from_address / email/from_name / email/sending_options/provider
+            $settingEntity->setValue($config->value);    // 默认值
+            $settingEntity->setType($config->formType);  // EmailType / MailTransportType 等
+            $settingEntity->setCompany($company);
+            $this->em->persist($settingEntity);
+        }
+    }
+}
+```
+
+**三个邮件相关设置项**：
+
+| 设置键 | 默认值 | 表单类型 | 说明 |
+|--------|--------|---------|------|
+| `email/from_address` | `no-reply@solidinvoice.co` | EmailType | 发件人地址 |
+| `email/from_name` | 公司名称 | TextType | 发件人名称 |
+| `email/sending_options/provider` | null | **MailTransportType** | 邮件传输提供商配置 |
+
+---
+
+#### 链路二：Settings 页面的读写路径
+
+安装完成后，用户在 **Settings → Email 标签页配置邮件。
+
+**设置页 Live 组件**：[SettingsBundle/Twig/Components/Settings.php](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/SettingsBundle/Twig/Components/Settings.php)
+
+Email 标签页在设置组件中以 section 形式存在：
+```php
+// Settings.php L51-L59
+public array $settingIconMap = [
+    'company' => 'building',
+    'invoice' => 'file-invoice',
+    'quote' => 'file-text-o',
+    'email' => 'envelope',   // Email 设置分组
+    // ...
+];
+```
+
+**设置表单类型**：[SettingsBundle/Form/Type/SettingsType.php](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/SettingsBundle/Form/Type/SettingsType.php)
+
+根据数据库中存储的 `Setting` 实体动态构建表单字段。
+
+**保存写回**：
+```php
+// Settings.php L146-L157
+#[LiveAction]
+public function save(Request $request): RedirectResponse
+{
+    $this->submitForm();
+    // 关键：调用 SettingsRepository::store()
+    $this->settingsRepository->store([$this->section => $this->getForm()->getData()]);
+}
+```
+
+**SettingsRepository::store()** 方法将嵌套数组扁平化为路径键并更新数据库：
+```php
+// SettingsRepository.php L44-L81
+public function store(array $settings): void
+{
+    $settings = $this->flatten($settings);  // ['email' => ['sending_options' => ['provider' => '...']]
+                                       // → ['email/sending_options/provider' => '...']
+    $entityManager->wrapInTransaction(function () use ($settings): void {
+        foreach ($settings as $key => $value) {
+            $this->createQueryBuilder('s')
+                ->update()
+                ->set('s.value', ':val')
+                ->where('s.key = :key')
+                ->execute();
+        }
+    });
+}
+```
+
+---
+
+#### 链路三：MailTransportType —— 多 Provider 表单与 JSON 序列化
+
+`email/sending_options/provider` 字段使用特殊的复合表单类型 [MailTransportType](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/SettingsBundle/Form/Type/MailTransportType.php)，这是邮件传输配置的核心枢纽。
+
+它根据已注册的 `ConfiguratorInterface`（邮件服务标签：`solidinvoice_mailer.transport.configurator`）动态构建子表单。
+
+**核心机制**：
+
+1. **动态 Provider 选择**：ChoiceType 下拉选择邮件提供商（Gmail/SMTP/Mailgun/Sendgrid/Postmark/Amazon SES/Mailchimp Mandrill）
+
+2. **对应子表单**：每个 Provider 对应一个 Configurator，它提供专属配置字段（SMTP 的 host/port/user/password；Gmail 的 username/password；Mailgun 的 domain/key 等）
+
+3. **JSON 序列化存储**：DataTransformer 将 provider + config 编码为 JSON 字符串存储：
+
+```php
+// MailTransportType.php L94-L126
+$builder->addModelTransformer(new class() implements DataTransformerInterface {
+    public function transform(mixed $value): ?array
+    {
+        // JSON → 数组
+        $data = json_decode($value, true);
+        return [
+            'provider' => $data['provider'] ?? null,
+            str_replace(' ', '-', (string)$data['provider']) => $data['config'] ?? [],
+        ];
+    }
+
+    public function reverseTransform(mixed $value): ?string
+    {
+        // 数组 → JSON 字符串
+        $provider = $value['provider'] ?? null;
+        return json_encode([
+            'provider' => $provider,
+            'config' => $value[str_replace(' ', '-', (string)$provider]
+        ], JSON_THROW_ON_ERROR);
+    }
+});
+```
+
+**数据库存储的典型值示例**：
+```json
+{"provider":"SMTP","config":{"host":"smtp.example.com","port":587,"user":"admin","password":"secret"}}
+```
+
+---
+
+#### 链路四：Configurator 列表与 Transport 写回 DSN（运行时生效）
+
+所有邮件 Provider Configurator 都实现 [ConfiguratorInterface](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/MailerBundle/Configurator/ConfiguratorInterface.php)：
+
+```php
+interface ConfiguratorInterface
+{
+    public function getName(): string;          // 显示名称（SMTP / Gmail / ...）
+    public function getForm(): string;        // 对应的表单类型类名
+    public function configure(array $config): Dsn;  // 配置数组 → Symfony Mailer DSN 对象
+}
+```
+
+**已注册的 Configurator**：
+
+| Configurator | 名称 | DSN 格式 |
+|---------------|------|----------|
+| [SmtpConfigurator](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/MailerBundle/Configurator/SmtpConfigurator.php) | SMTP | `smtp://user:pass@host:port` |
+| [GmailConfigurator](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/MailerBundle/Configurator/GmailConfigurator.php) | Gmail | `gmail+smtp://user:pass@default` |
+| MailgunConfigurator | Mailgun | `mailgun+api://key@default?region=...` |
+| PostmarkConfigurator | Postmark | `postmark+api://key@default` |
+| SendgridConfigurator | Sendgrid | `sendgrid+api://key@default` |
+| SesConfigurator | Amazon SES | `ses+api://...` |
+| MailchimpConfigurator | Mailchimp Mandrill | `mandrill+api://...` |
+
+**运行时生效的**关键是 [MailerConfigFactory](file:///d:/fz/0601-2/solo-dogfeeding/code/11-SolidInvoice/src/MailerBundle/Factory/MailerConfigFactory.php) —— 它通过 Symfony CompilerPass **装饰**（Decorate）了框架原生的 `mailer.transport_factory` 服务：
+
+```php
+// MailerTransportConfigCompilerPass.php L23-L38
+final class MailerTransportConfigCompilerPass implements CompilerPassInterface
+{
+    public function process(ContainerBuilder $container): void
+    {
+        $definition = new Definition(MailerConfigFactory::class);
+        $definition->setDecoratedService('mailer.transport_factory');  // 装饰框架的传输工厂
+        // ...
+    }
+}
+```
+
+**MailerConfigFactory::fromStrings() 在发送邮件时被调用，执行如下流程**：
+
+```php
+// MailerConfigFactory.php L41-L67
+public function fromStrings(array $dsns = []): ?TransportInterface
+{
+    // 1. 从数据库读取 JSON 配置
+    $mailerConfig = $this->config->get(self::CONFIG_KEY);  // 'email/sending_options/provider'
+
+    if (null === $mailerConfig) {
+        // 未配置时，回退使用 SOLIDINVOICE_MAILER_DSN 环境变量
+        return $this->inner->fromStrings($dsns);
+    }
+
+    $config = json_decode($mailerConfig, true);
+    $provider = $config['provider'] ?? '';
+
+    // 2. 找到对应 Configurator
+    foreach ($this->transports as $transport) {
+        if ($transport->getName() === $provider) {
+            // 3. Configurator 将配置数组构建为 DSN 对象
+            return $this->inner->fromDsnObject($transport->configure($config['config'] ?? []));
+        }
+    }
+}
+```
+
+**运行时生效路径优先级：
+
+```
+发送邮件时触发 mailer.transport_factory
+           ↓
+MailerConfigFactory::fromStrings() 被调用
+           ↓
+┌─ 数据库中 email/sending_options/provider 有值？
+│ 是 → 读取 JSON，解析 provider + config
+│       → 匹配 Configurator → configure() 生成 Symfony DSN 对象
+│       → 框架 Transport 实例化（SMTP/API 客户端
+│
+否 → 回退到框架原生
+       → 使用 $_ENV[SOLIDINVOICE_MAILER_DSN
+       → 默认为 null://null（不发送）
+```
+
+---
+
+### 邮件配置完整链路总结
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    环境变量层级（部署级，Secrets Vault）               │
+│                                                             │
+│  config/services.php:                                           │
+│    ├── env(SOLIDINVOICE_MAILER_DSN) = 'null://null'        │
+│    └── env(SOLIDINVOICE_MAILER_SENDER) = 默认发件人        │
+│                                                             │
+│  config/packages/mailer.php:                                    │
+│       └── 注入 FrameworkConfig::mailer                         │
+│            dsn + envelope.sender                                       │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│              设置层级（公司级，数据库 Setting 表）                         │
+│                                                             │
+│  公司创建 DefaultData:                                         │
+│    └── ConfigProvider::provide() → 播种 3 条 Setting 行        │
+│        ├── email/from_address                                 │
+│        ├── email/from_name                                   │
+│        └── email/sending_options/provider (MailTransportType)│
+│                                                             │
+│  Settings Live Component:                                   │
+│    └── 用户在 Email 标签页填写表单                               │
+│        ├── MailTransportType 动态渲染                          │
+│        │     ├── 选择 Provider (ChoiceType                   │
+│        │     └── 对应子表单字段                          │
+│        │     └── JSON 序列化: {"provider":"SMTP","config":{...}}│
+│        └── SettingsRepository::store() → UPDATE setting 表        │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│              运行时层级（发信时动态生效）                          │
+│                                                             │
+│  MailerConfigFactory (装饰 mailer.transport_factory)              │
+│    └── fromStrings():                                       │
+│         ├── 检查数据库 config->get('email/sending_options/provider')│
+│         ├── 未配置 → 回退 SOLIDINVOICE_MAILER_DSN           │
+│         ├── 已配置 → 解析 JSON                              │
+│         └── Configurator::configure() → Dsn 对象                  │
+│         └── 框架创建 Transport                             │
+│         └── 发送邮件                                       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 关键设计决策分析
+
+**为什么邮件配置不在安装向导中？**
+
+1. **部署 vs 业务分离**：
+   - 数据库配置是**部署基础设施**，必须在安装前配置
+   - 邮件配置是**业务配置**，可以安装后由管理员在 Settings 中设置
+
+2. **两套机制的双重配置路径**：
+   - **环境变量（Secrets Vault）**：适合 DevOps 部署时注入（Docker/Helm），无需进 Settings
+   - **数据库 Setting**：适合 SaaS 场景，每个公司可独立配置邮件
+
+3. **运行时回退机制**：
+   - MailerConfigFactory 优先用数据库 Setting 配置
+   - 回退到环境变量，为默认值 `null://null` 不发信（null transport）
+   - 部署环境（Helm Chart）可以在部署时直接设置 `SOLIDINVOICE_MAILER_DSN` 环境变量
+
+4. **遗留翻译键的历史遗留**：
+   - 翻译键 `email_settings` 作为安装向导的翻译中存在于数据库配置同级，说明早期可能计划把邮件配置并入安装步骤
+   - 最终选择了"安装后在 Settings 中配置，翻译键未清理
