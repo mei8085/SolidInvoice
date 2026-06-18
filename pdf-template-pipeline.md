@@ -432,26 +432,241 @@ public function __invoke(MessageEvent $event): void
 
 **文件**：`src/QuoteBundle/Resources/views/Pdf/quote.html.twig`
 
-结构与发票模板完全平行，关键差异：
+结构与发票模板完全平行。以下是完整的差异对照（按代码出现顺序）：
 
-| 差异点 | 发票模板 | 报价模板 |
-|--------|----------|----------|
-| **变量** | `invoice` | `quote` |
-| **标题 key** | `'invoice.pdf.title'` → "INVOICE" | `'quote.pdf.title'` → "QUOTE" |
-| **客户标签** | "Invoice To" | `'quote.pdf.prepared_for'` → "Prepared For" |
-| **水印设置 key** | `setting('invoice/watermark')` | `setting('quote/watermark')` |
-| **主色调** | 绿色 `#2e963a` | 蓝色 `#3b82f6` |
-| **总计背景色** | `#f0fdf4`（浅绿） | `#eff6ff`（浅蓝） |
-| **总计文字色** | `#166534`（深绿） | `#1d4ed8`（深蓝） |
-| **标签下划线色** | `#2e963a`（绿） | `#3b82f6`（蓝） |
-| **日期字段** | 开票日期 + 到期日 | 报价日期 + 有效期（`valid_until`） |
-| **有效期标识** | 无 | `isExpired` / `expires_today` / `valid_for_days` |
-| **余额行** | 有（支持部分付款） | 无 |
-| **付款记录** | 有（已付金额、未付余额） | 无 |
-| **支付 CTA 区块** | 有 | 无 |
-| **ID 字段** | `#{{ invoice.invoiceId }}` | `#{{ quote.quoteId }}` |
-| **ID 方法** | `invoice.getInvoiceId()` | `quote.getQuoteId()` |
-| **自定义字段 Target** | `CustomFieldTarget::INVOICE` | `CustomFieldTarget::QUOTE` |
+#### A. 模板变量差异
+
+| 差异点 | 发票模板（行号） | 报价模板（行号） | 说明 |
+|--------|------------------|------------------|------|
+| **模板变量名** | `invoice`（全文） | `quote`（全文） | 所有实体引用的变量名不同 |
+| **货币变量来源** | `invoice.client.currency`（第10行） | `quote.client.currency`（第10行） | 获取货币的实体路径不同 |
+| **余额判定变量** | `{% set hasOutstandingBalance = invoice.payments\|length > 0 and not invoice.balance.zero %}`（第11行） | ❌ 无此变量 | 报价无付款记录和余额概念，因此不需要 |
+| **水印设置 key** | `setting('invoice/watermark')`（第33行） | `setting('quote/watermark')`（第32行） | 读取不同的系统设置 |
+| **自定义字段 Target** | `CustomFieldTarget::INVOICE`（第269行） | `CustomFieldTarget::QUOTE`（第259行） | 自定义字段组件的目标实体不同 |
+
+#### B. 文件名和 ID 差异
+
+| 差异点 | 发票 | 报价 |
+|--------|------|------|
+| **文件名格式** | `invoice_{invoiceId}.pdf`（View 第52行 / Listener 第50行） | `quote_{quoteId}.pdf`（View 第46行 / Listener 第50行） |
+| **ID 字段（模板内）** | `#{{ invoice.invoiceId }}` | `#{{ quote.quoteId }}` |
+| **ID 获取方法** | `$invoice->getInvoiceId()` | `$quote->getQuoteId()` |
+| **外部链接 UUID 路由** | `/view/invoice/{uuid}.pdf`（路由 `_view_invoice_external`） | `/view/quote/{uuid}.pdf`（路由 `_view_quote_external`） |
+
+#### C. 日期和时效性标识差异（完整代码实现对照）
+
+**发票模板（第102-151行）：**
+```twig
+{# 开票日期 #}
+{{ 'invoice.date'|trans }} → {{ invoice.invoiceDate|date('F j, Y') }}
+
+{# 到期日计算 #}
+{% set now = "now"|date("U") %}
+{% set dueTimestamp = invoice.due|date("U") %}
+{% set daysDiff = ((dueTimestamp - now) / 86400)|round(0, 'floor') %}
+{% set isOverdue = daysDiff < 0 %}
+{% set daysOverdue = (daysDiff * -1) %}
+
+{{ 'invoice.due_date'|trans }} → {{ invoice.due|date('F j, Y') }}
+
+{# 到期提醒（仅在未付款时显示） #}
+{% if invoice.status != enum('InvoiceStatus').Paid %}
+    {% if isOverdue %}    → {{ 'invoice.pdf.overdue_by'|trans({'%days%': daysOverdue}) }}   {# 红色，大写 #}
+    {% elseif daysDiff == 0 %}  → {{ 'invoice.pdf.due_today'|trans }}                        {# 橙色，大写 #}
+    {% elseif daysDiff <= 7 %}  → {{ 'invoice.pdf.due_in_days'|trans({'%days%': daysDiff}) }}  {# 橙色 #}
+    {% else %}                → {{ 'invoice.pdf.due_in_days'|trans({'%days%': daysDiff}) }}  {# 灰色 #}
+    {% endif %}
+{% endif %}
+```
+
+**报价模板（第101-150行）：**
+```twig
+{# 报价日期 #}
+{{ 'quote.pdf.date'|trans }} → {{ quote.created|date('F j, Y') }}
+
+{# 有效期计算 #}
+{% set now = "now"|date("U") %}
+{% set dueTimestamp = quote.due|date("U") %}
+{% set daysDiff = ((dueTimestamp - now) / 86400)|round(0, 'floor') %}
+{% set isExpired = daysDiff < 0 %}
+{% set daysExpired = (daysDiff * -1) %}
+
+{{ 'quote.pdf.valid_until'|trans }} → {{ quote.due|date('F j, Y') }}
+
+{# 有效期提醒（仅在未接受/未拒绝/未取消时显示） #}
+{% if quote.status != Accepted and quote.status != Declined and quote.status != Cancelled %}
+    {% if isExpired %}    → {{ 'quote.pdf.expired'|trans }}                 {# 红色，大写 #}
+    {% elseif daysDiff == 0 %}  → {{ 'quote.pdf.expires_today'|trans }}     {# 橙色，大写 #}
+    {% elseif daysDiff <= 7 %}  → {{ 'quote.pdf.valid_for_days'|trans({'%days%': daysDiff}) }}  {# 橙色 #}
+    {% else %}                → {{ 'quote.pdf.valid_for_days'|trans({'%days%': daysDiff}) }}  {# 灰色 #}
+    {% endif %}
+{% endif %}
+```
+
+**日期与时效性差异汇总表：**
+
+| 维度 | 发票 | 报价 |
+|------|------|------|
+| **第一日期** | `invoice.date` → `invoice.invoiceDate`（开票日） | `quote.pdf.date` → `quote.created`（创建日） |
+| **第二日期** | `invoice.due_date` → `invoice.due`（到期日） | `quote.pdf.valid_until` → `quote.due`（有效期截止） |
+| **过期状态变量** | `isOverdue`（逾期） | `isExpired`（失效） |
+| **过期天数变量** | `daysOverdue` | `daysExpired` |
+| **过期文案 key** | `invoice.pdf.overdue_by` | `quote.pdf.expired` |
+| **今日到期 key** | `invoice.pdf.due_today` | `quote.pdf.expires_today` |
+| **剩余天数 key** | `invoice.pdf.due_in_days` | `quote.pdf.valid_for_days` |
+| **状态排除条件** | `status != InvoiceStatus::Paid`（仅排除已付款） | `status != Accepted and != Declined and != Cancelled`（排除3种终态） |
+
+#### D. 付款记录、余额行差异
+
+**发票模板独有（第343-381行）：**
+
+```twig
+{# 部分付款记录（仅在有付款且余额不为零时显示） #}
+{% if invoice.payments|length > 0 and not invoice.balance.zero %}
+    {% for payment in invoice.payments|filter(v => v.status == PaymentStatus::Captured) %}
+        {{ 'invoice.payment.label'|trans }}: {{ payment.method.name }}
+        -{{ payment.totalAmount|formatCurrency(currency) }}  {# 绿色文字 #}
+    {% endfor %}
+{% endif %}
+
+{# 总计或余额行（二选一） #}
+{% if hasOutstandingBalance %}
+    {# 余额行：黄色背景 #fef3c7，深褐色文字 #92400e #}
+    {{ 'invoice.balance'|trans }}
+    {{ invoice.balance|formatCurrency(currency) }}
+{% else %}
+    {# 合计行：绿色背景 #f0fdf4，深绿文字 #166534 #}
+    {{ 'invoice.total'|trans }}
+    {{ invoice.total|formatCurrency(currency) }}
+{% endif %}
+```
+
+**发票头部右侧的 Total Box（第153-173行）也有余额切换：**
+```twig
+{% if hasOutstandingBalance %}
+    {{ 'invoice.balance_due'|trans }}  →  {{ invoice.balance|formatCurrency(currency) }}
+{% else %}
+    {{ 'invoice.total_due'|trans }}    →  {{ invoice.total|formatCurrency(currency) }}
+{% endif %}
+```
+
+**报价模板（第267-367行）：**
+- ❌ 无付款记录区块（`invoice.payments` 循环不存在）
+- ❌ 无余额判定变量 `hasOutstandingBalance`
+- ❌ 无余额行（`balance-row` 样式不存在）
+- ✅ 始终显示合计行：`'quote.total'|trans`，蓝色背景 `#eff6ff`，深蓝文字 `#1d4ed8`
+- ✅ 报价头部右侧 Total Box（第152-166行）始终显示 `quote.pdf.total`，无余额切换
+
+**付款记录与余额差异汇总：**
+
+| 功能 | 发票 | 报价 | 发票代码位置 |
+|------|------|------|-------------|
+| 付款记录循环 | ✅ `invoice.payments` 遍历已捕获付款 | ❌ 无 | 第344-355行 |
+| 付款方式名显示 | ✅ `payment.method.name` | ❌ 无 | 第348行 |
+| 付款金额显示 | ✅ 绿色 `-{{ payment.totalAmount }}` | ❌ 无 | 第351行 |
+| 余额判定变量 | ✅ `hasOutstandingBalance` | ❌ 无 | 第11行 |
+| 余额行（黄色背景） | ✅ `invoice.balance`（`#fef3c7`） | ❌ 无 | 第363-371行 |
+| 合计行（二选一） | ✅ 与余额行互斥显示 | ✅ 始终显示 | 第372-380行 |
+| 头部 Total Box 切换 | ✅ `balance_due` / `total_due` | ❌ 始终显示 `total` | 第158-169行 |
+
+#### E. 支付入口（Payment CTA）差异
+
+**发票模板独有（第406-438行）：**
+
+```twig
+{# 付款引导区块（仅在未付款且配置了支付方式时显示） #}
+{% if invoice.status != InvoiceStatus::Paid and payments_configured(false) > 0 %}
+    {% set paymentUrl = url("_payments_create", {"uuid" : invoice.uuid}) %}
+
+    {# 绿色卡片区块 #}
+    <div style="background-color: #f0fdf4; border: 1px solid #bbf7d0;">
+        {{ 'invoice.pdf.payment_title'|trans }}
+        {{ 'invoice.pdf.payment_description'|trans }}
+
+        {# 绿色 Pay Now 按钮 #}
+        <a href="{{ paymentUrl }}" style="background-color: #2e963a; color: #ffffff;">
+            {{ 'invoice.action.pay_now'|trans }}
+        </a>
+
+        {# 支付链接文字 #}
+        {{ 'invoice.pdf.payment_url_label'|trans }}:
+        <a href="{{ paymentUrl }}" style="color: #166534;">{{ paymentUrl }}</a>
+    </div>
+{% endif %}
+```
+
+**报价模板：**
+- ❌ 完全无此区块（无 `payments_configured` 调用、无 `_payments_create` 路由、无 Pay Now 按钮）
+- 报价需要先被客户接受才能转为发票进行付款，因此报价 PDF 上不提供直接支付入口
+
+#### F. 预扣税（Withholding）差异
+
+两者都支持预扣税，结构对称，但颜色不同：
+
+| 维度 | 发票 | 报价 |
+|------|------|------|
+| **预扣行条件** | `invoice.withholdingAmount.positive`（第382行） | `quote.withholdingAmount.positive`（第348行） |
+| **预扣金额颜色** | `#ef4444`（红） | `#ef4444`（红，相同） |
+| **应付金额背景色** | `#f0fdf4`（浅绿） | `#eff6ff`（浅蓝） |
+| **应付金额文字色** | `#166534`（深绿） | `#1d4ed8`（深蓝） |
+| **应付 key** | `invoice.amount_payable` | `quote.amount_payable` |
+
+#### G. 颜色主题差异（所有行内样式）
+
+| 用途 | 发票（绿色系） | 报价（蓝色系） |
+|------|---------------|---------------|
+| 主按钮/头部 Total Box 背景 | `#2e963a` | `#3b82f6` |
+| 合计行背景色 | `#f0fdf4` | `#eff6ff` |
+| 合计行文字色 | `#166534` | `#1d4ed8` |
+| 支付 CTA 区块背景 | `#f0fdf4` + 边框 `#bbf7d0` | ❌ 无此区块 |
+| 支付 CTA 标题文字 | `#166534` | ❌ 无 |
+| 支付按钮背景色 | `#2e963a` | ❌ 无 |
+| 支付链接文字色 | `#166534` | ❌ 无 |
+| 标签下划线色（客户信息区） | `#2e963a` | `#3b82f6` |
+| 余额行背景色 | `#fef3c7`（黄） | ❌ 无余额行 |
+| 余额行文字色 | `#92400e`（深褐） | ❌ 无余额行 |
+
+#### H. 邮件附件环节差异
+
+| 维度 | 发票邮件 | 报价邮件 |
+|------|---------|---------|
+| **Email 类** | `src/InvoiceBundle/Email/InvoiceEmail.php` | `src/QuoteBundle/Email/QuoteEmail.php` |
+| **instanceof 检查** | `$message instanceof InvoiceEmail`（Listener 第45行） | `$message instanceof QuoteEmail`（Listener 第45行） |
+| **邮件 HTML 模板** | `@SolidInvoiceInvoice/Email/invoice.html.twig`（第26行） | `@SolidInvoiceQuote/Email/quote.html.twig`（第26行） |
+| **邮件上下文变量** | `['invoice' => $this->invoice]`（第27行） | `['quote' => $this->quote]`（第27行） |
+| **实体 getter** | `$message->getInvoice()`（Listener 第47、50行） | `$message->getQuote()`（Listener 第47、50行） |
+| **PDF 文件名** | `invoice_{id}.pdf` | `quote_{id}.pdf` |
+| **PDF 模板引用** | `@SolidInvoiceInvoice/Pdf/invoice.html.twig` | `@SolidInvoiceQuote/Pdf/quote.html.twig` |
+| **PDF 模板变量** | `['invoice' => ...]` | `['quote' => ...]` |
+| **MIME 类型** | `application/pdf`（相同） | `application/pdf`（相同） |
+
+#### I. 翻译 key 差异（完整对照）
+
+| 功能区域 | 发票 key | 报价 key |
+|---------|----------|----------|
+| PDF 标题 | `invoice.pdf.title` | `quote.pdf.title` |
+| 头部日期 | `invoice.date` | `quote.pdf.date` |
+| 第二日期 | `invoice.due_date` | `quote.pdf.valid_until` |
+| 过期文案 | `invoice.pdf.overdue_by` | `quote.pdf.expired` |
+| 今日到期 | `invoice.pdf.due_today` | `quote.pdf.expires_today` |
+| 剩余天数 | `invoice.pdf.due_in_days` | `quote.pdf.valid_for_days` |
+| 头部 Total（合计） | `invoice.total_due` | `quote.pdf.total` |
+| 头部 Total（余额） | `invoice.balance_due` | ❌ 无 |
+| 客户标签 | `invoice.pdf.bill_to`（"Bill To"） | `quote.pdf.prepared_for`（"Prepared For"） |
+| 明细表格列 | `invoice.item.heading.*` | `quote.item.heading.*` |
+| 小计 | `invoice.subtotal` | `quote.subtotal` |
+| 行税 | `invoice.line_tax` | `quote.line_tax` |
+| 折扣 | `invoice.discount` | `quote.discount` |
+| 合计 | `invoice.total` | `quote.total` |
+| 余额 | `invoice.balance` | ❌ 无 |
+| 付款记录 | `invoice.payment.label` | ❌ 无 |
+| 预扣税 | `invoice.withholding` | `quote.withholding` |
+| 应付金额 | `invoice.amount_payable` | `quote.amount_payable` |
+| 付款引导标题 | `invoice.pdf.payment_title` | ❌ 无 |
+| 付款引导描述 | `invoice.pdf.payment_description` | ❌ 无 |
+| 付款按钮 | `invoice.action.pay_now` | ❌ 无 |
+| 付款链接标签 | `invoice.pdf.payment_url_label` | ❌ 无 |
+| 条款 | `invoice.terms` | `quote.terms` |
 
 ### 5.3 两者的共同结构
 
