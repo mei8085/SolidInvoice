@@ -1,38 +1,43 @@
 # PDF 模板生成完整代码链路
 
-本文档梳理 SolidInvoice 中 PDF 模板从选择到最终打印输出的完整代码流程。所有结论均附有代码位置证据，可在仓库中直接验证。
+本文档梳理 SolidInvoice 中 **发票（Invoice）** 和 **报价（Quote）** 两条 PDF 生成链路，覆盖从模板选择、入口触发到最终打印输出的完整代码流程。所有结论均附有代码位置证据，可在仓库中直接验证。
 
 **相对路径说明**：所有路径均相对于项目根目录。
 
 ---
 
-## 一、模板选择逻辑：硬编码，无动态选择
+## 一、模板选择逻辑：发票与报价各有硬编码的默认模板
 
 ### 1.1 关键结论
 
-**所有生产代码（Action、Listener）均硬编码引用默认 PDF 模板，不存在运行时动态选择模板的机制。** 8 个可选预设模板（classic、modern、compact 等）目前仅在测试中使用，不进入实际运行路径。
+**所有生产代码（Action、Listener）均硬编码引用各自的默认 PDF 模板，不存在运行时动态选择模板的机制。** 8 个可选预设模板（classic、modern、compact 等）目前仅在测试中使用，不进入实际运行路径。
 
-### 1.2 默认模板的引用点（全量搜索结果）
+### 1.2 默认模板的引用点（发票 × 报价 全量对照）
 
 验证命令：
 ```bash
-grep -rn "@SolidInvoiceInvoice/Pdf\|@SolidInvoiceQuote/Pdf" src/ --include="*.php"
+grep -rn "@SolidInvoiceInvoice/Pdf\|@SolidInvoiceQuote/Pdf" src/ --include="*.php" | grep -v "Tests/"
 ```
 
-所有 6 个生产代码入口均直接硬编码模板路径：
+**发票（Invoice）的 3 个入口**：
 
-| 入口 | 模板路径 | 代码位置 | 行号 |
-|------|----------|----------|------|
-| 登录用户-发票 | `@SolidInvoiceInvoice/Pdf/invoice.html.twig` | `src/InvoiceBundle/Action/View.php` | 52 |
-| 登录用户-报价 | `@SolidInvoiceQuote/Pdf/quote.html.twig` | `src/QuoteBundle/Action/View.php` | 46 |
-| 外部链接-发票 | `@SolidInvoiceInvoice/Pdf/invoice.html.twig` | `src/CoreBundle/Action/ViewBilling.php` | 90 |
-| 外部链接-报价 | `@SolidInvoiceQuote/Pdf/quote.html.twig` | `src/CoreBundle/Action/ViewBilling.php` | 69 |
-| 邮件附件-发票 | `@SolidInvoiceInvoice/Pdf/invoice.html.twig` | `src/InvoiceBundle/Listener/Mailer/InvoicePdfListener.php` | 47 |
-| 邮件附件-报价 | `@SolidInvoiceQuote/Pdf/quote.html.twig` | `src/QuoteBundle/Listener/Mailer/QuotePdfListener.php` | 47 |
+| 入口类型 | 模板路径 | 代码位置 | 行号 |
+|----------|----------|----------|------|
+| 登录用户查看 | `@SolidInvoiceInvoice/Pdf/invoice.html.twig` | `src/InvoiceBundle/Action/View.php` | 52 |
+| 外部链接查看 | `@SolidInvoiceInvoice/Pdf/invoice.html.twig` | `src/CoreBundle/Action/ViewBilling.php` | 90 |
+| 邮件附件 | `@SolidInvoiceInvoice/Pdf/invoice.html.twig` | `src/InvoiceBundle/Listener/Mailer/InvoicePdfListener.php` | 47 |
 
-**验证结果**：没有通过设置系统或数据库读取模板名的逻辑。
+**报价（Quote）的 3 个入口**：
 
-### 1.3 可选预设模板的状态
+| 入口类型 | 模板路径 | 代码位置 | 行号 |
+|----------|----------|----------|------|
+| 登录用户查看 | `@SolidInvoiceQuote/Pdf/quote.html.twig` | `src/QuoteBundle/Action/View.php` | 46 |
+| 外部链接查看 | `@SolidInvoiceQuote/Pdf/quote.html.twig` | `src/CoreBundle/Action/ViewBilling.php` | 69 |
+| 邮件附件 | `@SolidInvoiceQuote/Pdf/quote.html.twig` | `src/QuoteBundle/Listener/Mailer/QuotePdfListener.php` | 47 |
+
+**验证结果**：没有通过设置系统或数据库读取模板名的逻辑。发票 3 个入口统一指向 `invoice.html.twig`，报价 3 个入口统一指向 `quote.html.twig`。
+
+### 1.3 可选预设模板的状态（测试专用）
 
 验证命令：
 ```bash
@@ -64,135 +69,215 @@ Templates/
 └── friendly/{pdf,email,preview}.html.twig
 ```
 
-**结论**：可选预设模板是为未来模板选择功能预制的，当前版本尚未接入运行路径。
+**结论**：可选预设模板是为未来模板选择功能预制的，当前版本尚未接入运行路径。注意：报价目前没有对应的 `Templates/` 目录，只有发票有。
 
 ---
 
-## 二、两个入口的完整调用链对比
+## 二、入口一：浏览器打印（发票 × 报价 并列）
 
-### 2.1 浏览器打印入口
-
-**路由定义**：
+### 2.1 路由配置对照
 
 验证命令：
 ```bash
-grep -n "_format.*pdf\|_invoices_view\|_view_invoice_external" \
+grep -n "_invoices_view\|_quotes_view\|_view_invoice_external\|_view_quote_external\|_format" \
   src/InvoiceBundle/Resources/config/routing.php \
+  src/QuoteBundle/Resources/config/routing.php \
   src/CoreBundle/Resources/config/routing.php
 ```
 
-```
-# 登录用户（InvoiceBundle 路由）
-_invoices_view: /view/{id}.{_format}    _format: html|pdf
-  → src/InvoiceBundle/Resources/config/routing.php 第63、66行
+| 维度 | 发票（Invoice） | 报价（Quote） |
+|------|-----------------|----------------|
+| **路由名** | `_invoices_view` | `_quotes_view` |
+| **路由配置文件** | `src/InvoiceBundle/Resources/config/routing.php` | `src/QuoteBundle/Resources/config/routing.php` |
+| **路由行号** | 第63-66行 | 第43-46行 |
+| **路由路径** | `/view/{id}.{_format}` | `/view/{id}.{_format}` |
+| **支持格式** | `html \| pdf` | `html \| pdf` |
+| **默认格式** | `html` | `html` |
+| **外部路由名** | `_view_invoice_external` | `_view_quote_external` |
+| **外部路由路径** | `/view/invoice/{uuid}.{_format}` | `/view/quote/{uuid}.{_format}` |
+| **外部路由文件** | `src/CoreBundle/Resources/config/routing.php` | `src/CoreBundle/Resources/config/routing.php` |
+| **外部路由行号** | 第44-47行 | 第38-42行 |
 
-# 外部链接（CoreBundle 路由）
-_view_invoice_external: /view/invoice/{uuid}.{_format}    _format: html|pdf
-_view_quote_external: /view/quote/{uuid}.{_format}        _format: html|pdf
-  → src/CoreBundle/Resources/config/routing.php 第38、44行
-```
-
-**触发条件**：URL 后缀为 `.pdf`（如 `/invoices/view/123.pdf`），Symfony 将 `getRequestFormat()` 设为 `'pdf'`。
-
-**调用流程**：
-
-```
-1. 用户访问 /invoices/view/{id}.pdf
-   │
-   ▼ 路由匹配 _invoices_view，_format=pdf
-2. src/InvoiceBundle/Action/View.php::__invoke(Request, Invoice)
-   │  第51行: 'pdf' === $request->getRequestFormat()  ✅
-   │  第51行: $this->pdfGenerator->canPrintPdf()      ✅ (需 mbstring+gd)
-   │
-   ▼
-3. Twig 渲染 @SolidInvoiceInvoice/Pdf/invoice.html.twig
-   │  传入 ['invoice' => $invoice]
-   │
-   ▼
-4. src/CoreBundle/Pdf/Generator.php::generate($html)
-   │  返回 PDF 二进制字符串
-   │
-   ▼
-5. new PdfResponse($pdfContent, 'invoice_{invoiceId}.pdf')
-   │  Content-Type: application/pdf
-   │  Content-Disposition: inline; filename="invoice_XXX.pdf"
-   │
-   ▼
-6. 浏览器接收 PDF 响应（内联预览）
-```
-
-**外部链接的特殊逻辑**（`src/CoreBundle/Action/ViewBilling.php` 第101-145行）：
+**路由配置代码：**
 
 ```php
-private function createResponse(Request $request, array $options): array|Response
-{
-    $entity = $repository->findOneBy(['uuid' => $options['uuid']]);
+// 发票路由（src/InvoiceBundle/Resources/config/routing.php 第63-66行）
+$routingConfigurator
+    ->add('_invoices_view', '/view/{id}.{_format}')
+    ->controller(\SolidInvoice\InvoiceBundle\Action\View::class)
+    ->defaults(['_format' => 'html'])
+    ->requirements(['_format' => 'html|pdf']);
 
-    // 1. 邮件验证门控检查
-    if ($this->emailVerificationGate->isCompanyGated($entity->getCompany())) {
-        throw new NotFoundHttpException(...);
-    }
+// 报价路由（src/QuoteBundle/Resources/config/routing.php 第43-46行）
+$routingConfigurator
+    ->add('_quotes_view', '/view/{id}.{_format}')
+    ->controller(\SolidInvoice\QuoteBundle\Action\View::class)
+    ->defaults(['_format' => 'html'])
+    ->requirements(['_format' => 'html|pdf']);
+```
 
-    // 2. 已登录用户重定向到内部路由
-    if ($this->authorizationChecker->isGranted('IS_AUTHENTICATED_REMEMBERED')) {
-        return new RedirectResponse($this->router->generate($options['route'], ...));
-    }
+### 2.2 登录用户 View Action 对照
 
-    // 3. 切换公司上下文（多租户）
-    $this->companySelector->switchCompany($entity->getCompany()->getId());
+| 维度 | 发票 | 报价 |
+|------|------|------|
+| **文件** | `src/InvoiceBundle/Action/View.php` | `src/QuoteBundle/Action/View.php` |
+| **类名** | `SolidInvoice\InvoiceBundle\Action\View` | `SolidInvoice\QuoteBundle\Action\View` |
+| **实体参数** | `Invoice $invoice` | `Quote $quote` |
+| **PDF 判断行号** | 第51行 | 第45行 |
+| **判断条件** | `'pdf' === $request->getRequestFormat() && $this->pdfGenerator->canPrintPdf()` | 同左 |
+| **渲染模板** | `@SolidInvoiceInvoice/Pdf/invoice.html.twig` | `@SolidInvoiceQuote/Pdf/quote.html.twig` |
+| **模板变量名** | `['invoice' => $invoice]` | `['quote' => $quote]` |
+| **文件名格式** | `invoice_{invoiceId}.pdf` | `quote_{quoteId}.pdf` |
+| **实体 ID 方法** | `$invoice->getInvoiceId()` | `$quote->getQuoteId()` |
+| **HTML 模板** | `@SolidInvoiceInvoice/Default/view.html.twig` | `@SolidInvoiceQuote/Default/view.html.twig` |
+| **额外依赖** | `PaymentRepository`（获取付款记录） | 无 |
 
-    // 4. PDF 格式处理
-    if ('pdf' === $request->getRequestFormat() && $this->pdfGenerator->canPrintPdf()) {
-        $html = $this->twig->render($options['pdfTemplate'], ...);
-        return new PdfResponse($this->pdfGenerator->generate($html), $filename);
-    }
+**发票 View 代码**（第51-52行）：
+```php
+if ('pdf' === $request->getRequestFormat() && $this->pdfGenerator->canPrintPdf()) {
+    return new PdfResponse($this->pdfGenerator->generate(
+        $this->twig->render('@SolidInvoiceInvoice/Pdf/invoice.html.twig', ['invoice' => $invoice])
+    ), sprintf('invoice_%s.pdf', $invoice->getInvoiceId()));
 }
 ```
 
-### 2.2 邮件附件入口
+**报价 View 代码**（第45-46行）：
+```php
+if ('pdf' === $request->getRequestFormat() && $this->pdfGenerator->canPrintPdf()) {
+    return new PdfResponse($this->pdfGenerator->generate(
+        $this->engine->render('@SolidInvoiceQuote/Pdf/quote.html.twig', ['quote' => $quote])
+    ), sprintf('quote_%s.pdf', $quote->getQuoteId()));
+}
+```
 
-**触发机制**：Symfony Mailer 的 `MessageEvent` 事件。
+### 2.3 外部链接 ViewBilling 入口对照
+
+两个入口共用同一个 Action 类 `src/CoreBundle/Action/ViewBilling.php`，通过不同方法分发：
+
+| 维度 | 发票外部入口 | 报价外部入口 |
+|------|-------------|-------------|
+| **方法名** | `invoiceAction()` | `quoteAction()` |
+| **行号** | 第82-94行 | 第61-73行 |
+| **路由名** | `_view_invoice_external` | `_view_quote_external` |
+| **HTML 模板** | `@SolidInvoiceCore/View/invoice.html.twig` | `@SolidInvoiceCore/View/quote.html.twig` |
+| **Repository** | `Invoice::class` | `Quote::class` |
+| **重定向路由** | `_invoices_view` | `_quotes_view` |
+| **HTML 视图模板** | `@SolidInvoiceInvoice/external_invoice_view.html.twig` | `@SolidInvoiceQuote/quote_template.html.twig` |
+| **PDF 模板** | `@SolidInvoiceInvoice/Pdf/invoice.html.twig` | `@SolidInvoiceQuote/Pdf/quote.html.twig` |
+| **实体变量名** | `'invoice'` | `'quote'` |
+| **ID 获取方法** | `$entity->getInvoiceId()` | `$entity->getQuoteId()` |
+
+**代码结构**（`ViewBilling.php`）：
+
+```php
+// 报价（第61-73行）
+#[Template('@SolidInvoiceCore/View/quote.html.twig')]
+public function quoteAction(Request $request, string $uuid): array|Response
+{
+    $options = [
+        'repository' => Quote::class,
+        'route' => '_quotes_view',
+        'template' => '@SolidInvoiceQuote/quote_template.html.twig',
+        'uuid' => $uuid,
+        'entity' => 'quote',
+        'pdfTemplate' => '@SolidInvoiceQuote/Pdf/quote.html.twig',
+    ];
+    return $this->createResponse($request, $options);
+}
+
+// 发票（第82-94行）
+#[Template('@SolidInvoiceCore/View/invoice.html.twig')]
+public function invoiceAction(Request $request, string $uuid): array|Response
+{
+    $options = [
+        'repository' => Invoice::class,
+        'route' => '_invoices_view',
+        'template' => '@SolidInvoiceInvoice/external_invoice_view.html.twig',
+        'uuid' => $uuid,
+        'entity' => 'invoice',
+        'pdfTemplate' => '@SolidInvoiceInvoice/Pdf/invoice.html.twig',
+    ];
+    return $this->createResponse($request, $options);
+}
+
+// 共用处理逻辑（第101-145行）
+private function createResponse(Request $request, array $options): array|Response
+{
+    // 1. 根据 UUID 查询实体
+    // 2. 邮件验证门控检查
+    // 3. 已登录用户重定向到内部路由
+    // 4. 切换公司上下文（多租户）
+    // 5. PDF 格式处理：渲染 $options['pdfTemplate']，返回 PdfResponse
+    // 6. 非 PDF 格式：返回数组供 HTML 模板渲染
+}
+```
+
+### 2.4 浏览器入口调用链对比图
+
+```
+               发票                                           报价
+  ┌─────────────────────────┐               ┌─────────────────────────┐
+  │ /invoices/view/{id}.pdf │               │  /quotes/view/{id}.pdf  │
+  │ 或                      │               │ 或                      │
+  │ /view/invoice/{uuid}.pdf│               │ /view/quote/{uuid}.pdf  │
+  └────────────┬────────────┘               └────────────┬────────────┘
+               │                                          │
+               ▼                                          ▼
+  ┌─────────────────────────┐               ┌─────────────────────────┐
+  │ InvoiceBundle/          │               │ QuoteBundle/            │
+  │ Action/View.php         │               │ Action/View.php         │
+  │ 或                      │               │ 或                      │
+  │ CoreBundle/Action/      │               │ CoreBundle/Action/      │
+  │ ViewBilling.php         │               │ ViewBilling.php         │
+  │                         │               │                         │
+  │ 第51行: _format='pdf'   │               │ 第45行: _format='pdf'   │
+  │ && canPrintPdf()        │               │ && canPrintPdf()        │
+  └────────────┬────────────┘               └────────────┬────────────┘
+               │                                          │
+               ▼                                          ▼
+  ┌─────────────────────────┐               ┌─────────────────────────┐
+  │ Twig 渲染               │               │ Twig 渲染               │
+  │ @SolidInvoiceInvoice/   │               │ @SolidInvoiceQuote/     │
+  │ Pdf/invoice.html.twig   │               │ Pdf/quote.html.twig     │
+  │ ['invoice' => $invoice] │               │ ['quote' => $quote]     │
+  └────────────┬────────────┘               └────────────┬────────────┘
+               │                                          │
+               ▼                                          ▼
+  ┌─────────────────────────┐               ┌─────────────────────────┐
+  │ new PdfResponse(        │               │ new PdfResponse(        │
+  │   $pdfBinary,           │               │   $pdfBinary,           │
+  │   "invoice_{id}.pdf"    │               │   "quote_{id}.pdf"      │
+  │ )                       │               │ )                       │
+  └─────────────────────────┘               └─────────────────────────┘
+```
+
+---
+
+## 三、入口二：邮件附件（发票 × 报价 并列）
+
+### 3.1 邮件监听器对照
 
 验证命令：
 ```bash
-grep -n "MessageEvent\|getSubscribedEvents\|__invoke" \
-  src/InvoiceBundle/Listener/Mailer/InvoicePdfListener.php
+grep -n "MessageEvent\|getSubscribedEvents\|__invoke\|instanceof" \
+  src/InvoiceBundle/Listener/Mailer/InvoicePdfListener.php \
+  src/QuoteBundle/Listener/Mailer/QuotePdfListener.php
 ```
 
-**事件流**：
+| 维度 | 发票邮件监听器 | 报价邮件监听器 |
+|------|--------------|--------------|
+| **文件** | `src/InvoiceBundle/Listener/Mailer/InvoicePdfListener.php` | `src/QuoteBundle/Listener/Mailer/QuotePdfListener.php` |
+| **类名** | `InvoicePdfListener` | `QuotePdfListener` |
+| **事件** | `MessageEvent` | `MessageEvent` |
+| **订阅方法行号** | 第57-61行 | 第57-62行 |
+| **instanceof 检查** | `$message instanceof InvoiceEmail` | `$message instanceof QuoteEmail` |
+| **instanceof 行号** | 第45行 | 第45行 |
+| **PDF 模板** | `@SolidInvoiceInvoice/Pdf/invoice.html.twig` | `@SolidInvoiceQuote/Pdf/quote.html.twig` |
+| **模板变量名** | `['invoice' => $message->getInvoice()]` | `['quote' => $message->getQuote()]` |
+| **文件名格式** | `invoice_{invoiceId}.pdf` | `quote_{quoteId}.pdf` |
+| **MIME 类型** | `application/pdf` | `application/pdf` |
 
-```
-1. 业务代码调用 $mailer->send(new InvoiceEmail($invoice))
-   │  InvoiceEmail 构造时设定 htmlTemplate = @SolidInvoiceInvoice/Email/invoice.html.twig
-   │  （注意：这是邮件 HTML 模板，不是 PDF 模板）
-   │
-   ▼
-2. Symfony Mailer 分发 MessageEvent 事件
-   │
-   ▼
-3. src/InvoiceBundle/Listener/Mailer/InvoicePdfListener.php::__invoke(MessageEvent)
-   │  第44行: 检查 $message instanceof InvoiceEmail  ✅
-   │  第45行: 检查 $this->generator->canPrintPdf()   ✅
-   │
-   ▼
-4. Twig 渲染 @SolidInvoiceInvoice/Pdf/invoice.html.twig
-   │  传入 ['invoice' => $message->getInvoice()]
-   │  （与浏览器入口使用完全相同的模板和数据）
-   │
-   ▼
-5. $this->generator->generate($html)
-   │  返回 PDF 二进制字符串
-   │
-   ▼
-6. $message->attach($content, 'invoice_{invoiceId}.pdf', 'application/pdf')
-   │  PDF 作为附件添加到邮件
-   │
-   ▼
-7. 邮件发送（含 HTML 正文 + PDF 附件）
-```
-
-**事件订阅注册**（第57-61行）：
-
+**事件订阅注册**（两者完全相同）：
 ```php
 public static function getSubscribedEvents(): array
 {
@@ -200,146 +285,199 @@ public static function getSubscribedEvents(): array
 }
 ```
 
-### 2.3 两个入口的核心差异
+### 3.2 邮件监听器核心代码对照
 
-| 维度 | 浏览器打印 | 邮件附件 |
-|------|-----------|----------|
-| **触发方式** | 用户主动请求 `.pdf` 后缀 | 发送邮件时自动触发 |
-| **入口代码** | `src/InvoiceBundle/Action/View.php` / `src/CoreBundle/Action/ViewBilling.php` | `src/InvoiceBundle/Listener/Mailer/InvoicePdfListener.php` |
-| **PDF 模板** | `@SolidInvoiceInvoice/Pdf/invoice.html.twig` | 同左（完全相同） |
-| **数据来源** | 路由参数解析的 Invoice 实体 | `InvoiceEmail` 对象中获取的 Invoice 实体 |
-| **输出方式** | `PdfResponse`（HTTP 响应） | `$message->attach()`（邮件附件） |
-| **文件名** | `invoice_{invoiceId}.pdf` | `invoice_{invoiceId}.pdf` |
-| **Content-Disposition** | `inline`（浏览器内预览） | 无（作为邮件附件下载） |
-| **前置检查** | 路由格式判断 + `canPrintPdf()` | `instanceof InvoiceEmail` + `canPrintPdf()` |
-| **公司上下文** | 外部入口需 `CompanySelector::switchCompany()` | 邮件发送时已在正确的公司上下文 |
+**发票监听器**（`InvoicePdfListener.php` 第40-51行）：
+```php
+public function __invoke(MessageEvent $event): void
+{
+    /** @var InvoiceEmail $message */
+    $message = $event->getMessage();
+
+    if ($message instanceof InvoiceEmail && $this->generator->canPrintPdf()) {
+        $content = $this->generator->generate(
+            $this->twig->render('@SolidInvoiceInvoice/Pdf/invoice.html.twig', ['invoice' => $message->getInvoice()])
+        );
+        $message->attach($content, sprintf('invoice_%s.pdf', $message->getInvoice()->getInvoiceId()), 'application/pdf');
+    }
+}
+```
+
+**报价监听器**（`QuotePdfListener.php` 第40-51行）：
+```php
+public function __invoke(MessageEvent $event): void
+{
+    /** @var QuoteEmail $message */
+    $message = $event->getMessage();
+
+    if ($message instanceof QuoteEmail && $this->generator->canPrintPdf()) {
+        $content = $this->generator->generate(
+            $this->twig->render('@SolidInvoiceQuote/Pdf/quote.html.twig', ['quote' => $message->getQuote()])
+        );
+        $message->attach($content, sprintf('quote_%s.pdf', $message->getQuote()->getQuoteId()), 'application/pdf');
+    }
+}
+```
+
+### 3.3 邮件入口调用链对比图
+
+```
+               发票                                           报价
+  ┌─────────────────────────┐               ┌─────────────────────────┐
+  │ $mailer->send(          │               │ $mailer->send(          │
+  │   new InvoiceEmail(     │               │   new QuoteEmail(       │
+  │     $invoice            │               │     $quote              │
+  │   )                     │               │   )                     │
+  │ )                       │               │ )                       │
+  └────────────┬────────────┘               └────────────┬────────────┘
+               │                                          │
+               ▼                                          ▼
+  ┌─────────────────────────┐               ┌─────────────────────────┐
+  │ Symfony Mailer 分发      │               │ Symfony Mailer 分发      │
+  │ MessageEvent 事件        │               │ MessageEvent 事件        │
+  └────────────┬────────────┘               └────────────┬────────────┘
+               │                                          │
+               ▼                                          ▼
+  ┌─────────────────────────┐               ┌─────────────────────────┐
+  │ InvoicePdfListener/     │               │ QuotePdfListener/       │
+  │ __invoke()              │               │ __invoke()              │
+  │                         │               │                         │
+  │ instanceof InvoiceEmail │               │ instanceof QuoteEmail   │
+  │ && canPrintPdf()        │               │ && canPrintPdf()        │
+  └────────────┬────────────┘               └────────────┬────────────┘
+               │                                          │
+               ▼                                          ▼
+  ┌─────────────────────────┐               ┌─────────────────────────┐
+  │ Twig 渲染               │               │ Twig 渲染               │
+  │ @SolidInvoiceInvoice/   │               │ @SolidInvoiceQuote/     │
+  │ Pdf/invoice.html.twig   │               │ Pdf/quote.html.twig     │
+  └────────────┬────────────┘               └────────────┬────────────┘
+               │                                          │
+               ▼                                          ▼
+  ┌─────────────────────────┐               ┌─────────────────────────┐
+  │ $message->attach(       │               │ $message->attach(       │
+  │   $pdfBinary,           │               │   $pdfBinary,           │
+  │   "invoice_{id}.pdf",   │               │   "quote_{id}.pdf",     │
+  │   "application/pdf"     │               │   "application/pdf"     │
+  │ )                       │               │ )                       │
+  └─────────────────────────┘               └─────────────────────────┘
+```
 
 ---
 
-## 三、默认模板内部结构
+## 四、两类入口 × 两种单据的完整对照表
 
-### 3.1 发票 PDF 模板
+| | **浏览器打印-发票** | **浏览器打印-报价** | **邮件附件-发票** | **邮件附件-报价** |
+|---|---|---|---|---|
+| **触发方式** | URL `.pdf` 后缀 | URL `.pdf` 后缀 | `MessageEvent` 事件 | `MessageEvent` 事件 |
+| **触发时机** | 用户主动访问 | 用户主动访问 | 发送邮件时自动 | 发送邮件时自动 |
+| **入口类** | `InvoiceBundle/Action/View` 或 `CoreBundle/Action/ViewBilling` | `QuoteBundle/Action/View` 或 `CoreBundle/Action/ViewBilling` | `InvoicePdfListener` | `QuotePdfListener` |
+| **入口文件** | `src/InvoiceBundle/Action/View.php` <br> `src/CoreBundle/Action/ViewBilling.php` | `src/QuoteBundle/Action/View.php` <br> `src/CoreBundle/Action/ViewBilling.php` | `src/InvoiceBundle/Listener/Mailer/InvoicePdfListener.php` | `src/QuoteBundle/Listener/Mailer/QuotePdfListener.php` |
+| **判断条件** | `_format='pdf'` <br> `&& canPrintPdf()` | `_format='pdf'` <br> `&& canPrintPdf()` | `instanceof InvoiceEmail` <br> `&& canPrintPdf()` | `instanceof QuoteEmail` <br> `&& canPrintPdf()` |
+| **判断行号** | 第51行（内部） <br> 第133行（外部） | 第45行（内部） <br> 第133行（外部） | 第45行 | 第45行 |
+| **PDF 模板** | `@SolidInvoiceInvoice/Pdf/invoice.html.twig` | `@SolidInvoiceQuote/Pdf/quote.html.twig` | `@SolidInvoiceInvoice/Pdf/invoice.html.twig` | `@SolidInvoiceQuote/Pdf/quote.html.twig` |
+| **模板文件** | `src/InvoiceBundle/Resources/views/Pdf/invoice.html.twig` | `src/QuoteBundle/Resources/views/Pdf/quote.html.twig` | 同左 | 同左 |
+| **模板变量名** | `'invoice'` | `'quote'` | `'invoice'` | `'quote'` |
+| **文件名** | `invoice_{id}.pdf` | `quote_{id}.pdf` | `invoice_{id}.pdf` | `quote_{id}.pdf` |
+| **ID 方法** | `$invoice->getInvoiceId()` | `$quote->getQuoteId()` | `$invoice->getInvoiceId()` | `$quote->getQuoteId()` |
+| **输出方式** | `PdfResponse` | `PdfResponse` | `$message->attach()` | `$message->attach()` |
+| **Content-Disposition** | `inline`（浏览器内预览） | `inline` | 无（邮件附件下载） | 无 |
+| **MIME 类型** | `application/pdf` | `application/pdf` | `application/pdf` | `application/pdf` |
+| **公司上下文** | 外部入口需 `switchCompany()` | 外部入口需 `switchCompany()` | 已在正确上下文 | 已在正确上下文 |
+| **额外依赖** | `PaymentRepository`（仅内部入口） | 无 | 无 | 无 |
+
+---
+
+## 五、默认模板结构（发票 × 报价 对照）
+
+### 5.1 发票 PDF 模板
 
 **文件**：`src/InvoiceBundle/Resources/views/Pdf/invoice.html.twig`
 
 该模板是**自包含的完整 HTML 文档**，不继承任何基础模板：
 
 ```twig
-{# 第10-11行：设置变量 #}
 {% set currency = invoice.client.currency %}
 {% set hasOutstandingBalance = invoice.payments|length > 0 and not invoice.balance.zero %}
 
 <html>
 <head>
-    <meta charset="UTF-8" />
     <style type="text/css">
-        {# 第17行：CSS 内联注入（关键机制，详见第四章） #}
-        {{ file(asset('static/pdf.css')) }}
-
-        {# 第19-25行：mPDF @page 规则 #}
+        {{ file(asset('static/pdf.css')) }}          {# ← CSS 内联注入 #}
         @page {
-            margin-top: 20mm;
-            margin-bottom: 25mm;
-            margin-left: 15mm;
-            margin-right: 15mm;
+            margin-top: 20mm; margin-bottom: 25mm;
+            margin-left: 15mm; margin-right: 15mm;
             footer: footer;
         }
     </style>
 </head>
 <body>
-    {# 第33-35行：状态水印（mPDF 自定义标签） #}
     {% if setting('invoice/watermark') %}
         <watermarktext content="{{ invoice.status.value|upper }}" alpha="0.08"/>
     {% endif %}
+    <pagefooter name="footer" content-right="Page {PAGENO} of {nb}" ... />
 
-    {# 第40-46行：页脚定义 #}
-    <pagefooter name="footer" content-left="..." content-right="Page {PAGENO} of {nb}" />
-
-    {# 第51-176行：公司信息 + 发票元数据头部 #}
-    {# 第183-212行：客户信息（Bill To） #}
-    {# 第217-262行：明细行表格 #}
-    {# 第267-271行：自定义字段组件 #}
-    {# 第277-401行：总计汇总表 #}
-    {# 第406-438行：支付链接区块 #}
-    {# 第443-452行：条款 #}
+    {# 公司信息 + 发票元数据头部 #}
+    {# 客户信息（Bill To） #}
+    {# 明细行表格 #}
+    {# 自定义字段组件 #}
+    {# 总计汇总表（含余额、付款信息） #}
+    {# 支付链接区块 #}
+    {# 条款 #}
 </body>
 </html>
 ```
 
-### 3.2 报价 PDF 模板
+### 5.2 报价 PDF 模板
 
 **文件**：`src/QuoteBundle/Resources/views/Pdf/quote.html.twig`
 
-结构与发票模板完全平行，差异点：
+结构与发票模板完全平行，关键差异：
 
-| 差异 | 发票模板 | 报价模板 |
-|------|----------|----------|
-| 标题 | `invoice.pdf.title` | `quote.pdf.title` |
-| 标签 | "Invoice To" | "Prepared For" |
-| 水印设置键 | `setting('invoice/watermark')` | `setting('quote/watermark')` |
-| 主色调 | 绿色 `#2e963a` | 蓝色 `#3b82f6` |
-| 总计背景色 | `#f0fdf4` (绿) | `#eff6ff` (蓝) |
-| 余额行 | 有（支持部分付款） | 无 |
-| 支付区块 | 有 | 无 |
+| 差异点 | 发票模板 | 报价模板 |
+|--------|----------|----------|
+| **变量** | `invoice` | `quote` |
+| **标题 key** | `'invoice.pdf.title'` → "INVOICE" | `'quote.pdf.title'` → "QUOTE" |
+| **客户标签** | "Invoice To" | `'quote.pdf.prepared_for'` → "Prepared For" |
+| **水印设置 key** | `setting('invoice/watermark')` | `setting('quote/watermark')` |
+| **主色调** | 绿色 `#2e963a` | 蓝色 `#3b82f6` |
+| **总计背景色** | `#f0fdf4`（浅绿） | `#eff6ff`（浅蓝） |
+| **总计文字色** | `#166534`（深绿） | `#1d4ed8`（深蓝） |
+| **标签下划线色** | `#2e963a`（绿） | `#3b82f6`（蓝） |
+| **日期字段** | 开票日期 + 到期日 | 报价日期 + 有效期（`valid_until`） |
+| **有效期标识** | 无 | `isExpired` / `expires_today` / `valid_for_days` |
+| **余额行** | 有（支持部分付款） | 无 |
+| **付款记录** | 有（已付金额、未付余额） | 无 |
+| **支付 CTA 区块** | 有 | 无 |
+| **ID 字段** | `#{{ invoice.invoiceId }}` | `#{{ quote.quoteId }}` |
+| **ID 方法** | `invoice.getInvoiceId()` | `quote.getQuoteId()` |
+| **自定义字段 Target** | `CustomFieldTarget::INVOICE` | `CustomFieldTarget::QUOTE` |
 
-### 3.3 可选预设模板的继承结构（测试用）
+### 5.3 两者的共同结构
 
-**基础模板**：`src/InvoiceBundle/Resources/views/Templates/_pdf_base.html.twig`
+发票和报价模板共享相同的基础骨架：
 
-```twig
-{# _pdf_base.html.twig 提供的骨架 #}
-<html>
-<head>
-    <style type="text/css">
-        {{ file(asset('static/pdf.css')) }}
-        @page { ... footer: footer; }
-        {% block extra_styles %}{% endblock %}     {# ← 子模板可注入额外样式 #}
-    </style>
-</head>
-<body{% block body_attrs %}{% endblock %}>
-
-    {% if setting('invoice/watermark') %}
-        <watermarktext content="{{ invoice.status.value|upper }}" alpha="0.08"/>
-    {% endif %}
-
-    <pagefooter name="footer" ... />
-
-    {% block body %}{% endblock %}                  {# ← 子模板填充内容 #}
-</body>
-</html>
-```
-
-**子模板示例（modern）**：`src/InvoiceBundle/Resources/views/Templates/modern/pdf.html.twig`
-
-```twig
-{% extends '@SolidInvoiceInvoice/Templates/_pdf_base.html.twig' %}
-{% import '@SolidInvoiceInvoice/Templates/_macros.html.twig' as inv %}
-
-{% block extra_styles %}
-    body { font-family: helvetica, Arial, sans-serif; color: #1e293b; }
-{% endblock %}
-
-{% block body %}
-    {{ inv.from_block() }}
-    {{ inv.bill_to_block(invoice) }}
-    ...
-{% endblock %}
-```
-
-**默认模板 vs 可选模板的结构差异**：
-
-| 维度 | 默认模板 (`Pdf/invoice.html.twig`) | 可选模板 (`Templates/{slug}/pdf.html.twig`) |
-|------|--------------------------------------|---------------------------------------------|
-| 继承 | 无（自包含） | 继承 `_pdf_base.html.twig` |
-| 样式 | 内联写在模板内 | 通过 `extra_styles` 块注入 |
-| 内容组织 | 原生 HTML 表格 | 使用 `_macros.html.twig` 宏 |
-| 运行状态 | ✅ 生产使用 | ❌ 仅测试使用 |
+| 共同部分 | 说明 |
+|----------|------|
+| `file(asset('static/pdf.css'))` | CSS 内联注入（样式机制完全相同） |
+| `@page` 边距设置 | 20mm 上、25mm 下、15mm 左右，页脚名 `footer` |
+| `<watermarktext>` | 状态水印，alpha=0.08 |
+| `<pagefooter>` | 页脚含 "Powered by SolidInvoice" + 页码 `{PAGENO} of {nb}` |
+| 公司信息区 | Logo + 公司名 + 税标识 + 联系方式 + 地址 |
+| 客户信息区 | 客户名 + 税标识 + 地址 + 主要联系人邮箱 |
+| 明细表格 | 描述 / 单价 / 数量 / 税额 / 合计 五列（税额列为条件渲染） |
+| 自定义字段 | `<twig:CustomFieldsListPdf>` 组件渲染 |
+| 总计汇总 | 小计 + 税务明细 + 折扣 + 合计（行内等宽字体） |
+| 条款 | `terms` 字段（条件渲染） |
+| 字体 | `'Courier New', monospace` 用于金额列（行内样式） |
 
 ---
 
-## 四、样式如何进入 mPDF 输出流程
+## 六、样式如何进入 mPDF（发票报价共用）
 
-### 4.1 完整链路（可验证）
+### 6.1 完整链路（可验证）
+
+发票和报价模板使用完全相同的样式注入机制。
 
 ```
 assets/scss/pdf.scss
@@ -352,514 +490,270 @@ assets/scss/pdf.scss
        ▼
 public/static/pdf.css
        │
-       │  ② Twig asset() 函数生成 public 路径
+       │  ② Twig asset() 生成 public 路径
        │     asset('static/pdf.css') → '/static/pdf.css'
        │
-       │  ③ Twig file() 函数读取文件内容
+       │  ③ Twig file() 读取文件内容
        │     src/CoreBundle/Twig/Extension/FileExtension.php 第34行:
        │     file_get_contents($this->projectDir . '/public/' . ltrim($file, '/'))
-       │     → 返回 CSS 全文字符串
        │
        ▼
 {{ file(asset('static/pdf.css')) }}
        │
-       │  ④ 模板输出时嵌入 <style> 标签
+       │  ④ 嵌入 <style> 标签（两个模板的第16/17行）
        │
        ▼
 <style type="text/css">
-    /* pdf.css 全部内容 */
-    body { font-family: 'Helvetica Neue', Helvetica, ... }
-    ...
+    /* pdf.css 全部内容原样嵌入 */
 </style>
        │
-       │  ⑤ 完整 HTML 传入 Generator::generate($html)
+       │  ⑤ 传入 Generator::generate($html)
        │
        ▼
 $mpdf->WriteHTML($html)
        │
        │  ⑥ mPDF 解析 <style> 中的 CSS 规则
-       │     mPDF 内部 CSS 解析器处理选择器和属性
        │
        ▼
 PDF 输出
 ```
 
-### 4.2 `file()` 函数的关键实现（可验证）
+### 6.2 样式叠加的三个层次
 
-验证命令：
-```bash
-grep -n "file_get_contents\|is_safe" src/CoreBundle/Twig/Extension/FileExtension.php
-```
+| 层次 | 发票模板 | 报价模板 | 是否相同 |
+|------|----------|----------|----------|
+| **1. `pdf.css` 全局样式** | `{{ file(asset('static/pdf.css')) }}`（第17行） | 同（第16行） | ✅ 完全相同 |
+| **2. `@page` 规则** | `margin-top: 20mm; margin-bottom: 25mm; margin-left: 15mm; margin-right: 15mm; footer: footer;` | 同 | ✅ 完全相同 |
+| **3. 行内 `style=""`** | 大量颜色、字体、间距声明 | 类似但颜色值不同（绿 vs 蓝） | ⚠️ 结构相同，颜色不同 |
 
-**代码**（`src/CoreBundle/Twig/Extension/FileExtension.php` 第34行）：
+**行内样式的颜色差异**：
 
-```php
-new TwigFunction(
-    'file',
-    fn ($file) => file_get_contents($this->projectDir . '/public/' . ltrim((string) $file, '\\')),
-    ['is_safe' => ['css', 'html']]
-)
-```
+| 用途 | 发票（绿） | 报价（蓝） |
+|------|-----------|-----------|
+| 主色 | `#2e963a` | `#3b82f6` |
+| 总计背景 | `#f0fdf4` | `#eff6ff` |
+| 总计文字 | `#166534` | `#1d4ed8` |
+| 标签下划线 | `#2e963a` | `#3b82f6` |
 
-**关键行为**：
-1. 接收 `asset()` 返回的相对路径（如 `/static/pdf.css`）
-2. 拼接项目根目录 + `/public/` 前缀得到绝对路径
-3. `file_get_contents()` 读取完整文件内容
-4. `is_safe` 标记告诉 Twig 不对输出转义（原始 CSS 内容直接输出）
-5. **结果：整个 CSS 文件内容被原样嵌入到 `<style>` 标签中**
-
-**这意味着 CSS 不是通过 `<link rel="stylesheet">` 外部引用，而是在模板渲染阶段就被内联到 HTML 中。** 这对 mPDF 很重要，因为 mPDF 需要在 `WriteHTML()` 时就能访问所有样式规则。
-
-### 4.3 样式叠加的三个层次
-
-在最终传入 `Generator::generate()` 的 HTML 中，样式通过三个层次叠加：
-
-**层次 1：`<style>` 中的 `pdf.css` 全局样式**
-
-```css
-body { font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; ... }
-.invoice-header-table { width: 100%; ... }
-.totals-table .value-cell { font-family: 'Courier New', monospace; ... }
-```
-
-**层次 2：`<style>` 中的 `@page` 规则和可选的 `extra_styles` 块**
-
-```css
-@page { margin-top: 20mm; margin-bottom: 25mm; ... footer: footer; }
-/* 可选模板可追加 */
-body { font-family: helvetica, Arial, sans-serif; color: #1e293b; }
-```
-
-**层次 3：HTML 元素上的 `style=""` 行内样式**
-
-```twig
-<td style="padding: 12px 16px; font-size: 9pt; color: #1e293b;
-           font-family: 'Courier New', monospace; font-weight: 600;">
-    {{ line.total|formatCurrency(currency) }}
-</td>
-```
-
-**mPDF 的 CSS 优先级与浏览器一致**：行内样式 > `<style>` 中的选择器样式。但由于 mPDF CSS 支持有限，开发策略是**对关键布局和颜色使用行内样式**以确保渲染正确，对通用样式使用 `pdf.css` 类选择器。
-
-### 4.4 为什么不使用 `<link>` 外部引用
-
-mPDF 的 `WriteHTML()` 方法在处理 HTML 时：
-- ✅ 能解析 `<style>` 标签中的 CSS
-- ⚠️ 对 `<link>` 外部 CSS 的支持不完善且依赖文件系统路径
-- ✅ 能解析 `style=""` 行内样式
-
-因此 SolidInvoice 选择了**编译时外挂 + 运行时内联**的策略。
-
-### 4.5 代码证据汇总
+### 6.3 代码证据汇总
 
 | 环节 | 验证命令 | 代码位置 | 行号 |
 |------|---------|----------|------|
 | Webpack 编译入口 | `grep -n "addStyleEntry.*pdf" webpack.config.js` | `webpack.config.js` | 9 |
-| 模板内联 CSS | `grep -rn "file(asset" src/InvoiceBundle/Resources/views/Pdf/` | `src/InvoiceBundle/Resources/views/Pdf/invoice.html.twig` | 17 |
-| file() 函数实现 | `grep -n "file_get_contents" src/CoreBundle/Twig/Extension/FileExtension.php` | `src/CoreBundle/Twig/Extension/FileExtension.php` | 34 |
+| 发票模板内联 CSS | `grep -n "file(asset.*pdf" src/InvoiceBundle/Resources/views/Pdf/invoice.html.twig` | `src/InvoiceBundle/Resources/views/Pdf/invoice.html.twig` | 17 |
+| 报价模板内联 CSS | `grep -n "file(asset.*pdf" src/QuoteBundle/Resources/views/Pdf/quote.html.twig` | `src/QuoteBundle/Resources/views/Pdf/quote.html.twig` | 16 |
+| file() 函数实现 | `grep -n "file_get_contents\|is_safe" src/CoreBundle/Twig/Extension/FileExtension.php` | `src/CoreBundle/Twig/Extension/FileExtension.php` | 34 |
 
 ---
 
-## 五、字体如何进入 mPDF 输出流程
+## 七、字体如何进入 mPDF（发票报价共用）
 
-### 5.1 字体指定的三个位置（可验证）
+### 7.1 字体指定的三个位置
 
-字体通过三个独立但协同的路径进入最终 PDF。
+发票和报价使用完全相同的字体机制。
 
-**路径 1：mPDF 构造函数的 `default_font` 参数**
-
-验证命令：
-```bash
-grep -n "default_font" src/CoreBundle/Pdf/Generator.php
-```
-
-**代码**（`src/CoreBundle/Pdf/Generator.php` 第45行）：
-
+**路径 1：mPDF `default_font` 参数**（`src/CoreBundle/Pdf/Generator.php` 第45行）：
 ```php
 $mpdf = new Mpdf([
-    'default_font' => 'helvetica',
-    // ...
+    'default_font' => 'helvetica',  // 全局回退字体
 ]);
 ```
 
-这是 mPDF 的全局回退字体。当 CSS 和行内样式都没有指定字体时使用此值。mPDF 内置了 `helvetica`、`times`、`courier` 等核心字体的字形数据，无需外部字体文件。
-
-**路径 2：`pdf.scss` 中的 `font-family` 声明**
-
-验证命令：
-```bash
-grep -n "font-family" assets/scss/pdf.scss | head -5
-```
-
-**代码**（`assets/scss/pdf.scss` 第20行）：
-
+**路径 2：`pdf.scss` CSS `font-family`**（`assets/scss/pdf.scss` 第20行）：
 ```scss
 body {
     font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
 }
 ```
 
-mPDF 的 CSS 解析器会解析 `font-family` 列表，按优先级查找可用字体：
-1. `'Helvetica Neue'` — mPDF 内置无此字体，跳过
-2. `Helvetica` — mPDF 内置，匹配使用
-3. `Arial` — 备选
-4. `sans-serif` — 通用回退
-
-**路径 3：行内 `style` 中的 `font-family` 覆盖**
-
-验证命令：
-```bash
-grep -n "font-family" assets/scss/pdf.scss | tail -5
+**路径 3：行内样式覆盖**（两个模板的金额列）：
+```twig
+<td style="font-family: 'Courier New', monospace;">
+    {{ line.total|formatCurrency(currency) }}
+</td>
 ```
 
-**代码**（`assets/scss/pdf.scss` 第312、351行）：
-
+或通过 CSS 类（`pdf.scss` 第312行）：
 ```scss
 .totals-table .value-cell {
     font-family: 'Courier New', monospace;
 }
 ```
 
-**或模板中行内样式**：
+### 7.2 字体路径对照
 
-```twig
-{# 金额列使用等宽字体 #}
-<td style="font-family: 'Courier New', monospace;">
-    {{ line.total|formatCurrency(currency) }}
-</td>
-```
+| 位置 | 发票 | 报价 | 是否相同 |
+|------|------|------|----------|
+| default_font | `helvetica` | `helvetica` | ✅ |
+| body font-family | `'Helvetica Neue', Helvetica, Arial, sans-serif` | 同 | ✅ |
+| 金额列 font-family | `'Courier New', monospace` | 同 | ✅ |
 
-这在特定元素上覆盖 CSS 类样式，确保数字对齐。
-
-### 5.2 字体从 CSS 到 PDF 像素的完整路径
-
-```
-1. Twig 模板渲染
-   ├─ <style> 中的 font-family: 'Helvetica Neue', Helvetica, ...
-   └─ style="" 中的 font-family: 'Courier New', monospace
-
-2. 生成完整 HTML 字符串传入 Generator::generate()
-
-3. mPDF 构造时设置 default_font = 'helvetica'
-   → src/CoreBundle/Pdf/Generator.php 第45行
-
-4. $mpdf->WriteHTML($html)  （第53行）
-   │
-   ├─ mPDF 解析 <style> 中的 CSS 规则
-   │  → 建立 CSSOM 样式映射
-   │
-   ├─ mPDF 逐元素匹配样式
-   │  → 元素无 font-family → 使用 default_font: helvetica
-   │  → 元素有 font-family: Helvetica → 匹配内置 Helvetica 字体
-   │  → 元素有 font-family: 'Courier New' → 匹配内置 Courier 字体
-   │
-   ├─ mPDF 使用对应字体的字形数据渲染文本
-   │  → 将字符映射为字体中的 glyph ID
-   │  → 计算 glyph 宽度进行排版
-   │  → 将 glyph 路径嵌入 PDF 流
-   │
-   └─ $mpdf->Output() 输出包含嵌入字体的 PDF
-```
-
-### 5.3 mPDF 内置字体子集
-
-mPDF 7.x+ 内置以下字体的子集（无需外部 TTF/OTF 文件）：
-
-| 字体名 | 类型 | mPDF 中的 Key | 使用场景 |
-|--------|------|---------------|----------|
-| Helvetica | 无衬线 | `helvetica` | 默认正文字体 |
-| Times | 衬线 | `times` | 未使用 |
-| Courier | 等宽 | `courier` | 金额数字列 |
-| DejaVu Sans | 无衬线 | `dejavusans` | Unicode 扩展字符 |
-
-如需使用非内置字体（如中文字体），需要：
-1. 将 TTF/OTF 字体文件放入 mPDF 字体目录
-2. 在 `fontdata` 配置中注册字体
-3. 在 CSS 或 `default_font` 中引用注册的字体名
-
-### 5.4 当前字体配置的局限
-
-| 局限 | 说明 |
-|------|------|
-| CSS `font-family` 回退链不完整 | `pdf.scss` 声明 `'Helvetica Neue'` 但 mPDF 无此字体，实际回退到 `Helvetica` |
-| 不支持 CJK 字符 | 默认 `helvetica` 字体不包含中文/日文/韩文字形 |
-| `default_font` 硬编码 | `Generator.php` 中 `default_font` 为硬编码值，无法通过设置系统修改 |
-| 无字体配置接口 | 当前没有管理界面或设置项让用户选择 PDF 字体 |
-
-### 5.5 代码证据汇总
+### 7.3 代码证据汇总
 
 | 环节 | 验证命令 | 代码位置 | 行号 |
 |------|---------|----------|------|
 | default_font 配置 | `grep -n "default_font" src/CoreBundle/Pdf/Generator.php` | `src/CoreBundle/Pdf/Generator.php` | 45 |
-| CSS body 字体 | `grep -n "font-family" assets/scss/pdf.scss | head -1` | `assets/scss/pdf.scss` | 20 |
-| 金额等宽字体 | `grep -n "font-family.*Courier" assets/scss/pdf.scss | head -1` | `assets/scss/pdf.scss` | 312 |
+| CSS body 字体 | `grep -n "font-family" assets/scss/pdf.scss \| head -1` | `assets/scss/pdf.scss` | 20 |
+| 金额等宽字体 | `grep -n "font-family.*Courier" assets/scss/pdf.scss \| head -1` | `assets/scss/pdf.scss` | 312 |
 | WriteHTML 调用 | `grep -n "WriteHTML" src/CoreBundle/Pdf/Generator.php` | `src/CoreBundle/Pdf/Generator.php` | 53 |
 
 ---
 
-## 六、Twig 函数/过滤器数据注入清单（可验证）
-
-PDF 模板中使用的所有动态数据函数：
-
-| Twig 函数/过滤器 | 来源 Extension | 作用 | 代码位置 |
-|------------------|----------------|------|----------|
-| `setting(key)` | `SettingsExtension` | 读取系统设置值 | `src/SettingsBundle/Twig/Extension/SettingsExtension.php` |
-| `address(data)` | `SettingsExtension` | 格式化地址数组 | 同上 |
-| `tax_identifiers(owner)` | `TaxBreakdownExtension` | 获取税标识列表 | `src/TaxBundle/Twig/Extension/TaxBreakdownExtension.php` |
-| `tax_breakdown(doc)` | `TaxBreakdownExtension` | 计算税务明细 | 同上 |
-| `payable_amount(doc)` | `TaxBreakdownExtension` | 计算应付金额 | 同上 |
-| `payments_configured()` | `PaymentExtension` | 检查支付方式数量 | `src/PaymentBundle/Twig/PaymentExtension.php` |
-| `discount(entity)` | `BillingExtension` | 计算折扣金额 | `src/CoreBundle/Twig/Extension/BillingExtension.php` |
-| `app_logo(width)` | `GlobalExtension` | 渲染公司 Logo（base64） | `src/CoreBundle/Twig/Extension/GlobalExtension.php` |
-| `company_name()` | `GlobalExtension` | 获取公司名称 | 同上 |
-| `can_print_pdf()` | `GlobalExtension` | 检查 PDF 生成能力 | 同上 |
-| `file(path)` | `FileExtension` | 读取文件内容 | `src/CoreBundle/Twig/Extension/FileExtension.php` |
-| `|formatCurrency(currency)` | MoneyBundle | 格式化金额 | - |
-| `<twig:CustomFieldsListPdf>` | `CustomFieldsListPdf` | 渲染自定义字段 | `src/CoreBundle/Twig/Components/CustomFieldsListPdf.php` |
-
-**验证命令**：
-```bash
-grep -rn "TwigFunction.*'setting'\|TwigFunction.*'file'" src/ --include="*.php"
-```
-
----
-
-## 七、mPDF 渲染核心（可验证）
+## 八、mPDF 渲染核心（发票报价共用）
 
 **文件**：`src/CoreBundle/Pdf/Generator.php`
 
-### 7.1 前置检查
-
-验证命令：
-```bash
-grep -n "canPrintPdf" src/CoreBundle/Pdf/Generator.php
-```
+两个单据共用同一个 Generator 类，配置完全相同：
 
 ```php
 public function canPrintPdf(): bool
 {
     return \extension_loaded('mbstring') && \extension_loaded('gd');
 }
-```
 
-- `mbstring`：mPDF 内部字符串处理所需
-- `gd`：图片处理（Logo 等）所需
-
-### 7.2 mPDF 配置
-
-验证命令：
-```bash
-grep -n "new Mpdf\|margin_\|default_font" src/CoreBundle/Pdf/Generator.php
-```
-
-```php
 $mpdf = new Mpdf([
-    'tempDir' => $this->cacheDir . '/pdf',       // 临时目录（ttfontdata 等）
-    'margin_left' => 15,                          // mm
+    'tempDir' => $this->cacheDir . '/pdf',
+    'margin_left' => 15,
     'margin_right' => 15,
     'margin_top' => 20,
     'margin_bottom' => 25,
     'margin_header' => 10,
     'margin_footer' => 10,
-    'default_font' => 'helvetica',                // 全局默认字体
+    'default_font' => 'helvetica',
 ]);
+
+$mpdf->allow_charset_conversion = false;
+$mpdf->showWatermarkText = true;
+$mpdf->SetDisplayMode('fullpage');
+$mpdf->SetProtection(['print']);
+$mpdf->setLogger($this->logger);
+$mpdf->WriteHTML($html);
+return $mpdf->Output(null, Destination::STRING_RETURN);
 ```
-
-### 7.3 渲染步骤
-
-验证命令：
-```bash
-grep -n "WriteHTML\|allow_charset_conversion\|showWatermarkText\|SetProtection\|SetDisplayMode" src/CoreBundle/Pdf/Generator.php
-```
-
-```php
-$mpdf->allow_charset_conversion = false;      // HTML 已为 UTF-8，不需转换
-$mpdf->showWatermarkText = true;              // 启用水印渲染
-$mpdf->SetDisplayMode('fullpage');            // PDF 阅读器默认全页显示
-$mpdf->SetProtection(['print']);              // 仅允许打印权限
-$mpdf->setLogger($this->logger);              // 日志记录
-
-$mpdf->WriteHTML($html);                      // 核心：解析 HTML+CSS，排版，生成 PDF
-
-return $mpdf->Output(null, Destination::STRING_RETURN);  // 输出为二进制字符串
-```
-
-### 7.4 mPDF 自定义标签
-
-模板中使用的 mPDF 专有 HTML 标签，由 `WriteHTML()` 特殊处理：
-
-| 标签 | 处理方式 | 模板用法 |
-|------|----------|----------|
-| `<watermarktext>` | 在每页绘制半透明文字 | `<watermarktext content="PENDING" alpha="0.08"/>` |
-| `<pagefooter>` | 注册命名页脚模板 | `<pagefooter name="footer" content-right="Page {PAGENO} of {nb}"/>` |
-| `{PAGENO}` | 渲染时替换为当前页码 | 页脚 content 属性中 |
-| `{nb}` | 渲染时替换为总页数 | 页脚 content 属性中 |
-
-### 7.5 CSS 解析的局限
-
-mPDF 的 CSS 解析器与浏览器引擎差异：
-
-| 特性 | 浏览器 | mPDF | SolidInvoice 的应对 |
-|------|--------|------|---------------------|
-| CSS 变量 `var(--xxx)` | ✅ | ❌ | pdf.scss 中硬编码颜色值 |
-| Flexbox/Grid | ✅ | ❌ | 使用 `<table>` 布局 |
-| 嵌套选择器 | ✅ | ⚠️ 有限 | 使用简单类选择器 + 行内样式 |
-| `border-radius` | ✅ | ⚠️ 有限 | 部分使用，简单场景 |
-| `background-color` 继承 | ✅ | ⚠️ 不完整 | 在每个 `<td>` 上重复声明 |
-| `@media` 查询 | ✅ | ❌ | 不使用 |
 
 ---
 
-## 八、响应封装（可验证）
-
-**文件**：`src/CoreBundle/Response/PdfResponse.php`
-
-验证命令：
-```bash
-grep -n "Content-Type\|Content-Disposition\|DISPOSITION_INLINE" src/CoreBundle/Response/PdfResponse.php
-```
-
-```php
-public function __construct(
-    string $content,                                    // PDF 二进制
-    string $fileName,                                   // 如 invoice_INV-001.pdf
-    string $contentDisposition = ResponseHeaderBag::DISPOSITION_INLINE,  // 默认内联预览
-    int $status = Response::HTTP_OK,
-    array $headers = []
-)
-```
-
-浏览器入口默认 `DISPOSITION_INLINE`（浏览器内预览），邮件附件入口不经过 `PdfResponse`，而是直接将二进制字符串通过 `$message->attach()` 附加。
-
----
-
-## 九、完整调用链对比图
+## 九、完整调用链总览（发票 + 报价双链路）
 
 ```
-                    ┌─────────────────────────────────────┐
-                    │         两种 PDF 触发入口             │
-                    └──────────┬──────────────┬────────────┘
-                               │              │
-              ┌────────────────▼──┐    ┌──────▼───────────────┐
-              │   浏览器打印入口    │    │    邮件附件入口        │
-              │                   │    │                       │
-              │ URL 后缀 .pdf     │    │ MessageEvent 事件     │
-              │ getRequestFormat  │    │ instanceof 检查       │
-              │ === 'pdf'         │    │ InvoiceEmail/QuoteEmail│
-              │                   │    │                       │
-              │ src/InvoiceBundle/Action/View.php  │ InvoicePdfListener.php │
-              │ src/CoreBundle/Action/ViewBilling.php │ QuotePdfListener.php │
-              └────────┬──────────┘    └──────────┬────────────┘
-                       │                          │
-                       │   ┌──────────────────────┘
-                       │   │
-              ┌────────▼───▼──────────────────────────────────┐
-              │  Twig 渲染 @SolidInvoiceInvoice/Pdf/          │
-              │           invoice.html.twig                    │
-              │           (或 Quote/Pdf/quote.html.twig)       │
-              │                                                │
-              │  ┌─ file(asset('static/pdf.css')) ──────────┐  │
-              │  │  FileExtension::file_get_contents()      │  │
-              │  │  → pdf.css 全文内联到 <style> 标签       │  │
-              │  └──────────────────────────────────────────┘  │
-              │                                                │
-              │  ┌─ Twig 函数注入动态数据 ───────────────────┐  │
-              │  │  setting() / tax_identifiers() /          │  │
-              │  │  tax_breakdown() / discount() /           │  │
-              │  │  payments_configured() / app_logo() /     │  │
-              │  │  company_name() / formatCurrency() /      │  │
-              │  │  <twig:CustomFieldsListPdf>               │  │
-              │  └──────────────────────────────────────────┘  │
-              │                                                │
-              │  ┌─ @page + 行内样式 ────────────────────────┐  │
-              │  │  @page { margin: 20mm 15mm 25mm 15mm; }  │  │
-              │  │  style="font-family: 'Courier New'; ..."  │  │
-              │  └──────────────────────────────────────────┘  │
-              └──────────────────┬─────────────────────────────┘
-                                 │
-                                 ▼
-              ┌──────────────────────────────────────────────┐
-              │  src/CoreBundle/Pdf/Generator.php::generate() │
-              │                                              │
-              │  new Mpdf(['default_font' => 'helvetica'])   │
-              │  $mpdf->showWatermarkText = true             │
-              │  $mpdf->SetProtection(['print'])             │
-              │  $mpdf->WriteHTML($html)                     │
-              │    → 解析 <style> 中的 CSS                    │
-              │    → 匹配 font-family 到内置字体              │
-              │    → 处理 <watermarktext> <pagefooter>       │
-              │    → 排版、字形嵌入、生成 PDF 内部结构         │
-              │  $mpdf->Output(null, STRING_RETURN)          │
-              └──────────────┬───────────────────────────────┘
-                             │
-                    ┌────────▼────────┐
-                    │  PDF 二进制字符串  │
-                    └───┬─────────┬───┘
-                        │         │
-           ┌────────────▼──┐  ┌──▼──────────────────┐
-           │ 浏览器入口      │  │ 邮件入口             │
-           │                │  │                     │
-           │ new PdfResponse│  │ $message->attach()  │
-           │ Content-Type:  │  │ MIME: application/  │
-           │ application/pdf│  │ pdf                 │
-           │ Disposition:   │  │                     │
-           │ inline         │  │ 作为邮件附件发送      │
-           └────────────────┘  └─────────────────────┘
+                        ┌─────────────────────────────────────────┐
+                        │            两种 PDF 触发入口              │
+                        └────────────────┬──────────────┬─────────┘
+                                         │              │
+                     ┌───────────────────▼──┐     ┌─────▼───────────────────┐
+                     │     浏览器打印入口     │     │      邮件附件入口        │
+                     └──────┬──────────┬────┘     └──┬──────────────────┬────┘
+                            │          │              │                  │
+                ┌───────────▼──┐  ┌────▼─────────┐  ┌▼─────────────┐  ┌▼──────────────┐
+                │ 发票 .pdf    │  │ 报价 .pdf    │  │ InvoiceEmail │  │ QuoteEmail    │
+                │ URL 访问     │  │ URL 访问     │  │ 邮件发送      │  │ 邮件发送       │
+                └──────┬───────┘  └────┬─────────┘  └──┬───────────┘  └──┬────────────┘
+                       │                │                │                  │
+                       ▼                ▼                ▼                  ▼
+          ┌──────────────────────┐  ┌──────────────────────┐  ┌──────────────────────┐  ┌──────────────────────┐
+          │ InvoiceBundle/       │  │ QuoteBundle/         │  │ InvoicePdfListener   │  │ QuotePdfListener     │
+          │ Action/View.php      │  │ Action/View.php      │  │ ::__invoke()         │  │ ::__invoke()         │
+          │ 或                   │  │ 或                   │  │                      │  │                      │
+          │ CoreBundle/Action/   │  │ CoreBundle/Action/   │  │ instanceof           │  │ instanceof           │
+          │ ViewBilling.php      │  │ ViewBilling.php      │  │ InvoiceEmail         │  │ QuoteEmail           │
+          └──────────┬───────────┘  └──────────┬───────────┘  └──────────┬───────────┘  └──────────┬───────────┘
+                     │                         │                         │                         │
+                     ▼                         ▼                         ▼                         ▼
+          ┌──────────────────────┐  ┌──────────────────────┐                                 ┌──────────────────────┐
+          │ @SolidInvoiceInvoice │  │ @SolidInvoiceQuote   │                                 │ 共用 Twig 渲染         │
+          │ /Pdf/invoice.html.twig│  │ /Pdf/quote.html.twig │                                 │ (模板/变量名不同)      │
+          │ ['invoice' => ...]   │  │ ['quote' => ...]     │                                 └──────────┬───────────┘
+          └──────────┬───────────┘  └──────────┬───────────┘                                            │
+                     │                         │                                                        │
+                     └──────────────┬──────────┘                                                        │
+                                    │                                                                   │
+                                    ▼                                                                   ▼
+                    ┌───────────────────────────────────────────────────────────────────────────────────┐
+                    │                    共用 PDF 生成管线（样式 + 字体 + mPDF）                          │
+                    │                                                                                   │
+                    │  1. {{ file(asset('static/pdf.css')) }} → CSS 全文内联到 <style>                  │
+                    │  2. @page 规则 + 行内 style="" 叠加                                                │
+                    │  3. font-family 解析: Helvetica(正文) / Courier(金额)                              │
+                    │  4. mPDF new Mpdf(['default_font' => 'helvetica'])                                │
+                    │  5. $mpdf->WriteHTML($html) → CSS解析 + 字体渲染 + 排版 + PDF生成                  │
+                    │  6. $mpdf->Output() → PDF 二进制字符串                                             │
+                    └──────────────────────────────┬────────────────────────────────────────────────────┘
+                                                   │
+                                    ┌──────────────▼───────────────┐
+                                    │        PDF 二进制字符串         │
+                                    └──────┬──────────────────┬─────┘
+                                           │                  │
+                               ┌───────────▼────────┐  ┌──────▼────────────────────┐
+                               │ 浏览器入口          │  │ 邮件入口                   │
+                               │                    │  │                            │
+                               │ new PdfResponse()  │  │ $message->attach()         │
+                               │ Content-Type:      │  │ 文件名: invoice_xxx.pdf   │
+                               │ application/pdf    │  │          quote_xxx.pdf     │
+                               │ Disposition: inline│  │ MIME: application/pdf     │
+                               └────────────────────┘  └───────────────────────────┘
 ```
 
 ---
 
 ## 十、关键文件索引（相对路径）
 
+### 10.1 发票链路
+
 | 功能 | 文件路径 |
 |------|----------|
+| 登录用户 View | `src/InvoiceBundle/Action/View.php` |
+| 路由配置 | `src/InvoiceBundle/Resources/config/routing.php` |
+| 邮件 PDF 监听器 | `src/InvoiceBundle/Listener/Mailer/InvoicePdfListener.php` |
+| 默认 PDF 模板 | `src/InvoiceBundle/Resources/views/Pdf/invoice.html.twig` |
+
+### 10.2 报价链路
+
+| 功能 | 文件路径 |
+|------|----------|
+| 登录用户 View | `src/QuoteBundle/Action/View.php` |
+| 路由配置 | `src/QuoteBundle/Resources/config/routing.php` |
+| 邮件 PDF 监听器 | `src/QuoteBundle/Listener/Mailer/QuotePdfListener.php` |
+| 默认 PDF 模板 | `src/QuoteBundle/Resources/views/Pdf/quote.html.twig` |
+
+### 10.3 共用基础（发票 + 报价）
+
+| 功能 | 文件路径 |
+|------|----------|
+| 外部链接查看 Action | `src/CoreBundle/Action/ViewBilling.php` |
+| 外部路由配置 | `src/CoreBundle/Resources/config/routing.php` |
 | PDF 生成器 | `src/CoreBundle/Pdf/Generator.php` |
 | PDF 响应类 | `src/CoreBundle/Response/PdfResponse.php` |
 | 文件内联 Twig 函数 | `src/CoreBundle/Twig/Extension/FileExtension.php` |
-| 发票 PDF 模板 | `src/InvoiceBundle/Resources/views/Pdf/invoice.html.twig` |
-| 报价 PDF 模板 | `src/QuoteBundle/Resources/views/Pdf/quote.html.twig` |
 | PDF 样式源 | `assets/scss/pdf.scss` |
 | Webpack 配置 | `webpack.config.js` |
-| 发票查看 Action | `src/InvoiceBundle/Action/View.php` |
-| 外部查看 Action | `src/CoreBundle/Action/ViewBilling.php` |
-| 发票路由配置 | `src/InvoiceBundle/Resources/config/routing.php` |
-| 外部路由配置 | `src/CoreBundle/Resources/config/routing.php` |
-| 发票邮件 PDF 监听器 | `src/InvoiceBundle/Listener/Mailer/InvoicePdfListener.php` |
-| 报价邮件 PDF 监听器 | `src/QuoteBundle/Listener/Mailer/QuotePdfListener.php` |
-| 可选模板目录 | `src/InvoiceBundle/Resources/views/Templates/` |
-| 可选模板基础类 | `src/InvoiceBundle/Resources/views/Templates/_pdf_base.html.twig` |
-| 设置 Twig 函数 | `src/SettingsBundle/Twig/Extension/SettingsExtension.php` |
-| 税务 Twig 函数 | `src/TaxBundle/Twig/Extension/TaxBreakdownExtension.php` |
-| 支付 Twig 函数 | `src/PaymentBundle/Twig/PaymentExtension.php` |
-| 全局 Twig 函数 | `src/CoreBundle/Twig/Extension/GlobalExtension.php` |
-| 自定义字段 PDF 组件 | `src/CoreBundle/Twig/Components/CustomFieldsListPdf.php` |
-| 自定义字段 PDF 模板 | `src/CoreBundle/Resources/views/Components/_custom-fields-pdf.html.twig` |
-| 模板渲染测试 | `src/InvoiceBundle/Tests/Functional/Templates/TemplatesRenderingTest.php` |
-| 品牌定制测试 | `src/SaasBundle/Tests/Functional/PdfBaseCustomBrandingGateTest.php` |
+| 可选模板目录（仅发票有，测试用） | `src/InvoiceBundle/Resources/views/Templates/` |
 
 ---
 
 ## 十一、验证命令汇总
 
-本章节的所有结论均可通过以下命令在本地仓库验证：
-
-### 11.1 模板选择验证
+### 11.1 模板引用验证
 
 ```bash
-# 生产代码中默认模板的引用（应得到 6 个结果，不含测试文件）
+# 生产代码中默认模板的引用（发票+报价合计6个结果，不含测试文件）
 grep -rn "@SolidInvoiceInvoice/Pdf\|@SolidInvoiceQuote/Pdf" src/ --include="*.php" | grep -v "Tests/"
 
-# 可选模板的引用（应仅在测试文件中）
+# 可选模板的引用（应仅在测试文件中，且只有发票有）
 grep -rn "@SolidInvoiceInvoice/Templates" src/ --include="*.php"
+grep -rn "@SolidInvoiceQuote/Templates" src/ --include="*.php"
 ```
 
-### 11.2 入口差异验证
+### 11.2 路由与入口验证
 
 ```bash
-# 路由配置
-grep -n "_invoices_view\|_view_invoice_external\|_format" \
-  src/InvoiceBundle/Resources/config/routing.php \
-  src/CoreBundle/Resources/config/routing.php
+# 发票路由
+grep -n "_invoices_view\|_format" src/InvoiceBundle/Resources/config/routing.php
+
+# 报价路由
+grep -n "_quotes_view\|_format" src/QuoteBundle/Resources/config/routing.php
+
+# 外部路由
+grep -n "_view_invoice_external\|_view_quote_external" src/CoreBundle/Resources/config/routing.php
 
 # 邮件监听器事件订阅
 grep -n "MessageEvent\|getSubscribedEvents" \
@@ -867,30 +761,20 @@ grep -n "MessageEvent\|getSubscribedEvents" \
   src/QuoteBundle/Listener/Mailer/QuotePdfListener.php
 ```
 
-### 11.3 样式流程验证
+### 11.3 样式与字体验证
 
 ```bash
-# Webpack 配置
-grep -n "addStyleEntry.*pdf" webpack.config.js
-
-# 模板内联 CSS
-grep -rn "file(asset.*pdf" src/ --include="*.twig"
+# 两个模板中 CSS 内联注入
+grep -n "file(asset.*pdf" \
+  src/InvoiceBundle/Resources/views/Pdf/invoice.html.twig \
+  src/QuoteBundle/Resources/views/Pdf/quote.html.twig
 
 # file() 函数实现
-grep -n "file_get_contents\|is_safe" src/CoreBundle/Twig/Extension/FileExtension.php
-```
+grep -n "file_get_contents" src/CoreBundle/Twig/Extension/FileExtension.php
 
-### 11.4 字体流程验证
-
-```bash
-# mPDF 默认字体
+# 字体配置
 grep -n "default_font\|WriteHTML" src/CoreBundle/Pdf/Generator.php
-
-# CSS 字体声明
 grep -n "font-family" assets/scss/pdf.scss | head -5
-
-# 行内字体覆盖
-grep -n "font-family.*Courier" assets/scss/pdf.scss
 ```
 
 ---
@@ -899,10 +783,18 @@ grep -n "font-family.*Courier" assets/scss/pdf.scss
 
 经过代码证据逐一验证，以下结论准确无误：
 
-1. **模板选择**：6 个生产代码入口全部硬编码引用默认模板，不存在动态选择机制。8 个可选预设模板仅在测试中使用，尚未接入运行路径。
+### 模板选择
+- **发票 3 个入口**（登录用户 View、外部 ViewBilling、邮件 InvoicePdfListener）统一硬编码引用 `@SolidInvoiceInvoice/Pdf/invoice.html.twig`
+- **报价 3 个入口**（登录用户 View、外部 ViewBilling、邮件 QuotePdfListener）统一硬编码引用 `@SolidInvoiceQuote/Pdf/quote.html.twig`
+- 不存在运行时动态选择模板的机制
+- 8 个可选预设模板（classic、modern 等）仅在测试文件中引用，尚未接入运行路径（且仅发票有，报价无对应 Templates 目录）
 
-2. **入口差异**：浏览器入口通过 URL 后缀 `.pdf` 触发，走 `View` / `ViewBilling` Action，返回 `PdfResponse`（内联预览）；邮件入口通过 `MessageEvent` 自动触发，走 `InvoicePdfListener`，作为邮件附件发送。两者使用完全相同的 PDF 模板。
+### 两类入口 × 两种单据
+- **浏览器打印**：通过 URL 后缀 `.pdf` 触发，走各自的 `Action/View.php` 或共用的 `ViewBilling.php`，返回 `PdfResponse`（`inline` 内联预览）
+- **邮件附件**：通过 `MessageEvent` 自动触发，走各自的 `PdfListener`，通过 `$message->attach()` 附加为邮件附件
+- 发票和报价的入口逻辑结构完全对称，差异仅在模板路径、实体类型、ID 方法、颜色
 
-3. **样式进入 mPDF**：通过 `file()` 函数（`file_get_contents`）将编译好的 `public/static/pdf.css` 全文内联到 `<style>` 标签，而非外部引用。三个层次叠加：`pdf.css` 全局 → `@page` 规则 → 行内 `style=""`。
-
-4. **字体进入 mPDF**：三个路径协同：① `Generator.php` 构造时设置 `default_font => 'helvetica'` 作为回退；② `pdf.scss` 中的 CSS `font-family` 声明匹配到内置 `Helvetica`；③ 行内样式中 `'Courier New'` 覆盖用于金额列。mPDF 在 `WriteHTML()` 时解析 CSS 中的字体声明，使用内置字形数据渲染并嵌入 PDF 流。
+### 样式与字体
+- 发票和报价使用完全相同的样式/字体机制：`file(asset('static/pdf.css'))` 将编译好的 CSS 全文内联到 `<style>`，叠加 `@page` 规则和行内 `style=""`
+- 字体通过三个路径进入 mPDF：① `default_font => 'helvetica'`（回退）② CSS `font-family`（正文 Helvetica）③ 行内 `'Courier New'`（金额列）
+- 发票和报价的样式差异仅限于行内颜色值（绿色 `#2e963a` vs 蓝色 `#3b82f6`）
