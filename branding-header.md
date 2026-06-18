@@ -207,9 +207,9 @@ mPDF::WriteHTML() 接收含内联 Data URI 的 HTML
   src/CoreBundle/Pdf/Generator.php #L53
 ```
 
-### 2.6 默认 Logo 的多层 fallback 逻辑
+### 2.6 默认 Logo 的多层 fallback 逻辑（逐行精确分析）
 
-`displayAppLogo()` 中有**三层 fallback 机制**，应对不同场景：
+`displayAppLogo()` 的控制流不是简单的"三层 fallback"，而是**有条件门控 + 覆盖赋值**的结构，需要逐行分析。
 
 `src/CoreBundle/Twig/Extension/GlobalExtension.php` #L149-L168
 
@@ -221,43 +221,100 @@ public function displayAppLogo(
     bool $showDefault = false,
     bool $showOnlyAppIcon = false
 ): string {
-    // 第一层：$showDefault 强制显示默认 Logo
+    // L151：第一步初始化
+    // 如果 showDefault=true，$logo 先被设为默认 Logo；否则为 null
     $logo = $showDefault ? self::DEFAULT_LOGO : null;
 
-    // 第二层：系统已安装 & 不是仅显示应用图标
+    // L153：第二步，进入主体逻辑的前提是两个条件同时满足：
+    //   1. $this->installed 非空（系统已安装）
+    //   2. !$showOnlyAppIcon（不是"仅显示应用图标"模式）
+    // 任意一个不满足，整个 if 块跳过，直接走到 L161
     if ($this->installed && ! $showOnlyAppIcon) {
+        // L154：第三步，覆盖 L151 的初始值
+        // 判断当前是否已选择公司（通过 companySelector）
+        //   已选公司 → 调用 SystemConfig::get('system/company/logo', $company)
+        //              注意：这里传了 $company 参数，可能触发指定公司读取
+        //   未选公司 → 直接用 DEFAULT_LOGO，**完全忽略传入的 $company 参数**
         $logo = $this->companySelector->getCompany() instanceof Ulid
-            ? $this->systemConfig->get('system/company/logo', $company)  // 已选公司 → 读数据库
-            : self::DEFAULT_LOGO;                                         // 未选公司 → 用默认
+            ? $this->systemConfig->get('system/company/logo', $company)
+            : self::DEFAULT_LOGO;
 
-        // 第三层：读出来是 null 的话
+        // L156-L158：第四步，补 null 的兜底
+        // 如果 L154 查出来是 null（数据库里没配置）
+        //   showDefault=true → 用默认 Logo
+        //   showDefault=false → 保持 null（最终不显示）
         if (null === $logo) {
             $logo = $showDefault ? self::DEFAULT_LOGO : null;
         }
     }
 
-    // 最终为 null → 返回空字符串（不显示 Logo）
+    // L161-L163：第五步，最终出口
+    // $logo 为 null → 返回空字符串（不渲染 <img>）
     if (null === $logo) {
         return '';
     }
 
-    // 解析格式并渲染为 <img>
+    // L165-L167：渲染为 <img src="data:image/..."/>
     [$type, $logo] = explode('|', $logo);
-    return $env->createTemplate('<img src="data:image/{{ type }};base64,{{ logo }}" ...')->render(...);
+    return $env->createTemplate(
+        '<img src="data:image/{{ type }};base64,{{ logo }}" class="navbar-brand-image m-2" width="' . $width . '"/>'
+    )->render(['type' => $type, 'logo' => $logo]);
 }
 ```
 
-**各场景对应结果：**
+**完整的组合场景真值表：**
 
-| 场景 | $showDefault | 结果 |
-|------|-------------|------|
-| 系统未安装 | false | 空字符串（不显示） |
-| 系统未安装 | true | 默认 Logo |
-| 已安装，未选公司 | - | 默认 Logo（安装向导、CLI 等场景） |
-| 已安装，已选公司，已配置 Logo | - | 公司自定义 Logo |
-| 已安装，已选公司，未配置 Logo | false | 空字符串（不显示） |
-| 已安装，已选公司，未配置 Logo | true | 默认 Logo |
-| $showOnlyAppIcon = true | - | 不显示 Logo（仅显示应用图标模式） |
+| # | installed | showOnlyAppIcon | 已选公司 | showDefault | DB 有 Logo | 传 $company | 结果 |
+|---|-----------|-----------------|----------|-------------|------------|-------------|------|
+| 1 | ❌ | - | - | ❌ | - | - | 空（不显示） |
+| 2 | ❌ | - | - | ✅ | - | - | 默认 Logo |
+| 3 | ✅ | ✅（仅显示图标） | - | ❌ | - | - | 空（不显示） |
+| 4 | ✅ | ✅（仅显示图标） | - | ✅ | - | - | 默认 Logo |
+| 5 | ✅ | ❌ | ❌（未选公司） | ❌ | - | ✅（传了也白传） | 默认 Logo（忽略 $company） |
+| 6 | ✅ | ❌ | ❌（未选公司） | ✅ | - | ✅ | 默认 Logo |
+| 7 | ✅ | ❌ | ✅（已选公司 A） | ❌ | ✅（公司 A） | ❌（传 null） | 公司 A 自定义 Logo |
+| 8 | ✅ | ❌ | ✅（已选公司 A） | ❌ | ❌（公司 A） | ❌ | 空（不显示） |
+| 9 | ✅ | ❌ | ✅（已选公司 A） | ✅ | ❌（公司 A） | ❌ | 默认 Logo |
+| 10 | ✅ | ❌ | ✅（已选公司 A） | ❌ | ✅（公司 B） | ✅（传公司 B） | 公司 B 自定义 Logo（指定公司读取） |
+| 11 | ✅ | ❌ | ✅（已选公司 A） | ❌ | ❌（公司 B） | ✅（传公司 B） | 空（不显示） |
+| 12 | ✅ | ❌ | ✅（已选公司 A） | ✅ | ❌（公司 B） | ✅（传公司 B） | 默认 Logo |
+
+**关键发现 #1：未选公司时，传入的 `$company` 参数被完全忽略**
+
+L154 的三元判断：
+```php
+$logo = $this->companySelector->getCompany() instanceof Ulid
+    ? $this->systemConfig->get('system/company/logo', $company)  // ← 已选公司才走这里
+    : self::DEFAULT_LOGO;                                         // ← 未选公司直接返回默认，$company 没用
+```
+
+如果系统已安装但当前请求还没有选择公司（如管理员还没切换、多公司首页等），即使你显式传入了目标 `$company` 对象，也**不会去查询该公司的 Logo**，直接返回默认 Logo。
+
+**关键发现 #2：`showOnlyAppIcon=true` 不会阻止 `showDefault=true`**
+
+L153 的条件是 `if ($this->installed && ! $showOnlyAppIcon)`：
+- 如果 `showOnlyAppIcon=true`，整个 if 块跳过
+- 但 L151 已经把 `$logo = showDefault ? DEFAULT : null`
+- 所以 `showOnlyAppIcon=true + showDefault=true` → 返回默认 Logo
+- `showOnlyAppIcon=true + showDefault=false` → 返回空
+
+"仅显示应用图标"模式并不是绝对不显示 Logo，只是**不读数据库**，如果强制 `showDefault` 还是会显示默认的 SolidInvoice Logo。
+
+**关键发现 #3：`SystemConfig::get()` 还有一道前置门**
+
+`src/SettingsBundle/SystemConfig.php` #L40-L47
+
+```php
+public function get(string $key, ?Company $company = null): ?string
+{
+    if (null === $this->installed || '' === $this->installed) {
+        return null;  // ← 系统未安装直接返回 null，不查数据库
+    }
+    return $this->repository->getSetting($key, $company)?->getValue();
+}
+```
+
+即使 `displayAppLogo()` 走到了 `SystemConfig::get()`，如果系统没安装也会返回 null。这是第二道防线。
 
 **配套的 company_name() 函数逻辑：**
 
@@ -272,8 +329,11 @@ new TwigFunction('company_name', function (): string {
 }),
 ```
 
-- 已选公司且配置了名称 → 自定义公司名
-- 其他所有情况 → `APP_NAME`（SolidInvoice）
+注意：`company_name()` 没有 `$company` 参数，**不支持指定公司查询**，只能读当前公司的名称。
+
+- 已选公司 + 已配置名称 → 自定义公司名
+- 已选公司 + 未配置名称 → `APP_NAME`（SolidInvoice）
+- 未选公司（不管有没有传）→ `APP_NAME`
 
 ---
 
