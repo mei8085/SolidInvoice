@@ -8,7 +8,7 @@
 
 ### 1.1 普通发票（Invoice）
 
-**代码位置**：[Invoice.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Entity/Invoice.php#L118-L538)
+**代码位置**：[Invoice.php](src/InvoiceBundle/Entity/Invoice.php#L118-L538)
 
 | 字段 | 类型 | 约束规则 | 说明 |
 |------|------|----------|------|
@@ -36,7 +36,7 @@
 
 ### 1.2 定期发票（RecurringInvoice）
 
-**代码位置**：[RecurringInvoice.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Entity/RecurringInvoice.php)
+**代码位置**：[RecurringInvoice.php](src/InvoiceBundle/Entity/RecurringInvoice.php)
 
 与普通发票共享 `BaseInvoice` 基类（金额、折扣、条款、备注等字段），额外包含：
 - 调度配置（`RecurringOptions`：频率、结束条件等）
@@ -46,7 +46,7 @@
 
 #### 普通发票状态
 
-**代码位置**：[InvoiceStatus.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Enum/InvoiceStatus.php#L18-L56)
+**代码位置**：[InvoiceStatus.php](src/InvoiceBundle/Enum/InvoiceStatus.php#L18-L56)
 
 | 枚举值 | value | 颜色标识 | 含义 |
 |--------|-------|----------|------|
@@ -61,7 +61,7 @@
 
 #### 定期发票状态
 
-**代码位置**：[RecurringInvoiceStatus.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Enum/RecurringInvoiceStatus.php#L18-L53)
+**代码位置**：[RecurringInvoiceStatus.php](src/InvoiceBundle/Enum/RecurringInvoiceStatus.php#L18-L53)
 
 | 枚举值 | value | 颜色标识 | 含义 |
 |--------|-------|----------|------|
@@ -77,7 +77,7 @@
 
 ## 2. 工作流（状态机）配置
 
-**配置文件**：[workflow.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/config/packages/workflow.php#L29-L110)
+**配置文件**：[workflow.php](config/packages/workflow.php#L29-L110)
 
 ### 2.1 普通发票状态转换图
 
@@ -131,7 +131,7 @@
 
 ### 2.3 状态转换的副作用（WorkFlowSubscriber）
 
-**监听器**：[WorkFlowSubscriber.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Listener/WorkFlowSubscriber.php#L32-L78)
+**监听器**：[WorkFlowSubscriber.php](src/InvoiceBundle/Listener/WorkFlowSubscriber.php#L32-L78)
 
 监听 `workflow.invoice.entered` 和 `workflow.recurring_invoice.entered` 事件：
 
@@ -151,7 +151,7 @@
 | **删除（Delete）** | Doctrine `$em->remove()` 硬删除 | 数据从数据库物理删除 | ❌ 不可逆 | API DELETE 端点、DataGrid 批量删除 |
 
 **ArchivableFilter 过滤规则**：
-- **过滤器**：[ArchivableFilter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/CoreBundle/Doctrine/Filter/ArchivableFilter.php#L23-L53)
+- **过滤器**：[ArchivableFilter.php](src/CoreBundle/Doctrine/Filter/ArchivableFilter.php#L23-L53)
 - **默认启用**：所有查询自动加上 `(archived IS NULL OR archived = false)` 条件
 - **禁用场景**：查询归档列表时需要手动禁用过滤器（`getArchivedGridQuery()`、`deleteInvoices()`、`restoreInvoices()` 内部都会临时禁用）
 
@@ -171,9 +171,9 @@
 **实现机制**：API Platform 默认的 Delete 操作，走 Doctrine 的 `remove()` + `flush()`，即**硬删除**。
 
 **测试验证**：
-- 测试方法：[InvoiceTest::testDelete()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Tests/Functional/Api/InvoiceTest.php#L157-L163)
+- 测试方法：[InvoiceTest::testDelete()](src/InvoiceBundle/Tests/Functional/Api/InvoiceTest.php#L157-L163)
 - 验证方式：调用 `requestDelete()` 后断言响应状态码为 `204 No Content`，响应体为空
-- 测试基类实现：[ApiTestCase::requestDelete()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/ApiBundle/Test/ApiTestCase.php#L333-L351)
+- 测试基类实现：[ApiTestCase::requestDelete()](src/ApiBundle/Test/ApiTestCase.php#L333-L351)
 
 **注意事项**：
 - 删除操作没有自定义 Processor，直接使用 API Platform 内置的 Doctrine 删除处理器
@@ -183,7 +183,7 @@
 
 ### 3.2 DataGrid 批量操作
 
-**代码位置**：[BaseInvoiceGrid.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/DataGrid/BaseInvoiceGrid.php#L119-L127)
+**代码位置**：[BaseInvoiceGrid.php](src/InvoiceBundle/DataGrid/BaseInvoiceGrid.php#L119-L127)
 
 三种网格视图的批量操作差异：
 
@@ -193,19 +193,19 @@
 | 归档发票列表（ArchivedInvoiceGrid） | Delete + Activate | `deleteInvoices()` 硬删除 + `restoreInvoices()` 恢复 |
 
 **删除方法实现**：
-- [InvoiceRepository::deleteInvoices()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Repository/InvoiceRepository.php#L238-L255)
+- [InvoiceRepository::deleteInvoices()](src/InvoiceBundle/Repository/InvoiceRepository.php#L238-L255)
   - 先禁用 `archivable` 过滤器（确保能找到已归档的发票）
   - 遍历 ID 列表，对每个实体执行 `$em->remove()`
   - 最后 `flush()` 一次性提交
   - 恢复 `archivable` 过滤器
 
 **归档方法实现**：
-- [InvoiceRepository::archiveInvoices()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Repository/InvoiceRepository.php#L293-L310)
+- [InvoiceRepository::archiveInvoices()](src/InvoiceBundle/Repository/InvoiceRepository.php#L293-L310)
   - 遍历 ID，设置 `archived = true`
   - 不改变 `status` 字段（仅设置 archived 标记）
 
 **恢复方法实现**：
-- [InvoiceRepository::restoreInvoices()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Repository/InvoiceRepository.php#L315-L336)
+- [InvoiceRepository::restoreInvoices()](src/InvoiceBundle/Repository/InvoiceRepository.php#L315-L336)
   - 先禁用 `archivable` 过滤器（才能查询到已归档记录）
   - 设置 `archived = null`（恢复为未归档状态）
   - 恢复过滤器
@@ -230,7 +230,7 @@
 
 #### 4.1.1 状态转换服务测试
 
-**代码位置**：[InvoiceStatusTransitionServiceTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Tests/Service/InvoiceStatusTransitionServiceTest.php#L38-L115)
+**代码位置**：[InvoiceStatusTransitionServiceTest.php](src/InvoiceBundle/Tests/Service/InvoiceStatusTransitionServiceTest.php#L38-L115)
 
 | 测试方法 | 测试场景 | 领域行为约束 |
 |----------|----------|------------|
@@ -243,7 +243,7 @@
 
 #### 4.1.2 状态转换监听器测试
 
-**代码位置**：[WorkFlowSubscriberTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Tests/Listener/WorkFlowSubscriberTest.php#L35-L70)
+**代码位置**：[WorkFlowSubscriberTest.php](src/InvoiceBundle/Tests/Listener/WorkFlowSubscriberTest.php#L35-L70)
 
 | 测试方法 | 测试场景 | 领域行为约束 |
 |----------|----------|------------|
@@ -254,7 +254,7 @@
 
 #### 4.1.3 发票管理器（InvoiceManager）测试
 
-**代码位置**：[InvoiceManagerTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Tests/Manager/InvoiceManagerTest.php#L114-L353)
+**代码位置**：[InvoiceManagerTest.php](src/InvoiceBundle/Tests/Manager/InvoiceManagerTest.php#L114-L353)
 
 | 测试方法 | 测试场景 | 领域行为约束 |
 |----------|----------|------------|
@@ -267,7 +267,7 @@
 
 #### 4.1.4 发票克隆（Cloner）测试
 
-**代码位置**：[InvoiceClonerTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Tests/Cloner/InvoiceClonerTest.php#L46-L214)
+**代码位置**：[InvoiceClonerTest.php](src/InvoiceBundle/Tests/Cloner/InvoiceClonerTest.php#L46-L214)
 
 | 测试方法 | 测试场景 | 领域行为约束 |
 |----------|----------|------------|
@@ -278,7 +278,7 @@
 
 #### 4.1.5 定期发票实体行为测试
 
-**代码位置**：[RecurringInvoiceTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Tests/Entity/RecurringInvoiceTest.php#L25-L75)
+**代码位置**：[RecurringInvoiceTest.php](src/InvoiceBundle/Tests/Entity/RecurringInvoiceTest.php#L25-L75)
 
 | 测试方法 | 测试场景 | 领域行为约束 |
 |----------|----------|------------|
@@ -295,7 +295,7 @@
 
 #### 4.2.1 逾期发票完整流程
 
-**代码位置**：[OverdueInvoiceFlowTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Tests/Functional/OverdueInvoiceFlowTest.php#L51-L260)
+**代码位置**：[OverdueInvoiceFlowTest.php](src/InvoiceBundle/Tests/Functional/OverdueInvoiceFlowTest.php#L51-L260)
 
 | 测试方法 | 测试场景 | 领域行为约束 |
 |----------|----------|------------|
@@ -308,7 +308,7 @@
 
 #### 4.2.2 API 资源测试
 
-**代码位置**：[InvoiceTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Tests/Functional/Api/InvoiceTest.php#L44-L315)
+**代码位置**：[InvoiceTest.php](src/InvoiceBundle/Tests/Functional/Api/InvoiceTest.php#L44-L315)
 
 | 测试方法 | 测试场景 | 领域行为约束 |
 |----------|----------|------------|
@@ -324,7 +324,7 @@
 
 #### 4.2.3 API 状态转换测试
 
-**代码位置**：[InvoiceTransitionTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Tests/Functional/Api/InvoiceTransitionTest.php#L38-L115)
+**代码位置**：[InvoiceTransitionTest.php](src/InvoiceBundle/Tests/Functional/Api/InvoiceTransitionTest.php#L38-L115)
 
 | 测试方法 | 测试场景 | 领域行为约束 |
 |----------|----------|------------|
@@ -353,7 +353,7 @@ SolidInvoice 发票测试中使用 **三种不同的夹具构造策略**，各�
 
 #### 5.2.1 InvoiceFactory 默认值
 
-**代码位置**：[InvoiceFactory.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Test/Factory/InvoiceFactory.php#L66-L99)
+**代码位置**：[InvoiceFactory.php](src/InvoiceBundle/Test/Factory/InvoiceFactory.php#L66-L99)
 
 | 字段 | 默认值策略 | 可覆盖 |
 |------|----------|--------|
@@ -367,7 +367,7 @@ SolidInvoice 发票测试中使用 **三种不同的夹具构造策略**，各�
 
 #### 5.2.2 RecurringInvoiceFactory 默认值
 
-**代码位置**：[RecurringInvoiceFactory.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Test/Factory/RecurringInvoiceFactory.php#L69-L105)
+**代码位置**：[RecurringInvoiceFactory.php](src/InvoiceBundle/Test/Factory/RecurringInvoiceFactory.php#L69-L105)
 
 与 InvoiceFactory 相比的差异：
 
@@ -439,67 +439,67 @@ SolidInvoice 发票测试中使用 **三种不同的夹具构造策略**，各�
 
 | 文件 | 说明 |
 |------|------|
-| [Invoice.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Entity/Invoice.php) | 普通发票实体 |
-| [BaseInvoice.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Entity/BaseInvoice.php) | 发票基类（金额、折扣等共享字段） |
-| [RecurringInvoice.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Entity/RecurringInvoice.php) | 定期发票实体 |
-| [InvoiceStatus.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Enum/InvoiceStatus.php) | 普通发票状态枚举 |
-| [RecurringInvoiceStatus.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Enum/RecurringInvoiceStatus.php) | 定期发票状态枚举 |
-| [Archivable.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/CoreBundle/Traits/Entity/Archivable.php) | 软删除 trait |
+| [Invoice.php](src/InvoiceBundle/Entity/Invoice.php) | 普通发票实体 |
+| [BaseInvoice.php](src/InvoiceBundle/Entity/BaseInvoice.php) | 发票基类（金额、折扣等共享字段） |
+| [RecurringInvoice.php](src/InvoiceBundle/Entity/RecurringInvoice.php) | 定期发票实体 |
+| [InvoiceStatus.php](src/InvoiceBundle/Enum/InvoiceStatus.php) | 普通发票状态枚举 |
+| [RecurringInvoiceStatus.php](src/InvoiceBundle/Enum/RecurringInvoiceStatus.php) | 定期发票状态枚举 |
+| [Archivable.php](src/CoreBundle/Traits/Entity/Archivable.php) | 软删除 trait |
 
 ### 7.2 状态机与工作流
 
 | 文件 | 说明 |
 |------|------|
-| [workflow.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/config/packages/workflow.php) | 状态机配置（invoice、recurring_invoice、quote 三个工作流） |
-| [Graph.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Model/Graph.php) | 转换名称常量 |
-| [WorkFlowSubscriber.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Listener/WorkFlowSubscriber.php) | 状态转换事件监听器（副作用处理） |
+| [workflow.php](config/packages/workflow.php) | 状态机配置（invoice、recurring_invoice、quote 三个工作流） |
+| [Graph.php](src/InvoiceBundle/Model/Graph.php) | 转换名称常量 |
+| [WorkFlowSubscriber.php](src/InvoiceBundle/Listener/WorkFlowSubscriber.php) | 状态转换事件监听器（副作用处理） |
 
 ### 7.3 核心服务
 
 | 文件 | 说明 |
 |------|------|
-| [InvoiceManager.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Manager/InvoiceManager.php) | 发票管理器（创建、从报价/定期生成） |
-| [InvoiceStatusTransitionService.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Service/InvoiceStatusTransitionService.php) | 状态转换服务 |
-| [InvoiceCloner.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Cloner/InvoiceCloner.php) | 发票克隆器 |
+| [InvoiceManager.php](src/InvoiceBundle/Manager/InvoiceManager.php) | 发票管理器（创建、从报价/定期生成） |
+| [InvoiceStatusTransitionService.php](src/InvoiceBundle/Service/InvoiceStatusTransitionService.php) | 状态转换服务 |
+| [InvoiceCloner.php](src/InvoiceBundle/Cloner/InvoiceCloner.php) | 发票克隆器 |
 
 ### 7.4 仓储与过滤器
 
 | 文件 | 说明 |
 |------|------|
-| [InvoiceRepository.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Repository/InvoiceRepository.php) | 发票仓储（删除、归档、恢复等方法） |
-| [ArchivableFilter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/CoreBundle/Doctrine/Filter/ArchivableFilter.php) | 软删除 SQL 过滤器 |
-| [CompanyFilter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/CoreBundle/Doctrine/Filter/CompanyFilter.php) | 多租户公司过滤器 |
+| [InvoiceRepository.php](src/InvoiceBundle/Repository/InvoiceRepository.php) | 发票仓储（删除、归档、恢复等方法） |
+| [ArchivableFilter.php](src/CoreBundle/Doctrine/Filter/ArchivableFilter.php) | 软删除 SQL 过滤器 |
+| [CompanyFilter.php](src/CoreBundle/Doctrine/Filter/CompanyFilter.php) | 多租户公司过滤器 |
 
 ### 7.5 Foundry 测试工厂
 
 | 文件 | 说明 |
 |------|------|
-| [InvoiceFactory.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Test/Factory/InvoiceFactory.php) | 普通发票测试工厂 |
-| [RecurringInvoiceFactory.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Test/Factory/RecurringInvoiceFactory.php) | 定期发票测试工厂 |
+| [InvoiceFactory.php](src/InvoiceBundle/Test/Factory/InvoiceFactory.php) | 普通发票测试工厂 |
+| [RecurringInvoiceFactory.php](src/InvoiceBundle/Test/Factory/RecurringInvoiceFactory.php) | 定期发票测试工厂 |
 
 ### 7.6 单元测试
 
 | 文件 | 说明 |
 |------|------|
-| [InvoiceStatusTransitionServiceTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Tests/Service/InvoiceStatusTransitionServiceTest.php) | 状态转换服务测试 |
-| [WorkFlowSubscriberTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Tests/Listener/WorkFlowSubscriberTest.php) | 工作流监听器测试 |
-| [InvoiceManagerTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Tests/Manager/InvoiceManagerTest.php) | 发票管理器测试 |
-| [InvoiceClonerTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Tests/Cloner/InvoiceClonerTest.php) | 发票克隆测试 |
-| [RecurringInvoiceTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Tests/Entity/RecurringInvoiceTest.php) | 定期发票实体测试 |
+| [InvoiceStatusTransitionServiceTest.php](src/InvoiceBundle/Tests/Service/InvoiceStatusTransitionServiceTest.php) | 状态转换服务测试 |
+| [WorkFlowSubscriberTest.php](src/InvoiceBundle/Tests/Listener/WorkFlowSubscriberTest.php) | 工作流监听器测试 |
+| [InvoiceManagerTest.php](src/InvoiceBundle/Tests/Manager/InvoiceManagerTest.php) | 发票管理器测试 |
+| [InvoiceClonerTest.php](src/InvoiceBundle/Tests/Cloner/InvoiceClonerTest.php) | 发票克隆测试 |
+| [RecurringInvoiceTest.php](src/InvoiceBundle/Tests/Entity/RecurringInvoiceTest.php) | 定期发票实体测试 |
 
 ### 7.7 功能测试
 
 | 文件 | 说明 |
 |------|------|
-| [OverdueInvoiceFlowTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Tests/Functional/OverdueInvoiceFlowTest.php) | 逾期发票完整流程测试 |
-| [InvoiceTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Tests/Functional/Api/InvoiceTest.php) | 发票 API CRUD 测试 |
-| [InvoiceTransitionTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/Tests/Functional/Api/InvoiceTransitionTest.php) | 发票 API 状态转换测试 |
-| [ApiTestCase.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/ApiBundle/Test/ApiTestCase.php) | API 测试基类（含 requestDelete 等方法） |
+| [OverdueInvoiceFlowTest.php](src/InvoiceBundle/Tests/Functional/OverdueInvoiceFlowTest.php) | 逾期发票完整流程测试 |
+| [InvoiceTest.php](src/InvoiceBundle/Tests/Functional/Api/InvoiceTest.php) | 发票 API CRUD 测试 |
+| [InvoiceTransitionTest.php](src/InvoiceBundle/Tests/Functional/Api/InvoiceTransitionTest.php) | 发票 API 状态转换测试 |
+| [ApiTestCase.php](src/ApiBundle/Test/ApiTestCase.php) | API 测试基类（含 requestDelete 等方法） |
 
 ### 7.8 DataGrid 视图
 
 | 文件 | 说明 |
 |------|------|
-| [BaseInvoiceGrid.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/DataGrid/BaseInvoiceGrid.php) | 发票网格基类（含 Delete 批量操作） |
-| [InvoiceGrid.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/DataGrid/InvoiceGrid.php) | 活跃发票网格（含 Archive 批量操作） |
-| [ArchivedInvoiceGrid.php](file:///d:/fz/0601-2/solo-dogfeeding/code/44-SolidInvoice/src/InvoiceBundle/DataGrid/ArchivedInvoiceGrid.php) | 归档发票网格（含 Activate 恢复操作） |
+| [BaseInvoiceGrid.php](src/InvoiceBundle/DataGrid/BaseInvoiceGrid.php) | 发票网格基类（含 Delete 批量操作） |
+| [InvoiceGrid.php](src/InvoiceBundle/DataGrid/InvoiceGrid.php) | 活跃发票网格（含 Archive 批量操作） |
+| [ArchivedInvoiceGrid.php](src/InvoiceBundle/DataGrid/ArchivedInvoiceGrid.php) | 归档发票网格（含 Activate 恢复操作） |
