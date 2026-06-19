@@ -215,36 +215,65 @@
 3. **每次转换后** → 持久化实体（persist + flush）
 4. **非 New 状态转换后** → 发送 `InvoiceStatusNotification` 通知
 
-### 2.6 取消、归档、删除三者区别
+### 2.6 取消、归档、删除、恢复操作总览
 
-发票领域有三种"关闭/移除"语义，各自对应不同的业务场景和实现方式：
+发票领域有五种"关闭/移除/恢复"语义，各自对应不同的业务场景和实现方式。**普通发票和定期发票在仓储归档和网格入口上存在关键差异**。
 
-| 操作 | 实现方式 | status 字段 | archived 字段 | 是否可逆 | 触发入口 |
+#### 2.6.1 操作语义对比
+
+| 操作 | 实现方式 | status 字段 | archived 字段 | 是否可逆 | 适用实体 |
 |------|----------|------------|--------------|----------|----------|
-| **取消（Cancel）** | 状态机 `TRANSITION_CANCEL` | `cancelled` | 不变 | ✅ 可逆（reopen → Draft） | API 转换端点、UI 操作 |
-| **状态机归档** | 状态机 `TRANSITION_ARCHIVE` | `archived` | `true` | ⚠️ 状态机无定义回退转换 | API 转换端点 |
-| **仓储归档** | `Repository::archiveInvoices()` | **不变** | `true` | ✅ 可逆（`restoreInvoices()`） | DataGrid 批量 Archive 操作 |
-| **恢复** | `Repository::restoreInvoices()` | **不变** | `null` | N/A | 归档网格 Activate 操作 |
-| **删除（Delete）** | Doctrine `$em->remove()` 硬删除 | 数据从数据库物理删除 | ❌ 不可逆 | API DELETE 端点、DataGrid 批量删除 |
+| **取消（Cancel）** | 状态机 `TRANSITION_CANCEL` | `cancelled` | 不变 | ✅ 可逆（reopen → Draft） | 普通发票 + 定期发票 |
+| **状态机归档** | 状态机 `TRANSITION_ARCHIVE` | `archived` | `true` | ⚠️ 状态机无回退转换 | 普通发票 + 定期发票 |
+| **仓储归档** | `Repository::archiveInvoices()` | **不变** | `true` | ✅ 可逆（`restoreInvoices`） | **仅普通发票** |
+| **恢复（Activate）** | `Repository::restoreInvoices()` | **不变** | `null` | N/A | 普通发票 + 定期发票 |
+| **重新激活（Reactivate）** | 直接 `$invoice->setStatus(Active)` | `active` | 不变 | — | **仅定期发票**（已完成→活跃） |
+| **删除（Delete）** | Doctrine `$em->remove()` 硬删除 | 数据物理删除 | ❌ 不可逆 | 普通发票 + 定期发票 |
 
-**ArchivableFilter 过滤规则**：
+#### 2.6.2 状态机归档 vs 仓储归档
+
+| 维度 | 状态机归档（TRANSITION_ARCHIVE） | 仓储归档（InvoiceRepository::archiveInvoices） |
+|------|--------------------------------|-----------------------------------------------|
+| status 变化 | 变为 `archived` | **保持原值不变** |
+| archived 变化 | 变为 `true`（由 WorkFlowSubscriber 设置） | 变为 `true`（直接 setArchived） |
+| 是否触发通知 | 是（WorkFlowSubscriber 发送） | 否 |
+| 前置状态限制 | 有（仅允许特定源状态） | 无（任何状态都可归档） |
+| 适用实体 | 普通发票 + 定期发票 | **仅普通发票**（RecurringInvoiceRepository 无此方法） |
+| 可逆方式 | 状态机中无定义回退转换 | `restoreInvoices()` 恢复 archived 字段 |
+
+#### 2.6.3 普通发票 vs 定期发票的归档路径差异
+
+| 归档路径 | 普通发票（Invoice） | 定期发票（RecurringInvoice） |
+|----------|-------------------|---------------------------|
+| 状态机归档（API 转换端点） | ✅ status→archived, archived→true | ✅ status→archived, archived→true |
+| 仓储归档（DataGrid 批量 Archive） | ✅ `InvoiceRepository::archiveInvoices()` | ❌ **无此方法和 UI 入口** |
+| 进入归档列表的其他途径 | 仓储归档后也出现在归档列表 | 仅状态机归档后出现在归档列表 |
+| 从归档列表恢复 | ✅ `InvoiceRepository::restoreInvoices()` → archived=null | ✅ `RecurringInvoiceRepository::restoreInvoices()` → archived=null |
+
+> **关键区别**：定期发票没有批量归档 UI 入口，归档只能通过 API 转换端点（状态机归档）实现。这意味着定期发票归档后 status 一定是 `archived`，不会出现"仓储归档那种 status 保持原值但 archived=true"的情况。
+
+#### 2.6.4 定期发票独有的"重新激活"操作
+
+**代码位置**：`src/InvoiceBundle/DataGrid/CompletedRecurringInvoiceGrid.php`
+
+已完成（Complete）状态的定期发票有一个独特的 **Reactivate** 批量操作，直接将 status 设为 `Active`，**绕过状态机**（不通过 `resume` 转换，因为 Complete → Active 在状态机中没有定义）。
+
+| 维度 | 说明 |
+|------|------|
+| 网格入口 | CompletedRecurringInvoiceGrid 的 Reactivate 按钮 |
+| 实现方式 | `$invoice->setStatus(RecurringInvoiceStatus::Active)` + `$em->flush()` |
+| 是否走状态机 | ❌ 直接修改 status，不走工作流 |
+| 源状态 | Complete |
+| 目标状态 | Active |
+
+#### 2.6.5 ArchivableFilter 过滤规则
+
 - **过滤器代码**：`src/CoreBundle/Doctrine/Filter/ArchivableFilter.php`
 - **SQL 条件**：`(archived IS NULL OR archived = 0)`
 - **默认启用**：所有查询自动过滤掉已归档记录
 - **禁用场景**：查询归档列表、删除归档记录、恢复归档记录时需手动禁用过滤器
 
-**两种归档的关键区别**：
-
-| 维度 | 状态机归档（TRANSITION_ARCHIVE） | 仓储归档（Repository::archiveInvoices） |
-|------|--------------------------------|---------------------------------------|
-| status 变化 | 变为 `archived` | **保持原值不变** |
-| archived 变化 | 变为 `true`（由 WorkFlowSubscriber 设置） | 变为 `true`（直接 setArchived） |
-| 是否触发通知 | 是（WorkFlowSubscriber 发送） | 否 |
-| 前置状态限制 | 有（仅允许特定源状态） | 无（任何状态都可归档） |
-| 适用实体 | 普通发票 + 定期发票 | 普通发票 + 定期发票 |
-| 可逆方式 | 状态机中无定义回退转换 | `restoreInvoices()` 恢复 archived 字段 |
-
-> **易错点**：归档网格（Archived Grid）显示的是 `archived = true` 的所有记录，不管 status 值是什么。也就是说，状态机归档的记录（status=archived, archived=true）和仓储归档的记录（status=原值, archived=true）都会出现在归档列表中。
+> **易错点**：归档网格（Archived Grid）显示的是 `archived IS NOT NULL` 的所有记录，不管 status 值是什么。对普通发票来说，状态机归档的记录（status=archived, archived=true）和仓储归档的记录（status=原值, archived=true）都会出现在归档列表中。对定期发票来说，因无仓储归档入口，归档列表中只会有状态机归档的记录。
 
 ---
 
@@ -269,35 +298,42 @@
 
 ### 3.2 DataGrid 批量操作
 
-**基类网格**：`src/InvoiceBundle/DataGrid/BaseInvoiceGrid.php`（普通发票）、`src/InvoiceBundle/DataGrid/BaseRecurringInvoiceGrid.php`（定期发票）
+#### 3.2.1 普通发票网格
 
-普通发票三种网格视图的批量操作：
+**基类**：`src/InvoiceBundle/DataGrid/BaseInvoiceGrid.php` — 定义 Delete 批量操作
 
-| 网格 | Delete 批量操作 | Archive 批量操作 | Activate/恢复 操作 |
-|------|---------------|-----------------|-------------------|
-| InvoiceGrid（活跃列表） | ✅ 硬删除 | ✅ 仓储归档 | — |
-| ArchivedInvoiceGrid（归档列表） | ✅ 硬删除 | — | ✅ 恢复 archived = null |
+| 网格 | 代码位置 | Delete | Archive | Activate/恢复 | 查询条件 |
+|------|----------|--------|---------|--------------|----------|
+| InvoiceGrid | `src/InvoiceBundle/DataGrid/InvoiceGrid.php` | ✅（继承自基类） | ✅ 调用 `InvoiceRepository::archiveInvoices()` | — | 全部未归档发票，可按 client_id 过滤 |
+| ArchivedInvoiceGrid | `src/InvoiceBundle/DataGrid/ArchivedInvoiceGrid.php` | ✅（继承自基类） | — | ✅ 调用 `InvoiceRepository::restoreInvoices()` → archived=null | 禁用 ArchivableFilter + `archived IS NOT NULL` |
 
-定期发票四种网格视图：
+**仓储方法对应关系**：
 
-| 网格 | 说明 |
-|------|------|
-| RecurringInvoiceGrid | 活跃列表，含 Delete 批量操作 |
-| CompletedRecurringInvoiceGrid | 已完成列表 |
-| ArchivedRecurringInvoiceGrid | 归档列表，含 Delete + 恢复 |
-| BaseRecurringInvoiceGrid | 基类，定义通用列和 Delete 批量操作 |
+| Repository 方法 | 被调用的网格 | 逻辑 |
+|----------------|------------|------|
+| `InvoiceRepository::deleteInvoices(array $ids)` | 两个网格都有 | 禁用 archivable 过滤器 → 逐个 remove → flush → 恢复过滤器 |
+| `InvoiceRepository::archiveInvoices(array $ids)` | InvoiceGrid Archive 按钮 | 逐个 `setArchived(true)` → persist → flush（**不改变 status**） |
+| `InvoiceRepository::restoreInvoices(array $ids)` | ArchivedInvoiceGrid Activate 按钮 | 禁用 archivable 过滤器 → 逐个 `setArchived(null)` → persist → flush → 恢复过滤器 |
 
-**删除方法实现**（普通发票和定期发票各有一套，逻辑一致）：
-- `InvoiceRepository::deleteInvoices(array $ids)`：先禁用 archivable 过滤器，遍历 ID 逐个 remove，最后 flush，finally 中恢复过滤器
-- `RecurringInvoiceRepository::deleteInvoices(array $ids)`：同上
+#### 3.2.2 定期发票网格
 
-**归档方法实现**：
-- `InvoiceRepository::archiveInvoices(array $ids)`：遍历 ID，设置 `archived = true`，不改变 status
-- `RecurringInvoiceRepository` **没有** `archiveInvoices` 方法（定期发票归档网格仅提供 Delete + 恢复，不提供批量归档 UI 入口）
+**基类**：`src/InvoiceBundle/DataGrid/BaseRecurringInvoiceGrid.php` — 定义 Delete 批量操作
 
-**恢复方法实现**：
-- `InvoiceRepository::restoreInvoices(array $ids)`：禁用过滤器，设置 `archived = null`
-- `RecurringInvoiceRepository::restoreInvoices(array $ids)`：同上
+| 网格 | 代码位置 | Delete | Reactivate | Activate/恢复 | 查询条件 |
+|------|----------|--------|-----------|--------------|----------|
+| RecurringInvoiceGrid | `src/InvoiceBundle/DataGrid/RecurringInvoiceGrid.php` | ✅（继承自基类） | — | — | `status != Complete`（排除已完成的） |
+| CompletedRecurringInvoiceGrid | `src/InvoiceBundle/DataGrid/CompletedRecurringInvoiceGrid.php` | ✅（继承自基类） | ✅ 直接 `setStatus(Active)` + flush（**绕过状态机**） | — | `status = Complete` |
+| ArchivedRecurringInvoiceGrid | `src/InvoiceBundle/DataGrid/ArchivedRecurringInvoiceGrid.php` | ✅（继承自基类） | — | ✅ 调用 `RecurringInvoiceRepository::restoreInvoices()` → archived=null | 禁用 ArchivableFilter + `archived IS NOT NULL` |
+
+**仓储方法对应关系**：
+
+| Repository 方法 | 被调用的网格 | 逻辑 |
+|----------------|------------|------|
+| `RecurringInvoiceRepository::deleteInvoices(array $ids)` | 三个网格都有 | 禁用 archivable 过滤器 → 逐个 remove → flush → 恢复过滤器 |
+| **无 `archiveInvoices` 方法** | ❌ 无入口 | 定期发票**不支持**批量仓储归档，归档只能走状态机 API 转换 |
+| `RecurringInvoiceRepository::restoreInvoices(array $ids)` | ArchivedRecurringInvoiceGrid Activate 按钮 | 禁用 archivable 过滤器 → 逐个 `setArchived(null)` → persist → flush → 恢复过滤器 |
+
+> **核心差异**：普通发票有两个归档入口（状态机 + 仓储批量），定期发票只有一个归档入口（状态机）。这导致普通发票归档列表中可能出现"status 保持原值但 archived=true"的记录（仓储归档产生），而定期发票归档列表中的记录 status 一定是 `archived`。
 
 ### 3.3 定期发票生成 API
 
@@ -559,6 +595,8 @@
 | **已归档数据默认不显示** | ArchivableFilter | 各列表查询测试间接保障（仅返回未归档） |
 | **删除操作需禁用归档过滤器** | Repository::deleteInvoices | 代码实现保证（无直接单元测试） |
 | **同日不可重复生成定期发票** | GenerateInvoiceFromRecurringProcessor | 代码实现保证 + 实体层 hasInvoiceForDay 测试 |
+| **仓储归档仅适用于普通发票** | RecurringInvoiceRepository 无 archiveInvoices | 代码实现保证（定期发票无批量归档入口） |
+| **定期发票 Reactivate 绕过状态机** | CompletedRecurringInvoiceGrid 直接 setStatus | 代码实现保证（Complete→Active 无状态机路径） |
 
 ---
 
